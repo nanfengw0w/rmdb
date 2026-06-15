@@ -75,7 +75,11 @@ void DiskManager::create_file(const std::string &path) {
     if (is_file(path)) {
         throw FileExistsError(path);
     }
+    #ifdef _WIN32
     int fd = open(path.c_str(), O_CREAT | O_RDWR | O_BINARY, 0664);
+#else
+    int fd = open(path.c_str(), O_CREAT | O_RDWR, 0664);
+#endif
     if (fd < 0) {
         throw UnixError();
     }
@@ -98,7 +102,11 @@ int DiskManager::open_file(const std::string &path) {
     if (path2fd_.count(path)) {
         throw FileExistsError(path);
     }
+    #ifdef _WIN32
     int fd = open(path.c_str(), O_RDWR | O_BINARY);
+#else
+    int fd = open(path.c_str(), O_RDWR);
+#endif
     if (fd < 0) {
         throw FileNotFoundError(path);
     }
@@ -167,5 +175,6 @@ void DiskManager::write_log(char *log_data, int size) {
         throw UnixError();
     }
 }
+
 
 
