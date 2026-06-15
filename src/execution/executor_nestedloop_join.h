@@ -52,7 +52,6 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
             return;
         }
         left_rec_ = left_->Next();
-        right_->beginTuple();
         advance_to_match();
     }
 
