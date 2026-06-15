@@ -24,6 +24,7 @@ class UpdateExecutor : public AbstractExecutor {
     std::string tab_name_;
     std::vector<SetClause> set_clauses_;
     SmManager *sm_manager_;
+    size_t cur_idx_;
 
    public:
     UpdateExecutor(SmManager *sm_manager, const std::string &tab_name, std::vector<SetClause> set_clauses,
@@ -36,11 +37,54 @@ class UpdateExecutor : public AbstractExecutor {
         conds_ = conds;
         rids_ = rids;
         context_ = context;
+        cur_idx_ = 0;
     }
+
     std::unique_ptr<RmRecord> Next() override {
-        
+        if (cur_idx_ < rids_.size()) {
+            auto record = fh_->get_record(rids_[cur_idx_], context_);
+            // Delete old index entries
+            for (size_t i = 0; i < tab_.indexes.size(); ++i) {
+                auto& index = tab_.indexes[i];
+                auto ih = sm_manager_->ihs_.at(
+                    sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
+                char* key = new char[index.col_tot_len];
+                int offset = 0;
+                for (size_t j = 0; j < index.col_num; ++j) {
+                    memcpy(key + offset, record->data + index.cols[j].offset, index.cols[j].len);
+                    offset += index.cols[j].len;
+                }
+                ih->delete_entry(key, context_->txn_);
+                delete[] key;
+            }
+            // Apply set clauses
+            for (auto &set_clause : set_clauses_) {
+                auto col = tab_.get_col(set_clause.lhs.col_name);
+                set_clause.rhs.init_raw(col->len);
+                memcpy(record->data + col->offset, set_clause.rhs.raw->data, col->len);
+            }
+            // Insert new index entries
+            for (size_t i = 0; i < tab_.indexes.size(); ++i) {
+                auto& index = tab_.indexes[i];
+                auto ih = sm_manager_->ihs_.at(
+                    sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
+                char* key = new char[index.col_tot_len];
+                int offset = 0;
+                for (size_t j = 0; j < index.col_num; ++j) {
+                    memcpy(key + offset, record->data + index.cols[j].offset, index.cols[j].len);
+                    offset += index.cols[j].len;
+                }
+                ih->insert_entry(key, rids_[cur_idx_], context_->txn_);
+                delete[] key;
+            }
+            // Update record
+            fh_->update_record(rids_[cur_idx_], record->data, context_);
+            cur_idx_++;
+        }
         return nullptr;
     }
 
     Rid &rid() override { return _abstract_rid; }
+
+    bool is_end() const override { return cur_idx_ >= rids_.size(); }
 };

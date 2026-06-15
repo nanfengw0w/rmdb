@@ -18,19 +18,20 @@ See the Mulan PSL v2 for more details. */
 
 class IndexScanExecutor : public AbstractExecutor {
    private:
-    std::string tab_name_;                      // 表名称
-    TabMeta tab_;                               // 表的元数据
-    std::vector<Condition> conds_;              // 扫描条件
-    RmFileHandle *fh_;                          // 表的数据文件句柄
-    std::vector<ColMeta> cols_;                 // 需要读取的字段
-    size_t len_;                                // 选取出来的一条记录的长度
-    std::vector<Condition> fed_conds_;          // 扫描条件，和conds_字段相同
+    std::string tab_name_;
+    TabMeta tab_;
+    std::vector<Condition> conds_;
+    RmFileHandle *fh_;
+    std::vector<ColMeta> cols_;
+    size_t len_;
+    std::vector<Condition> fed_conds_;
 
-    std::vector<std::string> index_col_names_;  // index scan涉及到的索引包含的字段
-    IndexMeta index_meta_;                      // index scan涉及到的索引元数据
+    std::vector<std::string> index_col_names_;
+    IndexMeta index_meta_;
 
     Rid rid_;
     std::unique_ptr<RecScan> scan_;
+    bool is_end_;
 
     SmManager *sm_manager_;
 
@@ -42,8 +43,7 @@ class IndexScanExecutor : public AbstractExecutor {
         tab_name_ = std::move(tab_name);
         tab_ = sm_manager_->db_.get_table(tab_name_);
         conds_ = std::move(conds);
-        // index_no_ = index_no;
-        index_col_names_ = index_col_names; 
+        index_col_names_ = index_col_names;
         index_meta_ = *(tab_.get_index_meta(index_col_names_));
         fh_ = sm_manager_->fhs_.at(tab_name_).get();
         cols_ = tab_.cols;
@@ -54,27 +54,108 @@ class IndexScanExecutor : public AbstractExecutor {
 
         for (auto &cond : conds_) {
             if (cond.lhs_col.tab_name != tab_name_) {
-                // lhs is on other table, now rhs must be on this table
                 assert(!cond.is_rhs_val && cond.rhs_col.tab_name == tab_name_);
-                // swap lhs and rhs
                 std::swap(cond.lhs_col, cond.rhs_col);
                 cond.op = swap_op.at(cond.op);
             }
         }
         fed_conds_ = conds_;
+        is_end_ = true;
     }
 
     void beginTuple() override {
-        
+        scan_ = std::make_unique<RmScan>(fh_);
+        is_end_ = false;
+        while (!scan_->is_end()) {
+            rid_ = scan_->rid();
+            auto record = fh_->get_record(rid_, context_);
+            if (eval_conds(record.get(), conds_)) {
+                return;
+            }
+            scan_->next();
+        }
+        is_end_ = true;
     }
 
     void nextTuple() override {
-        
+        scan_->next();
+        while (!scan_->is_end()) {
+            rid_ = scan_->rid();
+            auto record = fh_->get_record(rid_, context_);
+            if (eval_conds(record.get(), conds_)) {
+                return;
+            }
+            scan_->next();
+        }
+        is_end_ = true;
     }
 
     std::unique_ptr<RmRecord> Next() override {
-        return nullptr;
+        return fh_->get_record(rid_, context_);
     }
 
     Rid &rid() override { return rid_; }
+
+    bool is_end() const override { return is_end_; }
+
+    size_t tupleLen() const override { return len_; }
+
+    const std::vector<ColMeta> &cols() const override { return cols_; }
+
+   private:
+    bool eval_conds(RmRecord *record, const std::vector<Condition> &conds) {
+        for (auto &cond : conds) {
+            auto &lhs_col_meta = find_col_meta(cols_, cond.lhs_col);
+            char *lhs_buf = record->data + lhs_col_meta.offset;
+
+            if (cond.is_rhs_val) {
+                char *rhs_buf = cond.rhs_val.raw->data;
+                int cmp = compare_value(lhs_buf, rhs_buf, lhs_col_meta.type, lhs_col_meta.len);
+                if (!eval_cmp(cmp, cond.op)) return false;
+            } else {
+                auto &rhs_col_meta = find_col_meta(cols_, cond.rhs_col);
+                char *rhs_buf = record->data + rhs_col_meta.offset;
+                int cmp = compare_value(lhs_buf, rhs_buf, lhs_col_meta.type, lhs_col_meta.len);
+                if (!eval_cmp(cmp, cond.op)) return false;
+            }
+        }
+        return true;
+    }
+
+    ColMeta& find_col_meta(const std::vector<ColMeta> &cols, const TabCol &target) {
+        auto pos = std::find_if(cols.begin(), cols.end(), [&](const ColMeta &col) {
+            return col.tab_name == target.tab_name && col.name == target.col_name;
+        });
+        if (pos == cols.end()) {
+            throw ColumnNotFoundError(target.tab_name + "." + target.col_name);
+        }
+        return const_cast<ColMeta&>(*pos);
+    }
+
+    int compare_value(const char *a, const char *b, ColType type, int len) {
+        if (type == TYPE_INT) {
+            int va = *(int *)a;
+            int vb = *(int *)b;
+            return (va > vb) ? 1 : ((va < vb) ? -1 : 0);
+        } else if (type == TYPE_FLOAT) {
+            float va = *(float *)a;
+            float vb = *(float *)b;
+            return (va > vb) ? 1 : ((va < vb) ? -1 : 0);
+        } else if (type == TYPE_STRING) {
+            return memcmp(a, b, len);
+        }
+        return 0;
+    }
+
+    bool eval_cmp(int cmp, CompOp op) {
+        switch (op) {
+            case OP_EQ: return cmp == 0;
+            case OP_NE: return cmp != 0;
+            case OP_LT: return cmp < 0;
+            case OP_GT: return cmp > 0;
+            case OP_LE: return cmp <= 0;
+            case OP_GE: return cmp >= 0;
+            default: return false;
+        }
+    }
 };

@@ -17,10 +17,10 @@ See the Mulan PSL v2 for more details. */
 
 class ProjectionExecutor : public AbstractExecutor {
    private:
-    std::unique_ptr<AbstractExecutor> prev_;        // 投影节点的儿子节点
-    std::vector<ColMeta> cols_;                     // 需要投影的字段
-    size_t len_;                                    // 字段总长度
-    std::vector<size_t> sel_idxs_;                  
+    std::unique_ptr<AbstractExecutor> prev_;
+    std::vector<ColMeta> cols_;
+    size_t len_;
+    std::vector<size_t> sel_idxs_;
 
    public:
     ProjectionExecutor(std::unique_ptr<AbstractExecutor> prev, const std::vector<TabCol> &sel_cols) {
@@ -39,13 +39,31 @@ class ProjectionExecutor : public AbstractExecutor {
         len_ = curr_offset;
     }
 
-    void beginTuple() override {}
+    void beginTuple() override {
+        prev_->beginTuple();
+    }
 
-    void nextTuple() override {}
+    void nextTuple() override {
+        prev_->nextTuple();
+    }
 
     std::unique_ptr<RmRecord> Next() override {
-        return nullptr;
+        auto prev_rec = prev_->Next();
+        auto result = std::make_unique<RmRecord>(len_);
+        size_t dst_offset = 0;
+        for (size_t i = 0; i < sel_idxs_.size(); i++) {
+            auto &src_col = prev_->cols()[sel_idxs_[i]];
+            memcpy(result->data + dst_offset, prev_rec->data + src_col.offset, src_col.len);
+            dst_offset += cols_[i].len;
+        }
+        return result;
     }
 
     Rid &rid() override { return _abstract_rid; }
+
+    bool is_end() const override { return prev_->is_end(); }
+
+    size_t tupleLen() const override { return len_; }
+
+    const std::vector<ColMeta> &cols() const override { return cols_; }
 };
