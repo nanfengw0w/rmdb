@@ -79,6 +79,7 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
    private:
     void advance_to_match() {
         while (!left_->is_end()) {
+            right_->beginTuple();
             while (!right_->is_end()) {
                 right_rec_ = right_->Next();
                 if (eval_conds()) {
@@ -93,7 +94,6 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
                 return;
             }
             left_rec_ = left_->Next();
-            right_->beginTuple();
         }
         isend = true;
     }
