@@ -37,6 +37,11 @@ Transaction * TransactionManager::begin(Transaction* txn, LogManager* log_manage
 void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     if (txn == nullptr) return;
     txn->set_state(TransactionState::COMMITTED);
+    // Release all locks held by this transaction
+    auto lock_set = txn->get_lock_set();
+    for (auto &lock_data_id : *lock_set) {
+        lock_manager_->unlock(txn, lock_data_id);
+    }
 }
 
 /**
@@ -46,5 +51,39 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
  */
 void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
     if (txn == nullptr) return;
+
+    // Undo all write operations in reverse order
+    auto write_set = txn->get_write_set();
+    for (auto it = write_set->rbegin(); it != write_set->rend(); ++it) {
+        WriteRecord *wr = *it;
+        auto &tab_name = wr->GetTableName();
+        auto &rid = wr->GetRid();
+        auto fh = sm_manager_->fhs_.at(tab_name).get();
+
+        switch (wr->GetWriteType()) {
+            case WType::INSERT_TUPLE: {
+                // Undo insert -> delete the record
+                fh->delete_record(rid, nullptr);
+                break;
+            }
+            case WType::DELETE_TUPLE: {
+                // Undo delete -> re-insert the record
+                fh->insert_record(rid, wr->GetRecord().data);
+                break;
+            }
+            case WType::UPDATE_TUPLE: {
+                // Undo update -> restore old record
+                fh->update_record(rid, wr->GetRecord().data, nullptr);
+                break;
+            }
+        }
+    }
+
+    // Release all locks
+    auto lock_set = txn->get_lock_set();
+    for (auto &lock_data_id : *lock_set) {
+        lock_manager_->unlock(txn, lock_data_id);
+    }
+
     txn->set_state(TransactionState::ABORTED);
 }

@@ -43,6 +43,13 @@ class UpdateExecutor : public AbstractExecutor {
     std::unique_ptr<RmRecord> Next() override {
         if (cur_idx_ < rids_.size()) {
             auto record = fh_->get_record(rids_[cur_idx_], context_);
+
+            // Record write operation for transaction abort (save old value)
+            if (context_ != nullptr && context_->txn_ != nullptr) {
+                WriteRecord write_rec(WType::UPDATE_TUPLE, tab_name_, rids_[cur_idx_], *record);
+                context_->txn_->append_write_record(new WriteRecord(write_rec));
+            }
+
             // Delete old index entries
             for (size_t i = 0; i < tab_.indexes.size(); ++i) {
                 auto& index = tab_.indexes[i];

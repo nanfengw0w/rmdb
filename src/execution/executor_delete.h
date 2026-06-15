@@ -40,8 +40,16 @@ class DeleteExecutor : public AbstractExecutor {
 
     std::unique_ptr<RmRecord> Next() override {
         if (cur_idx_ < rids_.size()) {
-            // Delete index entries first
+            // Get the record before deletion
             auto record = fh_->get_record(rids_[cur_idx_], context_);
+
+            // Record write operation for transaction abort (save old value)
+            if (context_ != nullptr && context_->txn_ != nullptr) {
+                WriteRecord write_rec(WType::DELETE_TUPLE, tab_name_, rids_[cur_idx_], *record);
+                context_->txn_->append_write_record(new WriteRecord(write_rec));
+            }
+
+            // Delete index entries first
             for (size_t i = 0; i < tab_.indexes.size(); ++i) {
                 auto& index = tab_.indexes[i];
                 auto ih = sm_manager_->ihs_.at(
