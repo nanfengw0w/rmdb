@@ -56,8 +56,25 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
     }
 
     void nextTuple() override {
-        right_->nextTuple();
-        advance_to_match();
+        // Try to advance right and find next match without resetting
+        while (!left_->is_end()) {
+            while (!right_->is_end()) {
+                right_rec_ = right_->Next();
+                if (eval_conds()) {
+                    return;
+                }
+                right_->nextTuple();
+            }
+            // Right exhausted, advance left
+            left_->nextTuple();
+            if (left_->is_end()) {
+                isend = true;
+                return;
+            }
+            left_rec_ = left_->Next();
+            right_->beginTuple();
+        }
+        isend = true;
     }
 
     std::unique_ptr<RmRecord> Next() override {
@@ -78,7 +95,6 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
    private:
     void advance_to_match() {
         while (!left_->is_end()) {
-            right_->beginTuple();
             while (!right_->is_end()) {
                 right_rec_ = right_->Next();
                 if (eval_conds()) {
@@ -86,13 +102,14 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
                 }
                 right_->nextTuple();
             }
-            // Move to next left tuple
+            // Right exhausted, advance left and reset right
             left_->nextTuple();
             if (left_->is_end()) {
                 isend = true;
                 return;
             }
             left_rec_ = left_->Next();
+            right_->beginTuple();
         }
         isend = true;
     }
