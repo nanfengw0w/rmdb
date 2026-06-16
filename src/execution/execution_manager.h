@@ -44,4 +44,7 @@ class QlManager {
                         Context *context);
 
     void run_dml(std::unique_ptr<AbstractExecutor> exec);
+
+    // 处理聚合查询 (GROUP BY, HAVING, LIMIT, aggregate functions, multi-col ORDER BY)
+    void handle_aggregate(const std::string &sql, Context *context);
 };

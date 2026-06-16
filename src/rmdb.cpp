@@ -128,6 +128,52 @@ void *client_handler(void *sock_fd) {
 
         std::cout << "Read from client " << fd << ": " << data_recv << std::endl;
 
+        // Handle aggregate queries (GROUP BY, HAVING, LIMIT, aggregate functions, multi-col ORDER BY)
+        {
+            std::string sql_raw(data_recv);
+            while (!sql_raw.empty() && (sql_raw.back() == ';' || sql_raw.back() == ' ' || sql_raw.back() == '\n' || sql_raw.back() == '\r'))
+                sql_raw.pop_back();
+            std::string sql_lower = sql_raw;
+            for (auto &c : sql_lower) c = tolower(c);
+            bool has_agg = sql_lower.find("group by") != std::string::npos ||
+                           sql_lower.find("having") != std::string::npos ||
+                           sql_lower.find("count(") != std::string::npos ||
+                           sql_lower.find("max(") != std::string::npos ||
+                           sql_lower.find("min(") != std::string::npos ||
+                           sql_lower.find("sum(") != std::string::npos ||
+                           sql_lower.find("avg(") != std::string::npos ||
+                           sql_lower.find(" limit ") != std::string::npos;
+            bool has_multi_orderby = false;
+            if (sql_lower.find("order by") != std::string::npos) {
+                size_t ob_pos = sql_lower.find("order by");
+                std::string after_ob = sql_lower.substr(ob_pos + 8);
+                if (after_ob.find(',') != std::string::npos) has_multi_orderby = true;
+            }
+            if (has_agg || has_multi_orderby) {
+                try {
+                    auto context_agg = std::make_unique<Context>(lock_manager.get(), log_manager.get(), nullptr, data_send, &offset);
+                    SetTransaction(&txn_id, context_agg.get());
+                    ql_manager->handle_aggregate(sql_raw, context_agg.get());
+                    if (write(fd, data_send, offset + 1) == -1) break;
+                    if(context_agg->txn_ != nullptr && context_agg->txn_->get_txn_mode() == false &&
+                       context_agg->txn_->get_state() != TransactionState::COMMITTED &&
+                       context_agg->txn_->get_state() != TransactionState::ABORTED) {
+                        txn_manager->commit(context_agg->txn_, context_agg->log_mgr_);
+                    }
+                    continue;
+                } catch (std::exception &e) {
+                    std::cerr << "Aggregation error: " << e.what() << std::endl;
+                    set_response(data_send, &offset, std::string(e.what()) + "\n");
+                    std::fstream outfile;
+                    outfile.open("output.txt", std::ios::out | std::ios::app);
+                    outfile << "failure\n";
+                    outfile.close();
+                    if (write(fd, data_send, offset + 1) == -1) break;
+                    continue;
+                }
+            }
+        }
+
         // Handle "show index from table_name" directly
         std::string cmd_str(data_recv);
         // Trim leading whitespace
