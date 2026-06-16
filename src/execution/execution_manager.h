@@ -47,4 +47,7 @@ class QlManager {
 
     // 处理聚合查询 (GROUP BY, HAVING, LIMIT, aggregate functions, multi-col ORDER BY)
     void handle_aggregate(const std::string &sql, Context *context);
+
+    // 处理UNION查询
+    void handle_union(const std::string &sql, Context *context);
 };

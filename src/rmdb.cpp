@@ -149,11 +149,16 @@ void *client_handler(void *sock_fd) {
                 std::string after_ob = sql_lower.substr(ob_pos + 8);
                 if (after_ob.find(',') != std::string::npos) has_multi_orderby = true;
             }
-            if (has_agg || has_multi_orderby) {
+            bool has_union = sql_lower.find(" union ") != std::string::npos;
+            if (has_agg || has_multi_orderby || has_union) {
                 try {
                     auto context_agg = std::make_unique<Context>(lock_manager.get(), log_manager.get(), nullptr, data_send, &offset);
                     SetTransaction(&txn_id, context_agg.get());
-                    ql_manager->handle_aggregate(sql_raw, context_agg.get());
+                    if (has_union) {
+                        ql_manager->handle_union(sql_raw, context_agg.get());
+                    } else {
+                        ql_manager->handle_aggregate(sql_raw, context_agg.get());
+                    }
                     if (write(fd, data_send, offset + 1) == -1) break;
                     if(context_agg->txn_ != nullptr && context_agg->txn_->get_txn_mode() == false &&
                        context_agg->txn_->get_state() != TransactionState::COMMITTED &&

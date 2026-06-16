@@ -11,7 +11,30 @@ See the Mulan PSL v2 for more details. */
 #include "execution_manager.h"
 
 #include <sstream>
+#include <set>
 #include "executor_delete.h"
+#include "parser/ast.h"
+#include "optimizer/optimizer.h"
+#include "optimizer/planner.h"
+#include "analyze/analyze.h"
+
+// Forward declarations for parser/lexer (avoid yacc.tab.h conflicts)
+struct yy_buffer_state;
+typedef struct yy_buffer_state *YY_BUFFER_STATE;
+extern int yyparse(void);
+extern YY_BUFFER_STATE yy_scan_string(const char *str);
+extern void yy_delete_buffer(YY_BUFFER_STATE b);
+namespace ast { extern std::shared_ptr<ast::TreeNode> parse_tree; }
+#include "executor_seq_scan.h"
+#include "executor_index_scan.h"
+#include "executor_projection.h"
+#include "executor_nestedloop_join.h"
+#include "execution_sort.h"
+
+// Forward declarations for lexer
+extern YY_BUFFER_STATE yy_scan_string(const char *str);
+extern void yy_delete_buffer(YY_BUFFER_STATE b);
+extern int yyparse(void);
 #include "executor_index_scan.h"
 #include "executor_insert.h"
 #include "executor_nestedloop_join.h"
@@ -906,6 +929,401 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
         rec_printer.print_record(columns, context);
         outfile << "|";
         for (auto &c : columns) outfile << " " << c << " |";
+        outfile << "\n";
+        num_rec++;
+    }
+    outfile.close();
+    rec_printer.print_separator(context);
+    RecordPrinter::print_record_count(num_rec, context);
+}
+
+// 执行一个SELECT子查询，返回结果行（每行是字符串向量）和列元数据
+struct SubQueryResult {
+    std::vector<std::vector<std::string>> rows;
+    std::vector<ColMeta> cols;
+    std::vector<std::string> col_names;
+};
+
+// 递归构建执行器
+static std::unique_ptr<AbstractExecutor> build_executor_tree(SmManager *sm_manager, std::shared_ptr<Plan> plan, Context *context) {
+    if (auto x = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
+        return std::make_unique<ProjectionExecutor>(build_executor_tree(sm_manager, x->subplan_, context), x->sel_cols_);
+    } else if (auto x = std::dynamic_pointer_cast<ScanPlan>(plan)) {
+        if (x->tag == T_SeqScan) {
+            return std::make_unique<SeqScanExecutor>(sm_manager, x->tab_name_, x->conds_, context);
+        } else {
+            return std::make_unique<IndexScanExecutor>(sm_manager, x->tab_name_, x->conds_, x->index_col_names_, context);
+        }
+    } else if (auto x = std::dynamic_pointer_cast<JoinPlan>(plan)) {
+        auto left = build_executor_tree(sm_manager, x->left_, context);
+        auto right = build_executor_tree(sm_manager, x->right_, context);
+        return std::make_unique<NestedLoopJoinExecutor>(std::move(left), std::move(right), std::move(x->conds_));
+    } else if (auto x = std::dynamic_pointer_cast<SortPlan>(plan)) {
+        return std::make_unique<SortExecutor>(build_executor_tree(sm_manager, x->subplan_, context), x->sel_col_, x->is_desc_);
+    }
+    return nullptr;
+}
+
+static SubQueryResult execute_sub_select(SmManager *sm_manager, const std::string &select_sql, Context *context) {
+    SubQueryResult result;
+
+    // 解析SQL
+    ast::parse_tree = nullptr;
+    std::string sql_with_semi = select_sql;
+    if (!sql_with_semi.empty() && sql_with_semi.back() != ';') sql_with_semi += ';';
+    YY_BUFFER_STATE buf = yy_scan_string(sql_with_semi.c_str());
+    int parse_ok = yyparse();
+    yy_delete_buffer(buf);
+
+    if (parse_ok != 0 || ast::parse_tree == nullptr) {
+        throw InternalError("Parse failed for sub-query: " + select_sql);
+    }
+
+    auto analyze_inst = std::make_unique<Analyze>(sm_manager);
+    auto query = analyze_inst->do_analyze(ast::parse_tree);
+
+    auto planner_inst = std::make_unique<Planner>(sm_manager);
+    auto optimizer_inst = std::make_unique<Optimizer>(sm_manager, planner_inst.get());
+    auto plan = optimizer_inst->plan_query(query, context);
+
+    auto dml_plan = std::dynamic_pointer_cast<DMLPlan>(plan);
+    if (!dml_plan || dml_plan->tag != T_select) {
+        throw InternalError("Sub-query is not a SELECT");
+    }
+
+    auto executor = build_executor_tree(sm_manager, dml_plan->subplan_, context);
+    if (!executor) {
+        throw InternalError("Sub-query execution failed");
+    }
+
+    // 收集列元数据
+    auto executor_cols = executor->cols();
+    for (auto &col : executor_cols) {
+        result.col_names.push_back(col.name);
+        ColMeta cm;
+        cm.name = col.name;
+        cm.type = col.type;
+        cm.len = col.len;
+        cm.offset = col.offset;
+        result.cols.push_back(cm);
+    }
+
+    // 执行并收集结果
+    for (executor->beginTuple(); !executor->is_end(); executor->nextTuple()) {
+        auto tuple = executor->Next();
+        std::vector<std::string> row;
+        for (auto &col : executor_cols) {
+            char *data = tuple->data + col.offset;
+            std::string val;
+            if (col.type == TYPE_INT) {
+                val = std::to_string(*(int*)data);
+            } else if (col.type == TYPE_FLOAT) {
+                val = std::to_string(*(float*)data);
+            } else if (col.type == TYPE_STRING) {
+                val = std::string(data, col.len);
+                val.resize(strlen(val.c_str()));
+            }
+            row.push_back(val);
+        }
+        result.rows.push_back(row);
+    }
+
+    return result;
+}
+
+void QlManager::handle_union(const std::string &sql, Context *context) {
+    std::string sql_lower = to_lower_str(sql);
+
+    // 1. 提取外层ORDER BY和LIMIT
+    std::string outer_order_by;
+    int limit_n = -1;
+    {
+        // 找到最外层的ORDER BY（不在括号内的）
+        size_t ob_pos = std::string::npos;
+        int paren_depth = 0;
+        for (size_t i = 0; i < sql.length(); i++) {
+            if (sql[i] == '(') paren_depth++;
+            else if (sql[i] == ')') paren_depth--;
+            else if (paren_depth == 0 && i + 9 < sql.length()) {
+                std::string substr = sql_lower.substr(i, 9);
+                if (substr == "order by ") {
+                    ob_pos = i;
+                    break;
+                }
+            }
+        }
+        if (ob_pos != std::string::npos) {
+            size_t ob_end = sql.length();
+            size_t lim_pos = sql_lower.find(" limit ", ob_pos + 9);
+            if (lim_pos != std::string::npos) {
+                ob_end = lim_pos;
+                limit_n = std::stoi(trim_str(sql.substr(lim_pos + 7)));
+            }
+            outer_order_by = trim_str(sql.substr(ob_pos + 9, ob_end - ob_pos - 9));
+        } else {
+            size_t lim_pos = sql_lower.find(" limit ");
+            if (lim_pos != std::string::npos) {
+                limit_n = std::stoi(trim_str(sql.substr(lim_pos + 7)));
+            }
+        }
+    }
+
+    // 2. 按UNION分割子查询（考虑括号嵌套）
+    std::vector<std::string> sub_queries;
+    {
+        std::string remaining = sql;
+        // 去掉外层ORDER BY和LIMIT
+        {
+            size_t ob_search = to_lower_str(remaining).find(" order by ");
+            if (ob_search != std::string::npos) {
+                remaining = remaining.substr(0, ob_search);
+            }
+            size_t lim_search = to_lower_str(remaining).find(" limit ");
+            if (lim_search != std::string::npos) {
+                remaining = remaining.substr(0, lim_search);
+            }
+        }
+        remaining = trim_str(remaining);
+
+        // 检测并去掉外层 SELECT * FROM (...) AS alias 包裹
+        {
+            std::string rl = to_lower_str(remaining);
+            // 匹配: SELECT * FROM ( ... ) AS xxx
+            if (rl.find("select * from (") == 0 || rl.find("select * from (") == 0) {
+                // 找到匹配的右括号
+                int pd = 0;
+                size_t close_paren = std::string::npos;
+                for (size_t i = 15; i < remaining.length(); i++) {
+                    if (remaining[i] == '(') pd++;
+                    else if (remaining[i] == ')') {
+                        if (pd == 0) { close_paren = i; break; }
+                        pd--;
+                    }
+                }
+                if (close_paren != std::string::npos) {
+                    // 检查括号后面是否是 AS alias
+                    std::string after = trim_str(remaining.substr(close_paren + 1));
+                    std::string after_lower = to_lower_str(after);
+                    if (after_lower.find("as ") == 0 || after.empty()) {
+                        // 去掉外层包裹，只保留括号内的内容
+                        remaining = trim_str(remaining.substr(15, close_paren - 15));
+                    }
+                }
+            }
+        }
+
+        // 按UNION分割，考虑括号
+        std::string remaining_lower = to_lower_str(remaining);
+        size_t pos = 0;
+        while (pos < remaining.length()) {
+            // 找到下一个不在括号内的UNION
+            int pd = 0;
+            size_t union_pos = std::string::npos;
+            for (size_t i = pos; i < remaining.length(); i++) {
+                if (remaining[i] == '(') pd++;
+                else if (remaining[i] == ')') pd--;
+                else if (pd == 0 && i + 6 <= remaining.length()) {
+                    if (remaining_lower.substr(i, 6) == "union ") {
+                        union_pos = i;
+                        break;
+                    }
+                    // 也检查 UNION ALL
+                    if (i + 10 <= remaining.length() && remaining_lower.substr(i, 10) == "union all ") {
+                        union_pos = i;
+                        break;
+                    }
+                }
+            }
+            if (union_pos == std::string::npos) {
+                sub_queries.push_back(trim_str(remaining.substr(pos)));
+                break;
+            }
+            sub_queries.push_back(trim_str(remaining.substr(pos, union_pos - pos)));
+            // 跳过UNION [ALL]
+            size_t next_pos = union_pos + 6;
+            if (remaining_lower.substr(union_pos, 10) == "union all ") {
+                next_pos = union_pos + 10;
+            }
+            // 跳过空格
+            while (next_pos < remaining.length() && remaining[next_pos] == ' ') next_pos++;
+            pos = next_pos;
+        }
+    }
+
+    if (sub_queries.size() < 2) {
+        throw InternalError("UNION requires at least two sub-queries");
+    }
+
+    // 去掉子查询外层括号
+    for (auto &sq : sub_queries) {
+        sq = trim_str(sq);
+        while (sq.size() >= 2 && sq.front() == '(' && sq.back() == ')') {
+            sq = trim_str(sq.substr(1, sq.size() - 2));
+        }
+    }
+
+    // 3. 执行每个子查询
+    std::vector<SubQueryResult> sub_results;
+    for (auto &sq : sub_queries) {
+        sub_results.push_back(execute_sub_select(sm_manager_, sq, context));
+    }
+
+    // 4. 验证列数一致
+    int num_cols = sub_results[0].col_names.size();
+    for (size_t i = 1; i < sub_results.size(); i++) {
+        if ((int)sub_results[i].col_names.size() != num_cols) {
+            throw InternalError("failure");
+        }
+    }
+
+    // 5. 确定输出列类型（类型提升）
+    std::vector<ColType> out_types(num_cols, TYPE_INT);
+    std::vector<int> out_lens(num_cols, 0);
+    std::vector<std::string> out_names = sub_results[0].col_names;
+
+    for (int c = 0; c < num_cols; c++) {
+        ColType promoted = sub_results[0].cols[c].type;
+        int max_len = sub_results[0].cols[c].len;
+        for (size_t si = 1; si < sub_results.size(); si++) {
+            ColType cur = sub_results[si].cols[c].type;
+            int cur_len = sub_results[si].cols[c].len;
+            // 类型兼容性检查
+            if (promoted == TYPE_STRING && cur != TYPE_STRING) {
+                throw InternalError("failure");
+            }
+            if (cur == TYPE_STRING && promoted != TYPE_STRING) {
+                throw InternalError("failure");
+            }
+            // 类型提升
+            if (promoted == TYPE_INT && cur == TYPE_FLOAT) {
+                promoted = TYPE_FLOAT;
+            }
+            if (cur == TYPE_INT && promoted == TYPE_FLOAT) {
+                // 已经是float
+            }
+            max_len = std::max(max_len, cur_len);
+        }
+        out_types[c] = promoted;
+        out_lens[c] = max_len;
+    }
+
+    // 6. 合并结果并去重
+    // 将每行转为统一格式的字符串
+    struct UnifiedRow {
+        std::vector<std::string> vals;
+        std::string key; // 用于去重
+    };
+    std::vector<UnifiedRow> all_rows;
+    std::set<std::string> seen_keys;
+
+    for (auto &sr : sub_results) {
+        for (auto &row : sr.rows) {
+            UnifiedRow ur;
+            ur.vals.resize(num_cols);
+            std::string key;
+            for (int c = 0; c < num_cols; c++) {
+                // 类型提升：INT -> FLOAT
+                if (out_types[c] == TYPE_FLOAT && sr.cols[c].type == TYPE_INT) {
+                    int int_val = std::stoi(row[c]);
+                    float float_val = static_cast<float>(int_val);
+                    ur.vals[c] = std::to_string(float_val);
+                } else {
+                    ur.vals[c] = row[c];
+                }
+            }
+            // 构建去重key（使用提升后的类型进行比较）
+            std::string dedup_key;
+            for (int c = 0; c < num_cols; c++) {
+                if (out_types[c] == TYPE_INT) {
+                    dedup_key += std::to_string(std::stoi(ur.vals[c])) + "|";
+                } else if (out_types[c] == TYPE_FLOAT) {
+                    dedup_key += std::to_string(std::stof(ur.vals[c])) + "|";
+                } else {
+                    dedup_key += ur.vals[c] + "|";
+                }
+            }
+            if (seen_keys.find(dedup_key) == seen_keys.end()) {
+                seen_keys.insert(dedup_key);
+                all_rows.push_back(ur);
+            }
+        }
+    }
+
+    // 7. ORDER BY
+    if (!outer_order_by.empty()) {
+        // 解析ORDER BY列
+        auto ob_parts = split_str(outer_order_by, ",");
+        struct OrderSpec { int col_idx; bool is_desc; };
+        std::vector<OrderSpec> order_specs;
+        for (auto &p : ob_parts) {
+            p = trim_str(p);
+            OrderSpec os;
+            os.is_desc = false;
+            std::string p_lower = to_lower_str(p);
+            if (p_lower.find(" desc") != std::string::npos) {
+                os.is_desc = true;
+                p = trim_str(p.substr(0, p.length() - 5));
+            } else if (p_lower.find(" asc") != std::string::npos) {
+                p = trim_str(p.substr(0, p.length() - 4));
+            }
+            // 查找列索引（按列名）
+            os.col_idx = -1;
+            for (int c = 0; c < num_cols; c++) {
+                if (to_lower_str(out_names[c]) == to_lower_str(p)) {
+                    os.col_idx = c;
+                    break;
+                }
+            }
+            if (os.col_idx == -1) {
+                // 尝试按列号（1-based）
+                try {
+                    os.col_idx = std::stoi(p) - 1;
+                } catch (...) {}
+            }
+            if (os.col_idx < 0 || os.col_idx >= num_cols) {
+                throw InternalError("failure");
+            }
+            order_specs.push_back(os);
+        }
+
+        std::sort(all_rows.begin(), all_rows.end(), [&](const UnifiedRow &a, const UnifiedRow &b) {
+            for (auto &os : order_specs) {
+                if (os.col_idx < 0 || os.col_idx >= num_cols) continue;
+                if (out_types[os.col_idx] == TYPE_STRING) {
+                    int cmp = a.vals[os.col_idx].compare(b.vals[os.col_idx]);
+                    if (cmp != 0) return os.is_desc ? (cmp > 0) : (cmp < 0);
+                } else {
+                    double va = std::stod(a.vals[os.col_idx]);
+                    double vb = std::stod(b.vals[os.col_idx]);
+                    if (va != vb) return os.is_desc ? (va > vb) : (va < vb);
+                }
+            }
+            return false;
+        });
+    }
+
+    // 8. LIMIT
+    if (limit_n >= 0 && (int)all_rows.size() > limit_n) {
+        all_rows.resize(limit_n);
+    }
+
+    // 9. 输出
+    std::fstream outfile;
+    outfile.open("output.txt", std::ios::out | std::ios::app);
+    outfile << "|";
+    for (auto &name : out_names) outfile << " " << name << " |";
+    outfile << "\n";
+
+    RecordPrinter rec_printer(num_cols);
+    rec_printer.print_separator(context);
+    rec_printer.print_record(out_names, context);
+    rec_printer.print_separator(context);
+
+    size_t num_rec = 0;
+    for (auto &ur : all_rows) {
+        rec_printer.print_record(ur.vals, context);
+        outfile << "|";
+        for (auto &v : ur.vals) outfile << " " << v << " |";
         outfile << "\n";
         num_rec++;
     }
