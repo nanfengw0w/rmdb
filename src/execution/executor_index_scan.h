@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include <algorithm>
+#include <limits>
 #include <optional>
 
 #include "execution_defs.h"
@@ -241,7 +242,37 @@ class IndexScanExecutor : public AbstractExecutor {
     std::vector<char> make_first_col_key(const Value &value) {
         std::vector<char> key(index_meta_.col_tot_len, 0);
         memcpy(key.data(), value.raw->data, index_meta_.cols[0].len);
+        fill_suffix_with_min_key(key, 1);
         return key;
+    }
+
+    void fill_suffix_with_min_key(std::vector<char> &key, size_t begin_col) {
+        int offset = 0;
+        for (size_t i = 0; i < index_meta_.cols.size(); ++i) {
+            auto &col = index_meta_.cols[i];
+            if (i >= begin_col) {
+                fill_min_key_part(key.data() + offset, col);
+            }
+            offset += col.len;
+        }
+    }
+
+    void fill_min_key_part(char *dest, const ColMeta &col) {
+        switch (col.type) {
+            case TYPE_INT: {
+                int value = std::numeric_limits<int>::min();
+                memcpy(dest, &value, sizeof(value));
+                break;
+            }
+            case TYPE_FLOAT: {
+                float value = std::numeric_limits<float>::lowest();
+                memcpy(dest, &value, sizeof(value));
+                break;
+            }
+            case TYPE_STRING:
+                memset(dest, 0, col.len);
+                break;
+        }
     }
 
     int compare_first_col_key(const std::vector<char> &lhs, const std::vector<char> &rhs) {
