@@ -17,6 +17,7 @@ See the Mulan PSL v2 for more details. */
 #include <memory>
 
 #include "errors.h"
+#include "common/sql_rewrite.h"
 #include "optimizer/optimizer.h"
 #include "recovery/log_recovery.h"
 #include "optimizer/plan.h"
@@ -218,11 +219,15 @@ void *client_handler(void *sock_fd) {
         auto context = std::make_unique<Context>(lock_manager.get(), log_manager.get(), nullptr, data_send, &offset);
         SetTransaction(&txn_id, context.get());
 
+        // SQL预处理：去别名、ON转WHERE
+        auto rewrite_result = rewrite_sql_for_parser(std::string(data_recv));
+        std::string processed_sql = rewrite_result.sql;
+
         // 用于判断是否已经调用了yy_delete_buffer来删除buf
         bool finish_analyze = false;
         pthread_mutex_lock(buffer_mutex);
         ast::parse_tree = nullptr;
-        YY_BUFFER_STATE buf = yy_scan_string(data_recv);
+        YY_BUFFER_STATE buf = yy_scan_string(processed_sql.c_str());
         if (yyparse() == 0) {
             if (ast::parse_tree != nullptr) {
                 try {

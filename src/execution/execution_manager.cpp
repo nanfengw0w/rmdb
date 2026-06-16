@@ -14,6 +14,7 @@ See the Mulan PSL v2 for more details. */
 #include <set>
 #include "executor_delete.h"
 #include "parser/ast.h"
+#include "common/sql_rewrite.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/planner.h"
 #include "analyze/analyze.h"
@@ -1340,15 +1341,19 @@ struct ExplainNode {
     std::vector<std::shared_ptr<ExplainNode>> children;
 };
 
-static std::shared_ptr<ExplainNode> build_explain_tree(SmManager *sm_manager, std::shared_ptr<Plan> plan) {
+static std::shared_ptr<ExplainNode> build_explain_tree(SmManager *sm_manager, std::shared_ptr<Plan> plan, bool is_select_star = false) {
     if (auto x = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
         auto node = std::make_shared<ExplainNode>();
         node->type = "Project";
         std::string cols = "columns=[";
-        for (size_t i = 0; i < x->sel_cols_.size(); i++) {
-            if (i > 0) cols += ", ";
-            if (x->sel_cols_[i].tab_name.empty()) cols += x->sel_cols_[i].col_name;
-            else cols += x->sel_cols_[i].tab_name + "." + x->sel_cols_[i].col_name;
+        if (is_select_star) {
+            cols += "*";
+        } else {
+            for (size_t i = 0; i < x->sel_cols_.size(); i++) {
+                if (i > 0) cols += ", ";
+                if (x->sel_cols_[i].tab_name.empty()) cols += x->sel_cols_[i].col_name;
+                else cols += x->sel_cols_[i].tab_name + "." + x->sel_cols_[i].col_name;
+            }
         }
         cols += "]";
         node->attrs.push_back(cols);
@@ -1459,143 +1464,9 @@ void QlManager::handle_explain_analyze(const std::string &sql, Context *context)
     if (!inner_sql.empty() && inner_sql.back() == ';') inner_sql.pop_back();
     inner_sql = trim_str(inner_sql);
 
-    // SQL预处理：去别名、ON转WHERE
-    {
-        // 按token分割
-        std::vector<std::string> tokens;
-        {
-            std::string cur;
-            for (char c : inner_sql) {
-                if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '(' || c == ')' ||
-                    c == ',' || c == ';' || c == '=' || c == '<' || c == '>' || c == '!') {
-                    if (!cur.empty()) { tokens.push_back(cur); cur.clear(); }
-                    if (c != ' ' && c != '\t' && c != '\n' && c != '\r') {
-                        tokens.push_back(std::string(1, c));
-                    }
-                } else {
-                    cur += c;
-                }
-            }
-            if (!cur.empty()) tokens.push_back(cur);
-        }
-
-        // 重建SQL，去别名，ON转WHERE
-        std::vector<std::string> output_tokens;
-        std::map<std::string, std::string> alias_map; // alias -> table_name
-        for (size_t i = 0; i < tokens.size(); i++) {
-            std::string tl = to_lower_str(tokens[i]);
-
-            // 去掉AS: "table AS alias" -> 记录映射，跳过AS和alias
-            if (tl == "as" && i + 1 < tokens.size() && !output_tokens.empty()) {
-                alias_map[to_lower_str(tokens[i+1])] = to_lower_str(output_tokens.back());
-                i++; // 跳过alias
-                continue;
-            }
-
-            // FROM/JOIN后面的: "table alias" -> 记录映射，只输出table
-            if ((tl == "from" || tl == "join") && i + 1 < tokens.size()) {
-                output_tokens.push_back(tokens[i]);
-                i++;
-                output_tokens.push_back(tokens[i]);
-                std::string table_name = to_lower_str(tokens[i]);
-                // 检查下一个token是否是别名
-                if (i + 1 < tokens.size()) {
-                    std::string next_lower = to_lower_str(tokens[i+1]);
-                    bool is_kw = (next_lower == "where" || next_lower == "on" ||
-                        next_lower == "join" || next_lower == "inner" || next_lower == "left" ||
-                        next_lower == "right" || next_lower == "group" || next_lower == "order" ||
-                        next_lower == "having" || next_lower == "limit" || next_lower == "union" ||
-                        next_lower == "select" || next_lower == "and" || next_lower == "or" ||
-                        next_lower == "as" || next_lower == ",");
-                    if (!is_kw) {
-                        alias_map[next_lower] = table_name;
-                        i++; // 跳过别名
-                    }
-                }
-                continue;
-            }
-
-            // ON转WHERE
-            if (tl == "on") {
-                output_tokens.push_back("WHERE");
-                continue;
-            }
-
-            // 替换别名前缀: "alias.col" -> "table.col"
-            size_t dot_pos = tokens[i].find('.');
-            if (dot_pos != std::string::npos && dot_pos > 0) {
-                std::string prefix = to_lower_str(tokens[i].substr(0, dot_pos));
-                auto it = alias_map.find(prefix);
-                if (it != alias_map.end()) {
-                    tokens[i] = it->second + tokens[i].substr(dot_pos);
-                }
-            }
-
-            output_tokens.push_back(tokens[i]);
-        }
-
-        // 合并多个WHERE为一个（用AND连接）
-        std::vector<std::string> merged;
-        bool seen_where = false;
-        for (size_t i = 0; i < output_tokens.size(); i++) {
-            std::string tl = to_lower_str(output_tokens[i]);
-            if (tl == "where") {
-                if (seen_where) {
-                    // 用AND代替第二个WHERE
-                    merged.push_back("AND");
-                } else {
-                    merged.push_back(output_tokens[i]);
-                    seen_where = true;
-                }
-            } else {
-                merged.push_back(output_tokens[i]);
-            }
-        }
-
-        // 重建SQL
-        inner_sql = "";
-        for (size_t i = 0; i < merged.size(); i++) {
-            if (i > 0) inner_sql += " ";
-            inner_sql += merged[i];
-        }
-    }
-    {
-        std::string result;
-        std::istringstream iss(inner_sql);
-        std::string word;
-        std::vector<std::string> words;
-        while (iss >> word) words.push_back(word);
-        for (size_t i = 0; i < words.size(); i++) {
-            if (!result.empty()) result += " ";
-            result += words[i];
-            // 检查是否是FROM/JOIN后面的第一个表名
-            std::string w_lower = to_lower_str(words[i]);
-            if ((w_lower == "from" || w_lower == "join") && i + 1 < words.size()) {
-                // 下一个是表名
-                result += " " + words[i+1];
-                i++;
-                // 检查再下一个是否是别名（不是关键字）
-                if (i + 1 < words.size()) {
-                    std::string next_lower = to_lower_str(words[i+1]);
-                    bool is_keyword = (next_lower == "where" || next_lower == "on" ||
-                        next_lower == "join" || next_lower == "inner" || next_lower == "left" ||
-                        next_lower == "right" || next_lower == "outer" || next_lower == "cross" ||
-                        next_lower == "group" || next_lower == "order" || next_lower == "having" ||
-                        next_lower == "limit" || next_lower == "union" || next_lower == "as" ||
-                        next_lower == "select" || next_lower == "insert" || next_lower == "update" ||
-                        next_lower == "delete" || next_lower == "set" || next_lower == "values" ||
-                        next_lower == "into" || next_lower == "and" || next_lower == "or" ||
-                        next_lower == "not" || next_lower == "in" || next_lower == "between" ||
-                        next_lower == "like" || next_lower == "is" || next_lower == "null");
-                    if (!is_keyword && words[i+1].find('(') == std::string::npos) {
-                        // 跳过别名
-                        i++;
-                    }
-                }
-            }
-        }
-        inner_sql = result;
-    }
+    // 使用共享的SQL预处理函数
+    auto rewrite_result = rewrite_sql_for_parser(inner_sql);
+    inner_sql = rewrite_result.sql;
 
     ast::parse_tree = nullptr;
     std::string sql_semi = inner_sql;
@@ -1614,7 +1485,7 @@ void QlManager::handle_explain_analyze(const std::string &sql, Context *context)
     auto dml_plan = std::dynamic_pointer_cast<DMLPlan>(plan);
     if (!dml_plan || dml_plan->tag != T_select) throw InternalError("EXPLAIN ANALYZE only supports SELECT");
 
-    auto explain_root = build_explain_tree(sm_manager_, dml_plan->subplan_);
+    auto explain_root = build_explain_tree(sm_manager_, dml_plan->subplan_, rewrite_result.is_select_star);
 
     // 填充行数 - 通过执行器包装器统计每层行数
     // 对于简单SELECT（单表），直接执行获取各层行数
@@ -1656,10 +1527,14 @@ void QlManager::handle_explain_analyze(const std::string &sql, Context *context)
                     }
                 } else if (node->children[1]->type == "Filter") {
                     // 右子树是Filter+Scan
+                    // Filter行数 = 左表行数 * 右表过滤后行数
                     auto right_exec = build_executor_tree(sm_manager_, x->right_, context);
                     int right_filtered = count_executor_rows(right_exec.get());
-                    node->children[1]->rows = right_filtered;
-                    // Scan行数保持不变（总扫描行数）
+                    node->children[1]->rows = left_rows * right_filtered;
+                    // Scan行数 = 左表行数 * 右表总行数
+                    if (!node->children[1]->children.empty() && node->children[1]->children[0]->type == "Scan") {
+                        node->children[1]->children[0]->rows = left_rows * node->children[1]->children[0]->rows;
+                    }
                 }
             }
         } else if (auto x = std::dynamic_pointer_cast<SortPlan>(p)) {
@@ -1671,6 +1546,32 @@ void QlManager::handle_explain_analyze(const std::string &sql, Context *context)
 
     std::string output;
     format_explain_tree(explain_root, output);
+
+    // 将表名替换回别名（用于condition和columns显示）
+    for (auto &[alias, table] : rewrite_result.alias_to_table) {
+        // 替换 "table." 为 "alias." （仅在condition和columns中）
+        std::string from = table + ".";
+        std::string to = alias + ".";
+        size_t pos = 0;
+        while ((pos = output.find(from, pos)) != std::string::npos) {
+            output.replace(pos, from.length(), to);
+            pos += to.length();
+        }
+    }
+
+    // 修复浮点数显示: 去掉多余的0
+    // 1000.000000 -> 1000, 1200.000000 -> 1200
+    {
+        size_t pos = 0;
+        while ((pos = output.find(".000000", pos)) != std::string::npos) {
+            // 检查前面是否是数字
+            if (pos > 0 && isdigit(output[pos-1])) {
+                output.erase(pos, 7); // 去掉 ".000000"
+            } else {
+                pos += 7;
+            }
+        }
+    }
 
     std::fstream outfile;
     outfile.open("output.txt", std::ios::out | std::ios::app);
