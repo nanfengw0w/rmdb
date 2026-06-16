@@ -34,8 +34,14 @@ bool Planner::get_index_cols(std::string tab_name, std::vector<Condition> curr_c
 
         bool found_leftmost_col = false;
         for (auto& cond : curr_conds) {
-            if (cond.is_rhs_val && cond.lhs_col.tab_name == tab_name &&
+            // 检查lhs或rhs是否匹配索引的第一列
+            if (cond.lhs_col.tab_name == tab_name &&
                 cond.lhs_col.col_name == index.cols[0].name) {
+                found_leftmost_col = true;
+                break;
+            }
+            if (!cond.is_rhs_val && cond.rhs_col.tab_name == tab_name &&
+                cond.rhs_col.col_name == index.cols[0].name) {
                 found_leftmost_col = true;
                 break;
             }
@@ -205,6 +211,18 @@ std::shared_ptr<Plan> Planner::make_one_rel(std::shared_ptr<Query> query)
                 it = remaining_conds.erase(it);
             } else {
                 ++it;
+            }
+        }
+
+        // 检查JOIN条件中是否有索引可用于内表
+        auto right_scan = std::dynamic_pointer_cast<ScanPlan>(table_scan_executors[i]);
+        if (right_scan && right_scan->tag == T_SeqScan) {
+            std::vector<std::string> join_index_cols;
+            bool has_join_index = get_index_cols(tables[i], join_conds, join_index_cols);
+            if (has_join_index) {
+                // 升级为IndexScan
+                table_scan_executors[i] = std::make_shared<ScanPlan>(T_IndexScan, sm_manager_,
+                    tables[i], right_scan->conds_, join_index_cols);
             }
         }
 

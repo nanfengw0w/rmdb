@@ -1642,11 +1642,18 @@ void QlManager::handle_explain_analyze(const std::string &sql, Context *context)
             node->rows = total_rows;
             if (node->children.size() >= 2) {
                 fill_rows(node->children[0], x->left_);
-                // 右子树行数 = 左表行数 * 右表单次扫描行数
                 auto left_exec = build_executor_tree(sm_manager_, x->left_, context);
                 int left_rows = count_executor_rows(left_exec.get());
                 if (node->children[1]->type == "Scan") {
-                    node->children[1]->rows = left_rows * node->children[1]->rows;
+                    // 检查是否是IndexScan
+                    auto right_plan = std::dynamic_pointer_cast<ScanPlan>(x->right_);
+                    if (right_plan && right_plan->tag == T_IndexScan) {
+                        // IndexScan: 每个外层行做一次索引查找，总行数=Join输出行数
+                        node->children[1]->rows = total_rows;
+                    } else {
+                        // SeqScan: 右表被左表每行全表扫描
+                        node->children[1]->rows = left_rows * node->children[1]->rows;
+                    }
                 } else if (node->children[1]->type == "Filter") {
                     // 右子树是Filter+Scan
                     auto right_exec = build_executor_tree(sm_manager_, x->right_, context);
