@@ -128,6 +128,35 @@ void *client_handler(void *sock_fd) {
 
         std::cout << "Read from client " << fd << ": " << data_recv << std::endl;
 
+        // Handle "show index from table_name" directly
+        std::string cmd_str(data_recv);
+        // Trim leading whitespace
+        size_t start = cmd_str.find_first_not_of(" \t\r\n");
+        if (start != std::string::npos) cmd_str = cmd_str.substr(start);
+        // Check for show index from (case insensitive)
+        std::string cmd_lower = cmd_str;
+        for (auto &c : cmd_lower) c = tolower(c);
+        if (cmd_lower.length() > 16 &&
+            cmd_lower.substr(0, 16) == "show index from ") {
+            std::string tab_name = cmd_str.substr(16);
+            // Remove trailing semicolon and whitespace
+            while (!tab_name.empty() && (tab_name.back() == ';' || tab_name.back() == ' ' || tab_name.back() == '\n' || tab_name.back() == '\r')) {
+                tab_name.pop_back();
+            }
+            try {
+                sm_manager->show_index(tab_name, nullptr);
+                set_response(data_send, &offset, "OK\n");
+            } catch (std::exception &e) {
+                set_response(data_send, &offset, std::string("failure\n"));
+                std::fstream outfile;
+                outfile.open("output.txt", std::ios::out | std::ios::app);
+                outfile << "failure\n";
+                outfile.close();
+            }
+            if (write(fd, data_send, offset + 1) == -1) break;
+            continue;
+        }
+
         memset(data_send, '\0', BUFFER_LENGTH);
         offset = 0;
 

@@ -28,6 +28,7 @@ class IndexScanExecutor : public AbstractExecutor {
 
     std::vector<std::string> index_col_names_;
     IndexMeta index_meta_;
+    IxIndexHandle *ih_;
 
     Rid rid_;
     std::unique_ptr<RecScan> scan_;
@@ -63,16 +64,79 @@ class IndexScanExecutor : public AbstractExecutor {
         }
         fed_conds_ = conds_;
         is_end_ = true;
+
+        // Get the index handle
+        std::string ix_name = sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_col_names_);
+        if (sm_manager_->ihs_.count(ix_name)) {
+            ih_ = sm_manager_->ihs_.at(ix_name).get();
+        } else {
+            ih_ = nullptr;
+        }
     }
 
     void beginTuple() override {
-        scan_ = std::make_unique<RmScan>(fh_);
+        if (ih_ == nullptr) {
+            is_end_ = true;
+            return;
+        }
+
+        // Build search key from conditions
+        char *key = new char[index_meta_.col_tot_len];
+        memset(key, 0, index_meta_.col_tot_len);
+
+        bool has_eq = true;
+        int offset = 0;
+        for (auto &col : index_meta_.cols) {
+            bool found = false;
+            for (auto &cond : conds_) {
+                if (cond.is_rhs_val && cond.lhs_col.col_name == col.name && cond.op == OP_EQ) {
+                    memcpy(key + offset, cond.rhs_val.raw->data, col.len);
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                has_eq = false;
+                break;
+            }
+            offset += col.len;
+        }
+
+        if (has_eq && index_col_names_.size() == (size_t)index_meta_.col_num) {
+            // Exact match on all index columns - use point lookup
+            std::vector<Rid> result;
+            if (ih_->get_value(key, &result, nullptr) && !result.empty()) {
+                rid_ = result[0];
+                auto record = fh_->get_record(rid_, context_);
+                if (eval_conds(record.get(), fed_conds_)) {
+                    is_end_ = false;
+                    delete[] key;
+                    return;
+                }
+            }
+            is_end_ = true;
+            delete[] key;
+            return;
+        }
+
+        // Range scan using lower_bound
+        Iid lower = ih_->lower_bound(key);
+        Iid upper = ih_->leaf_end();
+        delete[] key;
+
+        scan_ = std::make_unique<IxScan>(ih_, lower, upper, sm_manager_->get_bpm());
         is_end_ = false;
+
+        // Find first matching tuple
         while (!scan_->is_end()) {
             rid_ = scan_->rid();
-            auto record = fh_->get_record(rid_, context_);
-            if (eval_conds(record.get(), conds_)) {
-                return;
+            try {
+                auto record = fh_->get_record(rid_, context_);
+                if (eval_conds(record.get(), fed_conds_)) {
+                    return;
+                }
+            } catch (...) {
+                // Skip invalid records
             }
             scan_->next();
         }
@@ -80,12 +144,21 @@ class IndexScanExecutor : public AbstractExecutor {
     }
 
     void nextTuple() override {
+        // If scan_ is null (point lookup mode), there's only one result
+        if (!scan_) {
+            is_end_ = true;
+            return;
+        }
         scan_->next();
         while (!scan_->is_end()) {
             rid_ = scan_->rid();
-            auto record = fh_->get_record(rid_, context_);
-            if (eval_conds(record.get(), conds_)) {
-                return;
+            try {
+                auto record = fh_->get_record(rid_, context_);
+                if (eval_conds(record.get(), fed_conds_)) {
+                    return;
+                }
+            } catch (...) {
+                // Skip invalid records
             }
             scan_->next();
         }
