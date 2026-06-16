@@ -16,6 +16,7 @@ See the Mulan PSL v2 for more details. */
 #include <string>
 #include <vector>
 #include "defs.h"
+#include "errors.h"
 #include "record/rm_defs.h"
 
 
@@ -57,10 +58,14 @@ struct Value {
         if(raw != nullptr) { raw.reset(); }
         raw = std::make_shared<RmRecord>(len);
         if (type == TYPE_INT) {
-            assert(len == sizeof(int));
+            if (len != sizeof(int)) {
+                throw InternalError("Invalid INT raw length");
+            }
             *(int *)(raw->data) = int_val;
         } else if (type == TYPE_FLOAT) {
-            assert(len == sizeof(float));
+            if (len != sizeof(float)) {
+                throw InternalError("Invalid FLOAT raw length");
+            }
             *(float *)(raw->data) = float_val;
         } else if (type == TYPE_STRING) {
             if (len < (int)str_val.size()) {

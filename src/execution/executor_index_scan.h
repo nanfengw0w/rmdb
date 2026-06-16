@@ -54,7 +54,9 @@ class IndexScanExecutor : public AbstractExecutor {
 
         for (auto &cond : conds_) {
             if (cond.lhs_col.tab_name != tab_name_) {
-                assert(!cond.is_rhs_val && cond.rhs_col.tab_name == tab_name_);
+                if (cond.is_rhs_val || cond.rhs_col.tab_name != tab_name_) {
+                    throw InternalError("Index scan condition does not reference target table");
+                }
                 std::swap(cond.lhs_col, cond.rhs_col);
                 cond.op = swap_op.at(cond.op);
             }

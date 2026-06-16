@@ -17,6 +17,7 @@ See the Mulan PSL v2 for more details. */
 #include <sstream>
 #include "common/context.h"
 #include "common/config.h"
+#include "errors.h"
 
 #define RECORD_COUNT_LENGTH 40
 
@@ -25,7 +26,9 @@ class RecordPrinter {
     size_t num_cols;
 public:
     RecordPrinter(size_t num_cols_) : num_cols(num_cols_) {
-        assert(num_cols_ > 0);
+        if (num_cols_ == 0) {
+            throw InternalError("No columns to print");
+        }
     }
 
     void print_separator(Context *context) const {
@@ -51,7 +54,9 @@ public:
     }
 
     void print_record(const std::vector<std::string> &rec_str, Context *context) const {
-        assert(rec_str.size() == num_cols);
+        if (rec_str.size() != num_cols) {
+            throw InternalError("Printed record column count mismatch");
+        }
         for (auto col: rec_str) {
             if (col.size() > COL_WIDTH) {
                 col = col.substr(0, COL_WIDTH - 3) + "...";
