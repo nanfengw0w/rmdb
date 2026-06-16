@@ -95,6 +95,12 @@ class IndexScanExecutor : public AbstractExecutor {
             return;
         }
 
+        if (index_meta_.col_num > 1) {
+            materialize_index_scan(ih_->leaf_begin(), ih_->leaf_end());
+            finish_materialized_scan();
+            return;
+        }
+
         auto exact_key = build_exact_match_key();
         if (exact_key.has_value()) {
             std::vector<Rid> result;
@@ -154,19 +160,7 @@ class IndexScanExecutor : public AbstractExecutor {
                                                   : ih_->lower_bound(upper_bound->key.data()))
                         : ih_->leaf_end();
 
-        IxScan index_scan(ih_, lower, upper, sm_manager_->get_bpm());
-        while (!index_scan.is_end()) {
-            if (!eval_index_key(index_scan.key())) {
-                index_scan.next();
-                continue;
-            }
-            auto candidate_rid = index_scan.rid();
-            auto record = fh_->get_record(candidate_rid, context_);
-            if (eval_conds(record.get(), fed_conds_)) {
-                matched_rids_.push_back(candidate_rid);
-            }
-            index_scan.next();
-        }
+        materialize_index_scan(lower, upper);
         finish_materialized_scan();
     }
 
@@ -195,6 +189,22 @@ class IndexScanExecutor : public AbstractExecutor {
     const std::vector<ColMeta> &cols() const override { return cols_; }
 
    private:
+    void materialize_index_scan(const Iid &lower, const Iid &upper) {
+        IxScan index_scan(ih_, lower, upper, sm_manager_->get_bpm());
+        while (!index_scan.is_end()) {
+            if (!eval_index_key(index_scan.key())) {
+                index_scan.next();
+                continue;
+            }
+            auto candidate_rid = index_scan.rid();
+            auto record = fh_->get_record(candidate_rid, context_);
+            if (eval_conds(record.get(), fed_conds_)) {
+                matched_rids_.push_back(candidate_rid);
+            }
+            index_scan.next();
+        }
+    }
+
     bool eval_index_key(const char *key) {
         for (auto &cond : conds_) {
             if (!cond.is_rhs_val || cond.lhs_col.tab_name != tab_name_) {
