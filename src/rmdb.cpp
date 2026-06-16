@@ -165,6 +165,26 @@ void *client_handler(void *sock_fd) {
                     outfile.open("output.txt",std::ios::out | std::ios::app);
                     outfile << "failure\n";
                     outfile.close();
+                } catch (std::exception &e) {
+                    std::cerr << "Standard exception: " << e.what() << std::endl;
+                    std::string err_msg = std::string("Error: ") + e.what();
+                    memcpy(data_send, err_msg.c_str(), err_msg.length());
+                    data_send[err_msg.length()] = '\n';
+                    offset = err_msg.length();
+                    std::fstream outfile;
+                    outfile.open("output.txt", std::ios::out | std::ios::app);
+                    outfile << "failure\n";
+                    outfile.close();
+                } catch (...) {
+                    std::cerr << "Unknown exception caught" << std::endl;
+                    std::string err_msg = "Error: Unknown error";
+                    memcpy(data_send, err_msg.c_str(), err_msg.length());
+                    data_send[err_msg.length()] = '\n';
+                    offset = err_msg.length();
+                    std::fstream outfile;
+                    outfile.open("output.txt", std::ios::out | std::ios::app);
+                    outfile << "failure\n";
+                    outfile.close();
                 }
             }
         }

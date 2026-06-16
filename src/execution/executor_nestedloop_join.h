@@ -1,4 +1,4 @@
-/* Copyright (c) 2023 Renmin University of China
+﻿/* Copyright (c) 2023 Renmin University of China
 RMDB is licensed under Mulan PSL v2.
 You can use this software according to the terms and conditions of the Mulan PSL v2.
 You may obtain a copy of Mulan PSL v2 at:
@@ -24,7 +24,6 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
 
     std::vector<Condition> fed_conds_;
     bool isend;
-    bool right_valid_;
     std::unique_ptr<RmRecord> left_rec_;
     std::unique_ptr<RmRecord> right_rec_;
 
@@ -42,7 +41,6 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
         cols_.insert(cols_.end(), right_cols.begin(), right_cols.end());
         isend = false;
         fed_conds_ = std::move(conds);
-        right_valid_ = false;
     }
 
     void beginTuple() override {
@@ -52,29 +50,61 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
             return;
         }
         left_rec_ = left_->Next();
-        advance_to_match();
+        right_->beginTuple();
+        if (right_->is_end()) {
+            isend = true;
+            return;
+        }
+        // Find first matching tuple
+        while (true) {
+            right_rec_ = right_->Next();
+            if (eval_conds()) {
+                return;  // Found a match
+            }
+            right_->nextTuple();
+            if (right_->is_end()) {
+                // Right exhausted, advance left
+                left_->nextTuple();
+                if (left_->is_end()) {
+                    isend = true;
+                    return;
+                }
+                left_rec_ = left_->Next();
+                right_->beginTuple();
+                if (right_->is_end()) {
+                    isend = true;
+                    return;
+                }
+            }
+        }
     }
 
     void nextTuple() override {
-        // Try to advance right and find next match without resetting
-        while (!left_->is_end()) {
-            while (!right_->is_end()) {
-                right_rec_ = right_->Next();
-                if (eval_conds()) {
+        // Advance right to get next tuple
+        right_->nextTuple();
+        
+        while (true) {
+            // Check if right is exhausted
+            while (right_->is_end()) {
+                left_->nextTuple();
+                if (left_->is_end()) {
+                    isend = true;
                     return;
                 }
-                right_->nextTuple();
+                left_rec_ = left_->Next();
+                right_->beginTuple();
+                if (right_->is_end()) {
+                    continue;  // Right table is empty, try next left
+                }
             }
-            // Right exhausted, advance left
-            left_->nextTuple();
-            if (left_->is_end()) {
-                isend = true;
-                return;
+            
+            // Get current right tuple
+            right_rec_ = right_->Next();
+            if (eval_conds()) {
+                return;  // Found a match
             }
-            left_rec_ = left_->Next();
-            right_->beginTuple();
+            right_->nextTuple();
         }
-        isend = true;
     }
 
     std::unique_ptr<RmRecord> Next() override {
@@ -93,27 +123,6 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
     const std::vector<ColMeta> &cols() const override { return cols_; }
 
    private:
-    void advance_to_match() {
-        while (!left_->is_end()) {
-            while (!right_->is_end()) {
-                right_rec_ = right_->Next();
-                if (eval_conds()) {
-                    return;
-                }
-                right_->nextTuple();
-            }
-            // Right exhausted, advance left and reset right
-            left_->nextTuple();
-            if (left_->is_end()) {
-                isend = true;
-                return;
-            }
-            left_rec_ = left_->Next();
-            right_->beginTuple();
-        }
-        isend = true;
-    }
-
     bool eval_conds() {
         for (auto &cond : fed_conds_) {
             auto &lhs_meta = find_col_meta(cols_, cond.lhs_col);
@@ -180,3 +189,4 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
         }
     }
 };
+
