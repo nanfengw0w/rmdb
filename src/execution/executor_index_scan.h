@@ -119,10 +119,24 @@ class IndexScanExecutor : public AbstractExecutor {
             return;
         }
 
-        // Range scan using lower_bound
-        Iid lower = ih_->lower_bound(key);
+        // Range scan - compute lower bound from conditions
+        // Try to find the best lower bound from GT/GE conditions on the first index column
+        char *lower_key = new char[index_meta_.col_tot_len];
+        memset(lower_key, 0, index_meta_.col_tot_len);
+        bool has_lower = false;
+        for (auto &cond : conds_) {
+            if (cond.is_rhs_val && cond.lhs_col.col_name == index_meta_.cols[0].name) {
+                if (cond.op == OP_GT || cond.op == OP_GE) {
+                    memcpy(lower_key, cond.rhs_val.raw->data, index_meta_.cols[0].len);
+                    has_lower = true;
+                    break;
+                }
+            }
+        }
+        Iid lower = has_lower ? ih_->lower_bound(lower_key) : ih_->leaf_begin();
         Iid upper = ih_->leaf_end();
         delete[] key;
+        delete[] lower_key;
 
         scan_ = std::make_unique<IxScan>(ih_, lower, upper, sm_manager_->get_bpm());
         is_end_ = false;
