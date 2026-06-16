@@ -71,7 +71,7 @@ class IxNodeHandle {
 
     void set_size(int size) { page_hdr->num_key = size; }
 
-    int get_max_size() { return file_hdr->btree_order_ + 1; }
+    int get_max_size() { return file_hdr->btree_order_; }
 
     int get_min_size() { return get_max_size() / 2; }
 

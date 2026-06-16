@@ -98,10 +98,10 @@ class IndexScanExecutor : public AbstractExecutor {
         if (exact_key.has_value()) {
             std::vector<Rid> result;
             if (ih_->get_value(exact_key->data(), &result, nullptr)) {
-                for (auto &rid : result) {
-                    auto record = fh_->get_record(rid, context_);
+                for (auto &candidate_rid : result) {
+                    auto record = fh_->get_record(candidate_rid, context_);
                     if (eval_conds(record.get(), fed_conds_)) {
-                        matched_rids_.push_back(rid);
+                        matched_rids_.push_back(candidate_rid);
                     }
                 }
             }
@@ -155,6 +155,10 @@ class IndexScanExecutor : public AbstractExecutor {
 
         IxScan index_scan(ih_, lower, upper, sm_manager_->get_bpm());
         while (!index_scan.is_end()) {
+            if (!eval_index_key(index_scan.key())) {
+                index_scan.next();
+                continue;
+            }
             auto candidate_rid = index_scan.rid();
             auto record = fh_->get_record(candidate_rid, context_);
             if (eval_conds(record.get(), fed_conds_)) {
@@ -190,6 +194,29 @@ class IndexScanExecutor : public AbstractExecutor {
     const std::vector<ColMeta> &cols() const override { return cols_; }
 
    private:
+    bool eval_index_key(const char *key) {
+        for (auto &cond : conds_) {
+            if (!cond.is_rhs_val || cond.lhs_col.tab_name != tab_name_) {
+                continue;
+            }
+            int offset = 0;
+            bool matched_index_col = false;
+            for (auto &col : index_meta_.cols) {
+                if (cond.lhs_col.col_name == col.name) {
+                    int cmp = compare_value(key + offset, cond.rhs_val.raw->data, col.type, col.len);
+                    if (!eval_cmp(cmp, cond.op)) {
+                        return false;
+                    }
+                    matched_index_col = true;
+                    break;
+                }
+                offset += col.len;
+            }
+            (void)matched_index_col;
+        }
+        return true;
+    }
+
     std::optional<std::vector<char>> build_exact_match_key() {
         std::vector<char> key(index_meta_.col_tot_len, 0);
         int offset = 0;

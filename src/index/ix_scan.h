@@ -48,5 +48,13 @@ class IxScan : public RecScan {
 
     Rid rid() const override;
 
+    const char *key() const {
+        assert(current_node_ != nullptr);
+        if (iid_.slot_no >= current_node_->get_size()) {
+            throw IndexEntryNotFoundError();
+        }
+        return current_node_->get_key(iid_.slot_no);
+    }
+
     const Iid &iid() const { return iid_; }
 };
