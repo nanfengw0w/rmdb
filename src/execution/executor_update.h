@@ -46,8 +46,7 @@ class UpdateExecutor : public AbstractExecutor {
 
             // Record write operation for transaction abort (save old value)
             if (context_ != nullptr && context_->txn_ != nullptr) {
-                WriteRecord write_rec(WType::UPDATE_TUPLE, tab_name_, rids_[cur_idx_], *record);
-                context_->txn_->append_write_record(new WriteRecord(write_rec));
+                context_->txn_->append_write_record(new WriteRecord(WType::UPDATE_TUPLE, tab_name_, rids_[cur_idx_], *record));
             }
 
             // Delete old index entries

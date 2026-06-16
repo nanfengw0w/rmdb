@@ -204,7 +204,10 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
 
 // 执行DML语句
 void QlManager::run_dml(std::unique_ptr<AbstractExecutor> exec){
-    do {
+    if (exec == nullptr) {
+        throw InternalError("Null DML executor");
+    }
+    while (!exec->is_end()) {
         exec->Next();
-    } while (!exec->is_end());
+    }
 }

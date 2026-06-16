@@ -23,6 +23,7 @@ class InsertExecutor : public AbstractExecutor {
     std::string tab_name_;          // 表名称
     Rid rid_;                       // 插入的位置，由于系统默认插入时不指定位置，因此当前rid_在插入后才赋值
     SmManager *sm_manager_;
+    bool done_;
 
    public:
     InsertExecutor(SmManager *sm_manager, const std::string &tab_name, std::vector<Value> values, Context *context) {
@@ -35,9 +36,13 @@ class InsertExecutor : public AbstractExecutor {
         }
         fh_ = sm_manager_->fhs_.at(tab_name).get();
         context_ = context;
+        done_ = false;
     };
 
     std::unique_ptr<RmRecord> Next() override {
+        if (done_) {
+            return nullptr;
+        }
         // Make record buffer
         RmRecord rec(fh_->get_file_hdr().record_size);
         for (size_t i = 0; i < values_.size(); i++) {
@@ -58,8 +63,7 @@ class InsertExecutor : public AbstractExecutor {
 
         // Record write operation for transaction abort
         if (context_ != nullptr && context_->txn_ != nullptr) {
-            WriteRecord write_rec(WType::INSERT_TUPLE, tab_name_, rid_);
-            context_->txn_->append_write_record(new WriteRecord(write_rec));
+            context_->txn_->append_write_record(new WriteRecord(WType::INSERT_TUPLE, tab_name_, rid_));
         }
 
         // Insert into index
@@ -73,8 +77,12 @@ class InsertExecutor : public AbstractExecutor {
                 offset += index.cols[i].len;
             }
             ih->insert_entry(key, rid_, context_->txn_);
+            delete[] key;
         }
+        done_ = true;
         return nullptr;
     }
     Rid &rid() override { return rid_; }
+
+    bool is_end() const override { return done_; }
 };

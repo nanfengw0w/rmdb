@@ -609,6 +609,7 @@ char *yytext;
 #include "ast.h"
 #include "yacc.tab.h"
 #include <iostream>
+#include <strings.h>
 
 // automatically update location
 #define YY_USER_ACTION \
@@ -1136,6 +1137,20 @@ case 42:
 YY_RULE_SETUP
 #line 95 "lex.l"
 {
+    if (strcasecmp(yytext, "enable_nestloop") == 0) {
+        return ENABLE_NESTLOOP;
+    }
+    if (strcasecmp(yytext, "enable_sortmerge") == 0) {
+        return ENABLE_SORTMERGE;
+    }
+    if (strcasecmp(yytext, "true") == 0) {
+        yylval->sv_bool = true;
+        return VALUE_BOOL;
+    }
+    if (strcasecmp(yytext, "false") == 0) {
+        yylval->sv_bool = false;
+        return VALUE_BOOL;
+    }
     yylval->sv_str = yytext;
     return IDENTIFIER;
 }

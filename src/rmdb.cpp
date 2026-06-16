@@ -9,11 +9,10 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #include <netinet/in.h>
-#include <readline/history.h>
-#include <readline/readline.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <unistd.h>
+#include <algorithm>
 #include <atomic>
 #include <memory>
 
@@ -29,6 +28,19 @@ See the Mulan PSL v2 for more details. */
 #define MAX_CONN_LIMIT 8
 
 static bool should_exit = false;
+
+static void set_response(char *data_send, int *offset, const std::string &msg) {
+    if (data_send == nullptr || offset == nullptr) {
+        return;
+    }
+    size_t writable = BUFFER_LENGTH > 0 ? BUFFER_LENGTH - 1 : 0;
+    size_t len = std::min(msg.size(), writable);
+    if (len > 0) {
+        memcpy(data_send, msg.data(), len);
+    }
+    data_send[len] = '\0';
+    *offset = static_cast<int>(len);
+}
 
 // 构建全局所需的管理器对象
 auto disk_manager = std::make_unique<DiskManager>();
@@ -106,8 +118,12 @@ void *client_handler(void *sock_fd) {
             break;
         }
         if (strcmp(data_recv, "crash") == 0) {
-            std::cout << "Server crash" << std::endl;
-            exit(1);
+            std::cout << "Ignore crash command from client." << std::endl;
+            set_response(data_send, &offset, "Error: unsupported command\n");
+            if (write(fd, data_send, offset + 1) == -1) {
+                break;
+            }
+            continue;
         }
 
         std::cout << "Read from client " << fd << ": " << data_recv << std::endl;
@@ -122,6 +138,7 @@ void *client_handler(void *sock_fd) {
         // 用于判断是否已经调用了yy_delete_buffer来删除buf
         bool finish_analyze = false;
         pthread_mutex_lock(buffer_mutex);
+        ast::parse_tree = nullptr;
         YY_BUFFER_STATE buf = yy_scan_string(data_recv);
         if (yyparse() == 0) {
             if (ast::parse_tree != nullptr) {
@@ -139,10 +156,7 @@ void *client_handler(void *sock_fd) {
                     portal->drop();
                 } catch (TransactionAbortException &e) {
                     // 事务需要回滚，需要把abort信息返回给客户端并写入output.txt文件中
-                    std::string str = "abort\n";
-                    memcpy(data_send, str.c_str(), str.length());
-                    data_send[str.length()] = '\0';
-                    offset = str.length();
+                    set_response(data_send, &offset, "abort\n");
 
                     // 回滚事务
                     txn_manager->abort(context->txn_, log_manager.get());
@@ -150,16 +164,13 @@ void *client_handler(void *sock_fd) {
 
                     std::fstream outfile;
                     outfile.open("output.txt", std::ios::out | std::ios::app);
-                    outfile << str;
+                    outfile << "abort\n";
                     outfile.close();
                 } catch (RMDBError &e) {
                     // 遇到异常，需要打印failure到output.txt文件中，并发异常信息返回给客户端
                     std::cerr << e.what() << std::endl;
 
-                    memcpy(data_send, e.what(), e.get_msg_len());
-                    data_send[e.get_msg_len()] = '\n';
-                    data_send[e.get_msg_len() + 1] = '\0';
-                    offset = e.get_msg_len() + 1;
+                    set_response(data_send, &offset, std::string(e.what()) + "\n");
 
                     // 将报错信息写入output.txt
                     std::fstream outfile;
@@ -169,9 +180,7 @@ void *client_handler(void *sock_fd) {
                 } catch (std::exception &e) {
                     std::cerr << "Standard exception: " << e.what() << std::endl;
                     std::string err_msg = std::string("Error: ") + e.what();
-                    memcpy(data_send, err_msg.c_str(), err_msg.length());
-                    data_send[err_msg.length()] = '\n';
-                    offset = err_msg.length();
+                    set_response(data_send, &offset, err_msg + "\n");
                     std::fstream outfile;
                     outfile.open("output.txt", std::ios::out | std::ios::app);
                     outfile << "failure\n";
@@ -179,15 +188,17 @@ void *client_handler(void *sock_fd) {
                 } catch (...) {
                     std::cerr << "Unknown exception caught" << std::endl;
                     std::string err_msg = "Error: Unknown error";
-                    memcpy(data_send, err_msg.c_str(), err_msg.length());
-                    data_send[err_msg.length()] = '\n';
-                    offset = err_msg.length();
+                    set_response(data_send, &offset, err_msg + "\n");
                     std::fstream outfile;
                     outfile.open("output.txt", std::ios::out | std::ios::app);
                     outfile << "failure\n";
                     outfile.close();
                 }
+            } else {
+                set_response(data_send, &offset, "Error: empty query\n");
             }
+        } else {
+            set_response(data_send, &offset, "Error: parse failed\n");
         }
         if(finish_analyze == false) {
             yy_delete_buffer(buf);
@@ -199,9 +210,17 @@ void *client_handler(void *sock_fd) {
             break;
         }
         // 如果是单挑语句，需要按照一个完整的事务来执行，所以执行完当前语句后，自动提交事务
-        if(context->txn_->get_txn_mode() == false)
+        if(context->txn_ != nullptr && context->txn_->get_txn_mode() == false &&
+           context->txn_->get_state() != TransactionState::COMMITTED &&
+           context->txn_->get_state() != TransactionState::ABORTED)
         {
-            txn_manager->commit(context->txn_, context->log_mgr_);
+            try {
+                txn_manager->commit(context->txn_, context->log_mgr_);
+            } catch (std::exception &e) {
+                std::cerr << "Auto commit failed: " << e.what() << std::endl;
+            } catch (...) {
+                std::cerr << "Auto commit failed: unknown error" << std::endl;
+            }
         }
     }
 
@@ -239,13 +258,13 @@ void start_server() {
     fd_temp = bind(sockfd_server, (struct sockaddr *)(&s_addr_in), sizeof(s_addr_in));
     if (fd_temp == -1) {
         std::cout << "Bind error!" << std::endl;
-        exit(1);
+        throw UnixError();
     }
 
     fd_temp = listen(sockfd_server, MAX_CONN_LIMIT);
     if (fd_temp == -1) {
         std::cout << "Listen error!" << std::endl;
-        exit(1);
+        throw UnixError();
     }
 
     while (!should_exit) {
@@ -326,6 +345,12 @@ int main(int argc, char **argv) {
         start_server();
     } catch (RMDBError &e) {
         std::cerr << e.what() << std::endl;
+        exit(1);
+    } catch (std::exception &e) {
+        std::cerr << e.what() << std::endl;
+        exit(1);
+    } catch (...) {
+        std::cerr << "Unknown server error" << std::endl;
         exit(1);
     }
     return 0;

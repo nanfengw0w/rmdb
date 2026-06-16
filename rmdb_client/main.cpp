@@ -1,7 +1,5 @@
 #include <netdb.h>
 #include <netinet/in.h>
-#include <readline/history.h>
-#include <readline/readline.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -10,6 +8,7 @@
 #include <unistd.h>
 
 #include <cassert>
+#include <cstring>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -69,12 +68,6 @@ int init_tcp_sock(const char *server_host, int server_port) {
 }
 
 int main(int argc, char *argv[]) {
-    int ret = 0;  // set_terminal_noncanonical();
-                  //    if (ret < 0) {
-                  //        printf("Warning: failed to set terminal non canonical. Long command may be "
-                  //               "handled incorrect\n");
-                  //    }
-
     const char *unix_socket_path = nullptr;
     const char *server_host = "127.0.0.1";  // 127.0.0.1 192.168.31.25
     int server_port = PORT_DEFAULT;
@@ -114,16 +107,13 @@ int main(int argc, char *argv[]) {
     char recv_buf[MAX_MEM_BUFFER_SIZE];
 
     while (1) {
-        char *line_read = readline("Rucbase> ");
-        if (line_read == nullptr) {
-            // EOF encountered
+        std::cout << "Rucbase> " << std::flush;
+        std::string command;
+        if (!std::getline(std::cin, command)) {
             break;
         }
-        std::string command = line_read;
-        free(line_read);
 
         if (!command.empty()) {
-            add_history(command.c_str());
             if (is_exit_command(command)) {
                 printf("The client will be closed.\n");
                 break;
