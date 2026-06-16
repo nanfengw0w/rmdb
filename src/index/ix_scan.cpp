@@ -10,26 +10,28 @@ See the Mulan PSL v2 for more details. */
 
 #include "ix_scan.h"
 
-/**
- * @brief 
- * @todo 加上读锁（需要使用缓冲池得到page）
- */
 void IxScan::next() {
     assert(!is_end());
-    IxNodeHandle *node = ih_->fetch_node(iid_.page_no);
-    assert(node->is_leaf_page());
-    assert(iid_.slot_no < node->get_size());
+    assert(current_node_ != nullptr);
+    assert(current_node_->is_leaf_page());
+    assert(iid_.slot_no < current_node_->get_size());
     // increment slot no
     iid_.slot_no++;
-    if (iid_.page_no != ih_->file_hdr_->last_leaf_ && iid_.slot_no == node->get_size()) {
-        // go to next leaf
+    if (iid_.page_no != ih_->file_hdr_->last_leaf_ && iid_.slot_no == current_node_->get_size()) {
+        // go to next leaf - save next_leaf before releasing current node
+        page_id_t next_leaf = current_node_->get_next_leaf();
+        bpm_->unpin_page(current_node_->get_page_id(), false);
+        delete current_node_;
         iid_.slot_no = 0;
-        iid_.page_no = node->get_next_leaf();
+        iid_.page_no = next_leaf;
+        current_node_ = ih_->fetch_node(iid_.page_no);
     }
-    bpm_->unpin_page(node->get_page_id(), false);
-    delete node;
 }
 
 Rid IxScan::rid() const {
-    return ih_->get_rid(iid_);
+    assert(current_node_ != nullptr);
+    if (iid_.slot_no >= current_node_->get_size()) {
+        throw IndexEntryNotFoundError();
+    }
+    return *current_node_->get_rid(iid_.slot_no);
 }

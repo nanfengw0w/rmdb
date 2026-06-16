@@ -23,10 +23,24 @@ class IxScan : public RecScan {
     Iid iid_;  // 初始为lower（用于遍历的指针）
     Iid end_;  // 初始为upper
     BufferPoolManager *bpm_;
+    IxNodeHandle *current_node_;  // 缓存当前叶子节点
 
    public:
     IxScan(const IxIndexHandle *ih, const Iid &lower, const Iid &upper, BufferPoolManager *bpm)
-        : ih_(ih), iid_(lower), end_(upper), bpm_(bpm) {}
+        : ih_(ih), iid_(lower), end_(upper), bpm_(bpm), current_node_(nullptr) {
+        // 预加载当前叶子节点
+        if (!is_end()) {
+            current_node_ = ih_->fetch_node(iid_.page_no);
+        }
+    }
+
+    ~IxScan() {
+        if (current_node_) {
+            bpm_->unpin_page(current_node_->get_page_id(), false);
+            delete current_node_;
+            current_node_ = nullptr;
+        }
+    }
 
     void next() override;
 
