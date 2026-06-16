@@ -142,8 +142,11 @@ void Analyze::check_clause(const std::vector<std::string> &tab_names, std::vecto
         ColType lhs_type = lhs_col->type;
         ColType rhs_type;
         if (cond.is_rhs_val) {
-            cond.rhs_val.init_raw(lhs_col->len);
             rhs_type = cond.rhs_val.type;
+            if (lhs_type == TYPE_FLOAT && rhs_type == TYPE_INT) {
+                cond.rhs_val.set_float(static_cast<float>(cond.rhs_val.int_val));
+                rhs_type = TYPE_FLOAT;
+            }
         } else {
             TabMeta &rhs_tab = sm_manager_->db_.get_table(cond.rhs_col.tab_name);
             auto rhs_col = rhs_tab.get_col(cond.rhs_col.col_name);
@@ -151,6 +154,9 @@ void Analyze::check_clause(const std::vector<std::string> &tab_names, std::vecto
         }
         if (lhs_type != rhs_type) {
             throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(rhs_type));
+        }
+        if (cond.is_rhs_val) {
+            cond.rhs_val.init_raw(lhs_col->len);
         }
     }
 }

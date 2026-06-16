@@ -44,6 +44,7 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
     }
 
     void beginTuple() override {
+        isend = false;
         left_->beginTuple();
         if (left_->is_end()) {
             isend = true;
@@ -126,12 +127,7 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
     bool eval_conds() {
         for (auto &cond : fed_conds_) {
             auto &lhs_meta = find_col_meta(cols_, cond.lhs_col);
-            char *lhs_buf;
-            if (lhs_meta.tab_name == left_->cols().front().tab_name) {
-                lhs_buf = left_rec_->data + lhs_meta.offset;
-            } else {
-                lhs_buf = right_rec_->data + (lhs_meta.offset - (int)left_->tupleLen());
-            }
+            char *lhs_buf = value_addr(lhs_meta);
 
             if (cond.is_rhs_val) {
                 char *rhs_buf = cond.rhs_val.raw->data;
@@ -139,17 +135,20 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
                 if (!eval_cmp(cmp, cond.op)) return false;
             } else {
                 auto &rhs_meta = find_col_meta(cols_, cond.rhs_col);
-                char *rhs_buf;
-                if (rhs_meta.tab_name == left_->cols().front().tab_name) {
-                    rhs_buf = left_rec_->data + rhs_meta.offset;
-                } else {
-                    rhs_buf = right_rec_->data + (rhs_meta.offset - (int)left_->tupleLen());
-                }
+                char *rhs_buf = value_addr(rhs_meta);
                 int cmp = compare_value(lhs_buf, rhs_buf, lhs_meta.type, lhs_meta.len);
                 if (!eval_cmp(cmp, cond.op)) return false;
             }
         }
         return true;
+    }
+
+    char *value_addr(const ColMeta &meta) {
+        int left_len = static_cast<int>(left_->tupleLen());
+        if (meta.offset < left_len) {
+            return left_rec_->data + meta.offset;
+        }
+        return right_rec_->data + (meta.offset - left_len);
     }
 
     ColMeta& find_col_meta(const std::vector<ColMeta> &cols, const TabCol &target) {

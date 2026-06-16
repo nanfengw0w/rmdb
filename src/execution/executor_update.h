@@ -67,6 +67,13 @@ class UpdateExecutor : public AbstractExecutor {
             // Apply set clauses
             for (auto &set_clause : set_clauses_) {
                 auto col = tab_.get_col(set_clause.lhs.col_name);
+                if (col->type != set_clause.rhs.type) {
+                    if (col->type == TYPE_FLOAT && set_clause.rhs.type == TYPE_INT) {
+                        set_clause.rhs.set_float(static_cast<float>(set_clause.rhs.int_val));
+                    } else {
+                        throw IncompatibleTypeError(coltype2str(col->type), coltype2str(set_clause.rhs.type));
+                    }
+                }
                 set_clause.rhs.init_raw(col->len);
                 memcpy(record->data + col->offset, set_clause.rhs.raw->data, col->len);
             }

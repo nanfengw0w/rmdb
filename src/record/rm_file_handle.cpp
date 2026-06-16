@@ -13,6 +13,7 @@ See the Mulan PSL v2 for more details. */
 std::unique_ptr<RmRecord> RmFileHandle::get_record(const Rid& rid, Context* context) const {
     RmPageHandle page_handle = fetch_page_handle(rid.page_no);
     auto rec = std::make_unique<RmRecord>(file_hdr_.record_size, page_handle.get_slot(rid.slot_no));
+    buffer_pool_manager_->unpin_page(PageId{fd_, rid.page_no}, false);
     return rec;
 }
 
