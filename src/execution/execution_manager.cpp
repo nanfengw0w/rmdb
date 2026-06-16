@@ -1331,3 +1331,345 @@ void QlManager::handle_union(const std::string &sql, Context *context) {
     rec_printer.print_separator(context);
     RecordPrinter::print_record_count(num_rec, context);
 }
+
+// EXPLAIN ANALYZE 输出格式的执行计划节点
+struct ExplainNode {
+    std::string type;
+    std::vector<std::string> attrs;
+    int rows = 0;
+    std::vector<std::shared_ptr<ExplainNode>> children;
+};
+
+static std::shared_ptr<ExplainNode> build_explain_tree(SmManager *sm_manager, std::shared_ptr<Plan> plan) {
+    if (auto x = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
+        auto node = std::make_shared<ExplainNode>();
+        node->type = "Project";
+        std::string cols = "columns=[";
+        for (size_t i = 0; i < x->sel_cols_.size(); i++) {
+            if (i > 0) cols += ", ";
+            if (x->sel_cols_[i].tab_name.empty()) cols += x->sel_cols_[i].col_name;
+            else cols += x->sel_cols_[i].tab_name + "." + x->sel_cols_[i].col_name;
+        }
+        cols += "]";
+        node->attrs.push_back(cols);
+        node->children.push_back(build_explain_tree(sm_manager, x->subplan_));
+        return node;
+    } else if (auto x = std::dynamic_pointer_cast<ScanPlan>(plan)) {
+        auto make_scan_node = [&](std::shared_ptr<ScanPlan> sp) {
+            auto sn = std::make_shared<ExplainNode>();
+            sn->type = "Scan";
+            sn->attrs.push_back("table=" + sp->tab_name_);
+            sn->attrs.push_back(std::string("type=") + (sp->tag == T_SeqScan ? "SeqScan" : "IndexScan"));
+            auto fh = sm_manager->fhs_.at(sp->tab_name_).get();
+            int count = 0; RmScan s(fh); while (!s.is_end()) { count++; s.next(); }
+            sn->rows = count;
+            return sn;
+        };
+        if (!x->conds_.empty()) {
+            auto filter_node = std::make_shared<ExplainNode>();
+            filter_node->type = "Filter";
+            std::string cond = "condition=[";
+            for (size_t i = 0; i < x->conds_.size(); i++) {
+                if (i > 0) cond += ", ";
+                auto &c = x->conds_[i];
+                cond += c.lhs_col.tab_name + "." + c.lhs_col.col_name;
+                switch (c.op) {
+                    case OP_EQ: cond += "="; break; case OP_NE: cond += "<>"; break;
+                    case OP_LT: cond += "<"; break; case OP_GT: cond += ">"; break;
+                    case OP_LE: cond += "<="; break; case OP_GE: cond += ">="; break;
+                }
+                if (c.is_rhs_val) {
+                    if (c.rhs_val.type == TYPE_INT) cond += std::to_string(c.rhs_val.int_val);
+                    else if (c.rhs_val.type == TYPE_FLOAT) cond += std::to_string(c.rhs_val.float_val);
+                    else cond += c.rhs_val.str_val;
+                } else cond += c.rhs_col.tab_name + "." + c.rhs_col.col_name;
+            }
+            cond += "]";
+            filter_node->attrs.push_back(cond);
+            filter_node->children.push_back(make_scan_node(x));
+            return filter_node;
+        }
+        return make_scan_node(x);
+    } else if (auto x = std::dynamic_pointer_cast<JoinPlan>(plan)) {
+        auto node = std::make_shared<ExplainNode>();
+        node->type = "Join";
+        std::string tables = "tables=[";
+        std::function<void(std::shared_ptr<Plan>, std::vector<std::string>&)> collect_tabs;
+        collect_tabs = [&](std::shared_ptr<Plan> p, std::vector<std::string> &tabs) {
+            if (auto s = std::dynamic_pointer_cast<ScanPlan>(p)) tabs.push_back(s->tab_name_);
+            else if (auto j = std::dynamic_pointer_cast<JoinPlan>(p)) { collect_tabs(j->left_, tabs); collect_tabs(j->right_, tabs); }
+            else if (auto pr = std::dynamic_pointer_cast<ProjectionPlan>(p)) collect_tabs(pr->subplan_, tabs);
+        };
+        std::vector<std::string> tabs;
+        collect_tabs(x, tabs);
+        for (size_t i = 0; i < tabs.size(); i++) { if (i > 0) tables += ", "; tables += tabs[i]; }
+        tables += "]";
+        node->attrs.push_back(tables);
+        if (!x->conds_.empty()) {
+            std::string cond = "condition=[";
+            for (size_t i = 0; i < x->conds_.size(); i++) {
+                if (i > 0) cond += ", ";
+                auto &c = x->conds_[i];
+                cond += c.lhs_col.tab_name + "." + c.lhs_col.col_name;
+                switch (c.op) {
+                    case OP_EQ: cond += "="; break; case OP_NE: cond += "<>"; break;
+                    case OP_LT: cond += "<"; break; case OP_GT: cond += ">"; break;
+                    case OP_LE: cond += "<="; break; case OP_GE: cond += ">="; break;
+                }
+                if (c.is_rhs_val) {
+                    if (c.rhs_val.type == TYPE_INT) cond += std::to_string(c.rhs_val.int_val);
+                    else if (c.rhs_val.type == TYPE_FLOAT) cond += std::to_string(c.rhs_val.float_val);
+                    else cond += c.rhs_val.str_val;
+                } else cond += c.rhs_col.tab_name + "." + c.rhs_col.col_name;
+            }
+            cond += "]";
+            node->attrs.push_back(cond);
+        }
+        node->children.push_back(build_explain_tree(sm_manager, x->left_));
+        node->children.push_back(build_explain_tree(sm_manager, x->right_));
+        return node;
+    } else if (auto x = std::dynamic_pointer_cast<SortPlan>(plan)) {
+        auto node = std::make_shared<ExplainNode>();
+        node->type = "Sort";
+        node->children.push_back(build_explain_tree(sm_manager, x->subplan_));
+        return node;
+    }
+    return nullptr;
+}
+
+static void format_explain_tree(std::shared_ptr<ExplainNode> node, std::string &output) {
+    if (!node) return;
+    output += node->type + "(";
+    for (size_t i = 0; i < node->attrs.size(); i++) { if (i > 0) output += ", "; output += node->attrs[i]; }
+    output += ", rows=" + std::to_string(node->rows) + ")\n";
+    for (auto &child : node->children) format_explain_tree(child, output);
+}
+
+static int count_executor_rows(AbstractExecutor *executor) {
+    int count = 0;
+    for (executor->beginTuple(); !executor->is_end(); executor->nextTuple()) count++;
+    return count;
+}
+
+void QlManager::handle_explain_analyze(const std::string &sql, Context *context) {
+    std::string sql_lower = to_lower_str(sql);
+    size_t pos = sql_lower.find("explain analyze ");
+    if (pos == std::string::npos) throw InternalError("Invalid EXPLAIN ANALYZE syntax");
+    std::string inner_sql = trim_str(sql.substr(pos + 16));
+    if (!inner_sql.empty() && inner_sql.back() == ';') inner_sql.pop_back();
+    inner_sql = trim_str(inner_sql);
+
+    // SQL预处理：去别名、ON转WHERE
+    {
+        // 按token分割
+        std::vector<std::string> tokens;
+        {
+            std::string cur;
+            for (char c : inner_sql) {
+                if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '(' || c == ')' ||
+                    c == ',' || c == ';' || c == '=' || c == '<' || c == '>' || c == '!') {
+                    if (!cur.empty()) { tokens.push_back(cur); cur.clear(); }
+                    if (c != ' ' && c != '\t' && c != '\n' && c != '\r') {
+                        tokens.push_back(std::string(1, c));
+                    }
+                } else {
+                    cur += c;
+                }
+            }
+            if (!cur.empty()) tokens.push_back(cur);
+        }
+
+        // 重建SQL，去别名，ON转WHERE
+        std::vector<std::string> output_tokens;
+        std::map<std::string, std::string> alias_map; // alias -> table_name
+        for (size_t i = 0; i < tokens.size(); i++) {
+            std::string tl = to_lower_str(tokens[i]);
+
+            // 去掉AS: "table AS alias" -> 记录映射，跳过AS和alias
+            if (tl == "as" && i + 1 < tokens.size() && !output_tokens.empty()) {
+                alias_map[to_lower_str(tokens[i+1])] = to_lower_str(output_tokens.back());
+                i++; // 跳过alias
+                continue;
+            }
+
+            // FROM/JOIN后面的: "table alias" -> 记录映射，只输出table
+            if ((tl == "from" || tl == "join") && i + 1 < tokens.size()) {
+                output_tokens.push_back(tokens[i]);
+                i++;
+                output_tokens.push_back(tokens[i]);
+                std::string table_name = to_lower_str(tokens[i]);
+                // 检查下一个token是否是别名
+                if (i + 1 < tokens.size()) {
+                    std::string next_lower = to_lower_str(tokens[i+1]);
+                    bool is_kw = (next_lower == "where" || next_lower == "on" ||
+                        next_lower == "join" || next_lower == "inner" || next_lower == "left" ||
+                        next_lower == "right" || next_lower == "group" || next_lower == "order" ||
+                        next_lower == "having" || next_lower == "limit" || next_lower == "union" ||
+                        next_lower == "select" || next_lower == "and" || next_lower == "or" ||
+                        next_lower == "as" || next_lower == ",");
+                    if (!is_kw) {
+                        alias_map[next_lower] = table_name;
+                        i++; // 跳过别名
+                    }
+                }
+                continue;
+            }
+
+            // ON转WHERE
+            if (tl == "on") {
+                output_tokens.push_back("WHERE");
+                continue;
+            }
+
+            // 替换别名前缀: "alias.col" -> "table.col"
+            size_t dot_pos = tokens[i].find('.');
+            if (dot_pos != std::string::npos && dot_pos > 0) {
+                std::string prefix = to_lower_str(tokens[i].substr(0, dot_pos));
+                auto it = alias_map.find(prefix);
+                if (it != alias_map.end()) {
+                    tokens[i] = it->second + tokens[i].substr(dot_pos);
+                }
+            }
+
+            output_tokens.push_back(tokens[i]);
+        }
+
+        // 合并多个WHERE为一个（用AND连接）
+        std::vector<std::string> merged;
+        bool seen_where = false;
+        for (size_t i = 0; i < output_tokens.size(); i++) {
+            std::string tl = to_lower_str(output_tokens[i]);
+            if (tl == "where") {
+                if (seen_where) {
+                    // 用AND代替第二个WHERE
+                    merged.push_back("AND");
+                } else {
+                    merged.push_back(output_tokens[i]);
+                    seen_where = true;
+                }
+            } else {
+                merged.push_back(output_tokens[i]);
+            }
+        }
+
+        // 重建SQL
+        inner_sql = "";
+        for (size_t i = 0; i < merged.size(); i++) {
+            if (i > 0) inner_sql += " ";
+            inner_sql += merged[i];
+        }
+    }
+    {
+        std::string result;
+        std::istringstream iss(inner_sql);
+        std::string word;
+        std::vector<std::string> words;
+        while (iss >> word) words.push_back(word);
+        for (size_t i = 0; i < words.size(); i++) {
+            if (!result.empty()) result += " ";
+            result += words[i];
+            // 检查是否是FROM/JOIN后面的第一个表名
+            std::string w_lower = to_lower_str(words[i]);
+            if ((w_lower == "from" || w_lower == "join") && i + 1 < words.size()) {
+                // 下一个是表名
+                result += " " + words[i+1];
+                i++;
+                // 检查再下一个是否是别名（不是关键字）
+                if (i + 1 < words.size()) {
+                    std::string next_lower = to_lower_str(words[i+1]);
+                    bool is_keyword = (next_lower == "where" || next_lower == "on" ||
+                        next_lower == "join" || next_lower == "inner" || next_lower == "left" ||
+                        next_lower == "right" || next_lower == "outer" || next_lower == "cross" ||
+                        next_lower == "group" || next_lower == "order" || next_lower == "having" ||
+                        next_lower == "limit" || next_lower == "union" || next_lower == "as" ||
+                        next_lower == "select" || next_lower == "insert" || next_lower == "update" ||
+                        next_lower == "delete" || next_lower == "set" || next_lower == "values" ||
+                        next_lower == "into" || next_lower == "and" || next_lower == "or" ||
+                        next_lower == "not" || next_lower == "in" || next_lower == "between" ||
+                        next_lower == "like" || next_lower == "is" || next_lower == "null");
+                    if (!is_keyword && words[i+1].find('(') == std::string::npos) {
+                        // 跳过别名
+                        i++;
+                    }
+                }
+            }
+        }
+        inner_sql = result;
+    }
+
+    ast::parse_tree = nullptr;
+    std::string sql_semi = inner_sql;
+    if (!sql_semi.empty() && sql_semi.back() != ';') sql_semi += ';';
+    YY_BUFFER_STATE buf = yy_scan_string(sql_semi.c_str());
+    int parse_ok = yyparse();
+    yy_delete_buffer(buf);
+    if (parse_ok != 0 || ast::parse_tree == nullptr) throw InternalError("Parse failed for EXPLAIN ANALYZE");
+
+    auto analyze_inst = std::make_unique<Analyze>(sm_manager_);
+    auto query = analyze_inst->do_analyze(ast::parse_tree);
+    auto planner_inst = std::make_unique<Planner>(sm_manager_);
+    auto optimizer_inst = std::make_unique<Optimizer>(sm_manager_, planner_inst.get());
+    auto plan = optimizer_inst->plan_query(query, context);
+
+    auto dml_plan = std::dynamic_pointer_cast<DMLPlan>(plan);
+    if (!dml_plan || dml_plan->tag != T_select) throw InternalError("EXPLAIN ANALYZE only supports SELECT");
+
+    auto explain_root = build_explain_tree(sm_manager_, dml_plan->subplan_);
+
+    // 填充行数 - 通过执行器包装器统计每层行数
+    // 对于简单SELECT（单表），直接执行获取各层行数
+    auto root_executor = build_executor_tree(sm_manager_, dml_plan->subplan_, context);
+    int total_rows = count_executor_rows(root_executor.get());
+
+    // 递归填充行数
+    std::function<void(std::shared_ptr<ExplainNode>, std::shared_ptr<Plan>)> fill_rows;
+    fill_rows = [&](std::shared_ptr<ExplainNode> node, std::shared_ptr<Plan> p) {
+        if (!node || !p) return;
+        if (auto x = std::dynamic_pointer_cast<ProjectionPlan>(p)) {
+            node->rows = total_rows;
+            if (!node->children.empty()) fill_rows(node->children[0], x->subplan_);
+        } else if (auto x = std::dynamic_pointer_cast<ScanPlan>(p)) {
+            // ScanPlan可能产生Filter+Scan或纯Scan
+            if (node->type == "Filter") {
+                // Filter行数 = 执行带条件的Scan后的行数
+                auto exec = build_executor_tree(sm_manager_, p, context);
+                node->rows = count_executor_rows(exec.get());
+                if (!node->children.empty()) fill_rows(node->children[0], p);
+            } else if (node->type == "Scan") {
+                // 行数已在build_explain_tree中设置
+            }
+        } else if (auto x = std::dynamic_pointer_cast<JoinPlan>(p)) {
+            node->rows = total_rows;
+            if (node->children.size() >= 2) {
+                fill_rows(node->children[0], x->left_);
+                // 右子树行数 = 左表行数 * 右表单次扫描行数
+                auto left_exec = build_executor_tree(sm_manager_, x->left_, context);
+                int left_rows = count_executor_rows(left_exec.get());
+                if (node->children[1]->type == "Scan") {
+                    node->children[1]->rows = left_rows * node->children[1]->rows;
+                } else if (node->children[1]->type == "Filter") {
+                    // 右子树是Filter+Scan
+                    auto right_exec = build_executor_tree(sm_manager_, x->right_, context);
+                    int right_filtered = count_executor_rows(right_exec.get());
+                    node->children[1]->rows = right_filtered;
+                    // Scan行数保持不变（总扫描行数）
+                }
+            }
+        } else if (auto x = std::dynamic_pointer_cast<SortPlan>(p)) {
+            node->rows = total_rows;
+            if (!node->children.empty()) fill_rows(node->children[0], x->subplan_);
+        }
+    };
+    fill_rows(explain_root, dml_plan->subplan_);
+
+    std::string output;
+    format_explain_tree(explain_root, output);
+
+    std::fstream outfile;
+    outfile.open("output.txt", std::ios::out | std::ios::app);
+    outfile << output;
+    outfile.close();
+
+    memcpy(context->data_send_ + *(context->offset_), output.c_str(), output.size());
+    *(context->offset_) += output.size();
+}

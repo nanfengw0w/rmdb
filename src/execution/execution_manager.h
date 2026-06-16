@@ -50,4 +50,7 @@ class QlManager {
 
     // 处理UNION查询
     void handle_union(const std::string &sql, Context *context);
+
+    // 处理EXPLAIN ANALYZE查询
+    void handle_explain_analyze(const std::string &sql, Context *context);
 };

@@ -150,11 +150,14 @@ void *client_handler(void *sock_fd) {
                 if (after_ob.find(',') != std::string::npos) has_multi_orderby = true;
             }
             bool has_union = sql_lower.find(" union ") != std::string::npos;
-            if (has_agg || has_multi_orderby || has_union) {
+            bool has_explain = sql_lower.find("explain analyze ") != std::string::npos;
+            if (has_agg || has_multi_orderby || has_union || has_explain) {
                 try {
                     auto context_agg = std::make_unique<Context>(lock_manager.get(), log_manager.get(), nullptr, data_send, &offset);
                     SetTransaction(&txn_id, context_agg.get());
-                    if (has_union) {
+                    if (has_explain) {
+                        ql_manager->handle_explain_analyze(sql_raw, context_agg.get());
+                    } else if (has_union) {
                         ql_manager->handle_union(sql_raw, context_agg.get());
                     } else {
                         ql_manager->handle_aggregate(sql_raw, context_agg.get());
