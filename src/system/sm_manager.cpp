@@ -126,12 +126,16 @@ void SmManager::flush_meta() {
  */
 void SmManager::close_db() {
     flush_meta();
-    // Close all file handles
+    // Close all index handles first
+    for (auto &entry : ihs_) {
+        ix_manager_->close_index(entry.second.get());
+    }
+    ihs_.clear();
+    // Close all record file handles
     for (auto &entry : fhs_) {
         rm_manager_->close_file(entry.second.get());
     }
     fhs_.clear();
-    ihs_.clear();
 }
 
 /**
