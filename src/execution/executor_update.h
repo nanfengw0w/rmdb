@@ -9,8 +9,11 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #pragma once
+#include <utility>
+
 #include "execution_defs.h"
 #include "execution_manager.h"
+#include "index_maintenance.h"
 #include "executor_abstract.h"
 #include "index/ix.h"
 #include "system/sm.h"
@@ -41,59 +44,86 @@ class UpdateExecutor : public AbstractExecutor {
     }
 
     std::unique_ptr<RmRecord> Next() override {
-        if (cur_idx_ < rids_.size()) {
-            auto record = fh_->get_record(rids_[cur_idx_], context_);
+        if (cur_idx_ >= rids_.size()) {
+            return nullptr;
+        }
 
-            // Record write operation for transaction abort (save old value)
-            if (context_ != nullptr && context_->txn_ != nullptr) {
-                context_->txn_->append_write_record(new WriteRecord(WType::UPDATE_TUPLE, tab_name_, rids_[cur_idx_], *record));
-            }
+        struct PendingUpdate {
+            Rid rid;
+            std::unique_ptr<RmRecord> old_record;
+            std::unique_ptr<RmRecord> new_record;
+            std::vector<std::vector<char>> old_keys;
+            std::vector<std::vector<char>> new_keys;
+        };
 
-            // Delete old index entries
-            for (size_t i = 0; i < tab_.indexes.size(); ++i) {
-                auto& index = tab_.indexes[i];
-                auto ih = sm_manager_->ihs_.at(
-                    sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
-                char* key = new char[index.col_tot_len];
-                int offset = 0;
-                for (size_t j = 0; j < index.col_num; ++j) {
-                    memcpy(key + offset, record->data + index.cols[j].offset, index.cols[j].len);
-                    offset += index.cols[j].len;
-                }
-                ih->delete_entry(key, context_->txn_);
-                delete[] key;
-            }
-            // Apply set clauses
-            for (auto &set_clause : set_clauses_) {
+        std::vector<PendingUpdate> pending_updates;
+        pending_updates.reserve(rids_.size());
+
+        for (auto &rid : rids_) {
+            PendingUpdate pending;
+            pending.rid = rid;
+            pending.old_record = fh_->get_record(rid, context_);
+            pending.new_record = std::make_unique<RmRecord>(*pending.old_record);
+
+            for (auto set_clause : set_clauses_) {
                 auto col = tab_.get_col(set_clause.lhs.col_name);
-                if (col->type != set_clause.rhs.type) {
-                    if (col->type == TYPE_FLOAT && set_clause.rhs.type == TYPE_INT) {
-                        set_clause.rhs.set_float(static_cast<float>(set_clause.rhs.int_val));
+                Value rhs = set_clause.rhs;
+                if (col->type != rhs.type) {
+                    if (col->type == TYPE_FLOAT && rhs.type == TYPE_INT) {
+                        rhs.set_float(static_cast<float>(rhs.int_val));
                     } else {
-                        throw IncompatibleTypeError(coltype2str(col->type), coltype2str(set_clause.rhs.type));
+                        throw IncompatibleTypeError(coltype2str(col->type), coltype2str(rhs.type));
                     }
                 }
-                set_clause.rhs.init_raw(col->len);
-                memcpy(record->data + col->offset, set_clause.rhs.raw->data, col->len);
+                rhs.init_raw(col->len);
+                memcpy(pending.new_record->data + col->offset, rhs.raw->data, col->len);
             }
-            // Insert new index entries
-            for (size_t i = 0; i < tab_.indexes.size(); ++i) {
-                auto& index = tab_.indexes[i];
-                auto ih = sm_manager_->ihs_.at(
-                    sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
-                char* key = new char[index.col_tot_len];
-                int offset = 0;
-                for (size_t j = 0; j < index.col_num; ++j) {
-                    memcpy(key + offset, record->data + index.cols[j].offset, index.cols[j].len);
-                    offset += index.cols[j].len;
-                }
-                ih->insert_entry(key, rids_[cur_idx_], context_->txn_);
-                delete[] key;
+
+            pending.old_keys.reserve(tab_.indexes.size());
+            pending.new_keys.reserve(tab_.indexes.size());
+            for (auto &index : tab_.indexes) {
+                pending.old_keys.emplace_back(index_maintenance::build_key(index, pending.old_record->data));
+                pending.new_keys.emplace_back(index_maintenance::build_key(index, pending.new_record->data));
             }
-            // Update record
-            fh_->update_record(rids_[cur_idx_], record->data, context_);
-            cur_idx_++;
+            pending_updates.emplace_back(std::move(pending));
         }
+
+        for (auto &pending : pending_updates) {
+            for (size_t index_no = 0; index_no < tab_.indexes.size(); ++index_no) {
+                index_maintenance::check_unique_conflict(sm_manager_, tab_name_, tab_.indexes[index_no],
+                                                         pending.new_keys[index_no].data(), pending.rid);
+            }
+        }
+
+        for (size_t index_no = 0; index_no < tab_.indexes.size(); ++index_no) {
+            for (size_t i = 0; i < pending_updates.size(); ++i) {
+                for (size_t j = i + 1; j < pending_updates.size(); ++j) {
+                    if (pending_updates[i].new_keys[index_no] == pending_updates[j].new_keys[index_no]) {
+                        throw UniqueIndexConflictError(tab_name_,
+                                                       index_maintenance::index_col_names(tab_.indexes[index_no]));
+                    }
+                }
+            }
+        }
+
+        Transaction *txn = context_ == nullptr ? nullptr : context_->txn_;
+        for (auto &pending : pending_updates) {
+            if (txn != nullptr) {
+                txn->append_write_record(new WriteRecord(WType::UPDATE_TUPLE, tab_name_, pending.rid, *pending.old_record));
+            }
+
+            for (size_t index_no = 0; index_no < tab_.indexes.size(); ++index_no) {
+                if (pending.old_keys[index_no] == pending.new_keys[index_no]) {
+                    continue;
+                }
+                auto ih = index_maintenance::get_index_handle(sm_manager_, tab_name_, tab_.indexes[index_no]);
+                ih->delete_entry(pending.old_keys[index_no].data(), txn);
+                ih->insert_entry(pending.new_keys[index_no].data(), pending.rid, txn);
+            }
+            fh_->update_record(pending.rid, pending.new_record->data, context_);
+        }
+
+        cur_idx_ = rids_.size();
         return nullptr;
     }
 

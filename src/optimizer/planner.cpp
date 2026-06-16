@@ -27,31 +27,24 @@ bool Planner::get_index_cols(std::string tab_name, std::vector<Condition> curr_c
     index_col_names.clear();
     TabMeta& tab = sm_manager_->db_.get_table(tab_name);
 
-    // Try each index on the table
     for (auto& index : tab.indexes) {
-        std::vector<std::string> matched_cols;
-        bool all_match = true;
+        if (index.cols.empty()) {
+            continue;
+        }
 
-        for (auto& index_col : index.cols) {
-            bool found = false;
-            for (auto& cond : curr_conds) {
-                if (cond.is_rhs_val && cond.lhs_col.tab_name == tab_name &&
-                    cond.lhs_col.col_name == index_col.name) {
-                    // Found a condition on this index column
-                    matched_cols.push_back(index_col.name);
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                all_match = false;
+        bool found_leftmost_col = false;
+        for (auto& cond : curr_conds) {
+            if (cond.is_rhs_val && cond.lhs_col.tab_name == tab_name &&
+                cond.lhs_col.col_name == index.cols[0].name) {
+                found_leftmost_col = true;
                 break;
             }
         }
 
-        if (!matched_cols.empty()) {
-            // We found at least one matching column with leftmost prefix
-            index_col_names = matched_cols;
+        if (found_leftmost_col) {
+            for (auto &col : index.cols) {
+                index_col_names.push_back(col.name);
+            }
             return true;
         }
     }

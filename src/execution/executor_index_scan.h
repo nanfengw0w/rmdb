@@ -10,8 +10,12 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <algorithm>
+#include <optional>
+
 #include "execution_defs.h"
 #include "execution_manager.h"
+#include "index_maintenance.h"
 #include "executor_abstract.h"
 #include "index/ix.h"
 #include "system/sm.h"
@@ -31,10 +35,16 @@ class IndexScanExecutor : public AbstractExecutor {
     IxIndexHandle *ih_;
 
     Rid rid_;
-    std::unique_ptr<RecScan> scan_;
+    std::vector<Rid> matched_rids_;
+    size_t matched_pos_;
     bool is_end_;
 
     SmManager *sm_manager_;
+
+    struct Bound {
+        std::vector<char> key;
+        bool inclusive;
+    };
 
    public:
     IndexScanExecutor(SmManager *sm_manager, std::string tab_name, std::vector<Condition> conds, std::vector<std::string> index_col_names,
@@ -64,6 +74,7 @@ class IndexScanExecutor : public AbstractExecutor {
         }
         fed_conds_ = conds_;
         is_end_ = true;
+        matched_pos_ = 0;
 
         // Get the index handle
         std::string ix_name = sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_col_names_);
@@ -75,108 +86,95 @@ class IndexScanExecutor : public AbstractExecutor {
     }
 
     void beginTuple() override {
-        if (ih_ == nullptr) {
-            is_end_ = true;
-            return;
-        }
-
-        // Build search key from conditions
-        char *key = new char[index_meta_.col_tot_len];
-        memset(key, 0, index_meta_.col_tot_len);
-
-        bool has_eq = true;
-        int offset = 0;
-        for (auto &col : index_meta_.cols) {
-            bool found = false;
-            for (auto &cond : conds_) {
-                if (cond.is_rhs_val && cond.lhs_col.col_name == col.name && cond.op == OP_EQ) {
-                    memcpy(key + offset, cond.rhs_val.raw->data, col.len);
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                has_eq = false;
-                break;
-            }
-            offset += col.len;
-        }
-
-        if (has_eq && index_col_names_.size() == (size_t)index_meta_.col_num) {
-            // Exact match on all index columns - use point lookup
-            std::vector<Rid> result;
-            if (ih_->get_value(key, &result, nullptr) && !result.empty()) {
-                rid_ = result[0];
-                auto record = fh_->get_record(rid_, context_);
-                if (eval_conds(record.get(), fed_conds_)) {
-                    is_end_ = false;
-                    delete[] key;
-                    return;
-                }
-            }
-            is_end_ = true;
-            delete[] key;
-            return;
-        }
-
-        // Range scan - compute lower bound from conditions
-        // Try to find the best lower bound from GT/GE conditions on the first index column
-        char *lower_key = new char[index_meta_.col_tot_len];
-        memset(lower_key, 0, index_meta_.col_tot_len);
-        bool has_lower = false;
-        for (auto &cond : conds_) {
-            if (cond.is_rhs_val && cond.lhs_col.col_name == index_meta_.cols[0].name) {
-                if (cond.op == OP_GT || cond.op == OP_GE) {
-                    memcpy(lower_key, cond.rhs_val.raw->data, index_meta_.cols[0].len);
-                    has_lower = true;
-                    break;
-                }
-            }
-        }
-        Iid lower = has_lower ? ih_->lower_bound(lower_key) : ih_->leaf_begin();
-        Iid upper = ih_->leaf_end();
-        delete[] key;
-        delete[] lower_key;
-
-        scan_ = std::make_unique<IxScan>(ih_, lower, upper, sm_manager_->get_bpm());
-        is_end_ = false;
-
-        // Find first matching tuple
-        while (!scan_->is_end()) {
-            rid_ = scan_->rid();
-            try {
-                auto record = fh_->get_record(rid_, context_);
-                if (eval_conds(record.get(), fed_conds_)) {
-                    return;
-                }
-            } catch (...) {
-                // Skip invalid records
-            }
-            scan_->next();
-        }
+        matched_rids_.clear();
+        matched_pos_ = 0;
         is_end_ = true;
+
+        if (ih_ == nullptr) {
+            return;
+        }
+
+        auto exact_key = build_exact_match_key();
+        if (exact_key.has_value()) {
+            std::vector<Rid> result;
+            if (ih_->get_value(exact_key->data(), &result, nullptr)) {
+                for (auto &rid : result) {
+                    auto record = fh_->get_record(rid, context_);
+                    if (eval_conds(record.get(), fed_conds_)) {
+                        matched_rids_.push_back(rid);
+                    }
+                }
+            }
+            finish_materialized_scan();
+            return;
+        }
+
+        std::optional<Bound> lower_bound;
+        std::optional<Bound> upper_bound;
+        auto &first_col = index_meta_.cols[0];
+        for (auto &cond : conds_) {
+            if (!cond.is_rhs_val || cond.lhs_col.tab_name != tab_name_ || cond.lhs_col.col_name != first_col.name) {
+                continue;
+            }
+
+            auto key = make_first_col_key(cond.rhs_val);
+            switch (cond.op) {
+                case OP_EQ:
+                    update_lower_bound(lower_bound, Bound{key, true});
+                    update_upper_bound(upper_bound, Bound{std::move(key), true});
+                    break;
+                case OP_GT:
+                    update_lower_bound(lower_bound, Bound{std::move(key), false});
+                    break;
+                case OP_GE:
+                    update_lower_bound(lower_bound, Bound{std::move(key), true});
+                    break;
+                case OP_LT:
+                    update_upper_bound(upper_bound, Bound{std::move(key), false});
+                    break;
+                case OP_LE:
+                    update_upper_bound(upper_bound, Bound{std::move(key), true});
+                    break;
+                case OP_NE:
+                    break;
+            }
+        }
+
+        if (bounds_are_empty(lower_bound, upper_bound)) {
+            return;
+        }
+
+        Iid lower = lower_bound.has_value()
+                        ? (lower_bound->inclusive ? ih_->lower_bound(lower_bound->key.data())
+                                                  : ih_->upper_bound(lower_bound->key.data()))
+                        : ih_->leaf_begin();
+        Iid upper = upper_bound.has_value() && index_meta_.col_num == 1
+                        ? (upper_bound->inclusive ? ih_->upper_bound(upper_bound->key.data())
+                                                  : ih_->lower_bound(upper_bound->key.data()))
+                        : ih_->leaf_end();
+
+        IxScan index_scan(ih_, lower, upper, sm_manager_->get_bpm());
+        while (!index_scan.is_end()) {
+            auto candidate_rid = index_scan.rid();
+            auto record = fh_->get_record(candidate_rid, context_);
+            if (eval_conds(record.get(), fed_conds_)) {
+                matched_rids_.push_back(candidate_rid);
+            }
+            index_scan.next();
+        }
+        finish_materialized_scan();
     }
 
     void nextTuple() override {
-        // If scan_ is null (point lookup mode), there's only one result
-        if (!scan_) {
+        if (is_end_) {
+            return;
+        }
+        matched_pos_++;
+        if (matched_pos_ >= matched_rids_.size()) {
             is_end_ = true;
             return;
         }
-        scan_->next();
-        while (!scan_->is_end()) {
-            rid_ = scan_->rid();
-            try {
-                auto record = fh_->get_record(rid_, context_);
-                if (eval_conds(record.get(), fed_conds_)) {
-                    return;
-                }
-            } catch (...) {
-                // Skip invalid records
-            }
-            scan_->next();
-        }
-        is_end_ = true;
+        rid_ = matched_rids_[matched_pos_];
     }
 
     std::unique_ptr<RmRecord> Next() override {
@@ -192,6 +190,82 @@ class IndexScanExecutor : public AbstractExecutor {
     const std::vector<ColMeta> &cols() const override { return cols_; }
 
    private:
+    std::optional<std::vector<char>> build_exact_match_key() {
+        std::vector<char> key(index_meta_.col_tot_len, 0);
+        int offset = 0;
+        for (auto &col : index_meta_.cols) {
+            bool found = false;
+            for (auto &cond : conds_) {
+                if (cond.is_rhs_val && cond.lhs_col.tab_name == tab_name_ &&
+                    cond.lhs_col.col_name == col.name && cond.op == OP_EQ) {
+                    memcpy(key.data() + offset, cond.rhs_val.raw->data, col.len);
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                return std::nullopt;
+            }
+            offset += col.len;
+        }
+        return key;
+    }
+
+    std::vector<char> make_first_col_key(const Value &value) {
+        std::vector<char> key(index_meta_.col_tot_len, 0);
+        memcpy(key.data(), value.raw->data, index_meta_.cols[0].len);
+        return key;
+    }
+
+    int compare_first_col_key(const std::vector<char> &lhs, const std::vector<char> &rhs) {
+        auto &col = index_meta_.cols[0];
+        return compare_value(lhs.data(), rhs.data(), col.type, col.len);
+    }
+
+    void update_lower_bound(std::optional<Bound> &current, Bound candidate) {
+        if (!current.has_value()) {
+            current = std::move(candidate);
+            return;
+        }
+        int cmp = compare_first_col_key(candidate.key, current->key);
+        if (cmp > 0 || (cmp == 0 && current->inclusive && !candidate.inclusive)) {
+            current = std::move(candidate);
+        }
+    }
+
+    void update_upper_bound(std::optional<Bound> &current, Bound candidate) {
+        if (!current.has_value()) {
+            current = std::move(candidate);
+            return;
+        }
+        int cmp = compare_first_col_key(candidate.key, current->key);
+        if (cmp < 0 || (cmp == 0 && current->inclusive && !candidate.inclusive)) {
+            current = std::move(candidate);
+        }
+    }
+
+    bool bounds_are_empty(const std::optional<Bound> &lower, const std::optional<Bound> &upper) {
+        if (!lower.has_value() || !upper.has_value()) {
+            return false;
+        }
+        int cmp = compare_first_col_key(lower->key, upper->key);
+        return cmp > 0 || (cmp == 0 && (!lower->inclusive || !upper->inclusive));
+    }
+
+    void finish_materialized_scan() {
+        std::sort(matched_rids_.begin(), matched_rids_.end(), index_maintenance::rid_less);
+        matched_rids_.erase(std::unique(matched_rids_.begin(), matched_rids_.end(),
+                                        index_maintenance::same_rid),
+                            matched_rids_.end());
+        if (matched_rids_.empty()) {
+            is_end_ = true;
+            return;
+        }
+        matched_pos_ = 0;
+        rid_ = matched_rids_[matched_pos_];
+        is_end_ = false;
+    }
+
     bool eval_conds(RmRecord *record, const std::vector<Condition> &conds) {
         for (auto &cond : conds) {
             auto &lhs_col_meta = find_col_meta(cols_, cond.lhs_col);

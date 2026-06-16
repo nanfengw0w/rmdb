@@ -19,6 +19,40 @@ See the Mulan PSL v2 for more details. */
 #include "record/rm.h"
 #include "record_printer.h"
 
+namespace {
+
+std::vector<std::string> index_col_names(const std::vector<ColMeta> &cols) {
+    std::vector<std::string> col_names;
+    col_names.reserve(cols.size());
+    for (const auto &col : cols) {
+        col_names.push_back(col.name);
+    }
+    return col_names;
+}
+
+std::vector<char> build_index_key(const IndexMeta &index_meta, const char *record_data) {
+    std::vector<char> key(index_meta.col_tot_len);
+    int offset = 0;
+    for (const auto &col : index_meta.cols) {
+        memcpy(key.data() + offset, record_data + col.offset, col.len);
+        offset += col.len;
+    }
+    return key;
+}
+
+bool column_is_still_indexed(const TabMeta &tab, const std::string &col_name) {
+    for (const auto &index : tab.indexes) {
+        for (const auto &col : index.cols) {
+            if (col.name == col_name) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
 /**
  * @description: å¤æ­æ¯å¦ä¸ºä¸ä¸ªæä»¶å¤¹
  * @return {bool} è¿åæ¯å¦ä¸ºä¸ä¸ªæä»¶å¤¹
@@ -276,15 +310,6 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
         index_cols.push_back(*col);
     }
 
-    // Create index file
-    ix_manager_->create_index(tab_name, index_cols);
-
-    // Open index handle
-    std::string ix_name = ix_manager_->get_index_name(tab_name, col_names);
-    auto ih = ix_manager_->open_index(tab_name, index_cols);
-    ihs_.emplace(ix_name, std::move(ih));
-
-    // Add index metadata to table
     IndexMeta index_meta;
     index_meta.tab_name = tab_name;
     index_meta.col_num = index_cols.size();
@@ -293,29 +318,39 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
         index_meta.cols.push_back(col);
         index_meta.col_tot_len += col.len;
     }
-    tab.indexes.push_back(index_meta);
 
-    // Insert existing records into index
-    auto fh = fhs_.at(tab_name).get();
-    auto ih_ptr = ihs_.at(ix_name).get();
-    RmScan scan(fh);
-    while (!scan.is_end()) {
-        auto rid = scan.rid();
-        auto record = fh->get_record(rid, context);
+    ix_manager_->create_index(tab_name, index_cols);
+    std::string ix_name = ix_manager_->get_index_name(tab_name, col_names);
+    auto ih = ix_manager_->open_index(tab_name, index_cols);
 
-        // Build key from record
-        char *key = new char[index_meta.col_tot_len];
-        int offset = 0;
-        for (auto &col : index_cols) {
-            memcpy(key + offset, record->data + col.offset, col.len);
-            offset += col.len;
+    try {
+        auto fh = fhs_.at(tab_name).get();
+        RmScan scan(fh);
+        while (!scan.is_end()) {
+            auto rid = scan.rid();
+            auto record = fh->get_record(rid, context);
+            auto key = build_index_key(index_meta, record->data);
+
+            std::vector<Rid> existing;
+            if (ih->get_value(key.data(), &existing, nullptr) && !existing.empty()) {
+                throw UniqueIndexConflictError(tab_name, col_names);
+            }
+
+            ih->insert_entry(key.data(), rid, nullptr);
+            scan.next();
         }
-
-        ih_ptr->insert_entry(key, rid, nullptr);
-        delete[] key;
-        scan.next();
+    } catch (...) {
+        ix_manager_->close_index(ih.get());
+        ih.reset();
+        ix_manager_->destroy_index(tab_name, index_cols);
+        throw;
     }
 
+    ihs_.emplace(ix_name, std::move(ih));
+    tab.indexes.push_back(index_meta);
+    for (auto &col_name : col_names) {
+        tab.get_col(col_name)->index = true;
+    }
     flush_meta();
 }
 
@@ -355,7 +390,11 @@ void SmManager::drop_index(const std::string& tab_name, const std::vector<std::s
     }
     ix_manager_->destroy_index(tab_name, it->cols);
 
+    std::vector<std::string> dropped_cols = index_col_names(it->cols);
     tab.indexes.erase(it);
+    for (auto &col_name : dropped_cols) {
+        tab.get_col(col_name)->index = column_is_still_indexed(tab, col_name);
+    }
     flush_meta();
 }
 

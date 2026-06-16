@@ -590,7 +590,7 @@ Iid IxIndexHandle::lower_bound(const char *key) {
     int slot = leaf->lower_bound(key);
     Iid iid = {.page_no = leaf->get_page_no(), .slot_no = slot};
     buffer_pool_manager_->unpin_page(leaf->get_page_id(), false);
-    return iid;
+    return normalize_iid(iid);
 }
 
 /**
@@ -605,7 +605,30 @@ Iid IxIndexHandle::upper_bound(const char *key) {
     int slot = leaf->upper_bound(key);
     Iid iid = {.page_no = leaf->get_page_no(), .slot_no = slot};
     buffer_pool_manager_->unpin_page(leaf->get_page_id(), false);
-    return iid;
+    return normalize_iid(iid);
+}
+
+Iid IxIndexHandle::normalize_iid(const Iid &iid) const {
+    Iid current = iid;
+    while (true) {
+        IxNodeHandle *node = fetch_node(current.page_no);
+        int size = node->get_size();
+        if (current.slot_no < size || current.page_no == file_hdr_->last_leaf_) {
+            if (current.slot_no > size) {
+                current.slot_no = size;
+            }
+            buffer_pool_manager_->unpin_page(node->get_page_id(), false);
+            return current;
+        }
+
+        page_id_t next_leaf = node->get_next_leaf();
+        buffer_pool_manager_->unpin_page(node->get_page_id(), false);
+        if (next_leaf == IX_LEAF_HEADER_PAGE || next_leaf == IX_NO_PAGE) {
+            return leaf_end();
+        }
+        current.page_no = next_leaf;
+        current.slot_no = 0;
+    }
 }
 
 /**

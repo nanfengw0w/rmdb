@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 #include "execution_defs.h"
 #include "execution_manager.h"
+#include "index_maintenance.h"
 #include "executor_abstract.h"
 #include "index/ix.h"
 #include "system/sm.h"
@@ -49,18 +50,12 @@ class DeleteExecutor : public AbstractExecutor {
             }
 
             // Delete index entries first
+            Transaction *txn = context_ == nullptr ? nullptr : context_->txn_;
             for (size_t i = 0; i < tab_.indexes.size(); ++i) {
                 auto& index = tab_.indexes[i];
-                auto ih = sm_manager_->ihs_.at(
-                    sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
-                char* key = new char[index.col_tot_len];
-                int offset = 0;
-                for (size_t j = 0; j < index.col_num; ++j) {
-                    memcpy(key + offset, record->data + index.cols[j].offset, index.cols[j].len);
-                    offset += index.cols[j].len;
-                }
-                ih->delete_entry(key, context_->txn_);
-                delete[] key;
+                auto ih = index_maintenance::get_index_handle(sm_manager_, tab_name_, index);
+                auto key = index_maintenance::build_key(index, record->data);
+                ih->delete_entry(key.data(), txn);
             }
             fh_->delete_record(rids_[cur_idx_], context_);
             cur_idx_++;

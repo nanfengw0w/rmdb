@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 #include "execution_defs.h"
 #include "execution_manager.h"
+#include "index_maintenance.h"
 #include "executor_abstract.h"
 #include "index/ix.h"
 #include "system/sm.h"
@@ -58,6 +59,15 @@ class InsertExecutor : public AbstractExecutor {
             val.init_raw(col.len);
             memcpy(rec.data + col.offset, val.raw->data, col.len);
         }
+
+        std::vector<std::vector<char>> index_keys;
+        index_keys.reserve(tab_.indexes.size());
+        for (auto &index : tab_.indexes) {
+            auto key = index_maintenance::build_key(index, rec.data);
+            index_maintenance::check_unique_conflict(sm_manager_, tab_name_, index, key.data());
+            index_keys.emplace_back(std::move(key));
+        }
+
         // Insert into record file
         rid_ = fh_->insert_record(rec.data, context_);
 
@@ -67,17 +77,11 @@ class InsertExecutor : public AbstractExecutor {
         }
 
         // Insert into index
+        Transaction *txn = context_ == nullptr ? nullptr : context_->txn_;
         for(size_t i = 0; i < tab_.indexes.size(); ++i) {
             auto& index = tab_.indexes[i];
-            auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
-            char* key = new char[index.col_tot_len];
-            int offset = 0;
-            for(size_t i = 0; i < index.col_num; ++i) {
-                memcpy(key + offset, rec.data + index.cols[i].offset, index.cols[i].len);
-                offset += index.cols[i].len;
-            }
-            ih->insert_entry(key, rid_, context_->txn_);
-            delete[] key;
+            auto ih = index_maintenance::get_index_handle(sm_manager_, tab_name_, index);
+            ih->insert_entry(index_keys[i].data(), rid_, txn);
         }
         done_ = true;
         return nullptr;

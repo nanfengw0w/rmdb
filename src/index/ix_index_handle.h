@@ -211,6 +211,8 @@ class IxIndexHandle {
 
     bool is_empty() const { return file_hdr_->root_page_ == IX_NO_PAGE; }
 
+    Iid normalize_iid(const Iid &iid) const;
+
     // for get/create node
     IxNodeHandle *fetch_node(int page_no) const;
 
