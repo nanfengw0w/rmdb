@@ -97,6 +97,9 @@ void SmManager::open_db(const std::string& db_name) {
     for (auto &entry : db_.tabs_) {
         auto &tab_name = entry.first;
         fhs_.emplace(tab_name, rm_manager_->open_file(tab_name));
+        // 设置fd2pageno，确保新页面从正确的位置开始分配
+        auto &fh = fhs_.at(tab_name);
+        disk_manager_->set_fd2pageno(fh->GetFd(), fh->get_file_hdr().num_pages);
         // Open existing indexes
         auto &tab = entry.second;
         for (auto &index : tab.indexes) {
