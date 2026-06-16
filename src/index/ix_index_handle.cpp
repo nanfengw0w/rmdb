@@ -363,16 +363,12 @@ bool IxIndexHandle::delete_entry(const char *key, Transaction *transaction) {
 
     leaf->remove(key);
 
-    bool should_delete = coalesce_or_redistribute(leaf, transaction);
-    if (should_delete) {
-        // The leaf was merged and needs to be deleted
-        erase_leaf(leaf);
-        release_node_handle(*leaf);
-        buffer_pool_manager_->unpin_page(leaf->get_page_id(), true);
-        buffer_pool_manager_->delete_page(leaf->get_page_id());
-    } else {
+    bool already_handled = coalesce_or_redistribute(leaf, transaction);
+    if (!already_handled) {
+        // coalesce_or_redistribute didn't touch the leaf's page, unpin it
         buffer_pool_manager_->unpin_page(leaf->get_page_id(), true);
     }
+    // If already_handled is true, the page was already unpinned/deleted by coalesce_or_redistribute
     return true;
 }
 
@@ -417,13 +413,15 @@ bool IxIndexHandle::coalesce_or_redistribute(IxNodeHandle *node, Transaction *tr
         buffer_pool_manager_->unpin_page(parent->get_page_id(), true);
         return false;
     } else {
-        // Coalesce
+        // Coalesce - merge node into neighbor
+        // After coalesce, node's page should be deleted
+        // We handle the unpin/delete of node's page here
         if (child_idx == 0) {
-            // node is left, neighbor is right - swap so node is right
+            // node is left, neighbor is right - swap so neighbor is left
             std::swap(node, neighbor);
             std::swap(child_idx, neighbor_idx);
         }
-        // Now neighbor is left, node is right
+        // neighbor is left, node is right - merge right into left
         bool should_delete_parent = coalesce(&neighbor, &node, &parent, child_idx, transaction, root_is_latched);
         buffer_pool_manager_->unpin_page(neighbor->get_page_id(), true);
         if (should_delete_parent) {
@@ -431,12 +429,13 @@ bool IxIndexHandle::coalesce_or_redistribute(IxNodeHandle *node, Transaction *tr
         } else {
             buffer_pool_manager_->unpin_page(parent->get_page_id(), true);
         }
-        // Return true to indicate node should be deleted
+        // Delete the merged node's page
         erase_leaf(node);
         release_node_handle(*node);
         buffer_pool_manager_->unpin_page(node->get_page_id(), true);
         buffer_pool_manager_->delete_page(node->get_page_id());
-        return false;  // We already handled deletion
+        // Return true: caller should NOT unpin/delete node's page (already done)
+        return true;
     }
 }
 
