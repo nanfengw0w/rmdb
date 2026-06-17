@@ -307,6 +307,7 @@ static AggType parse_agg_func(const std::string &col_expr, std::string &inner_co
     if (lp == std::string::npos || rp == std::string::npos || rp <= lp) return AGG_NONE;
     std::string func = to_lower_str(trim_str(col_expr.substr(0, lp)));
     inner_col = trim_str(col_expr.substr(lp + 1, rp - lp - 1));
+    if (func == "count" && inner_col == "*") return AGG_COUNT_STAR;
     if (func == "count") return AGG_COUNT;
     if (func == "max") return AGG_MAX;
     if (func == "min") return AGG_MIN;
@@ -521,6 +522,9 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
             ac.col_type = col_it->type;
             ac.col_len = col_it->len;
             ac.col_offset = col_it->offset;
+            if (ac.type != AGG_COUNT && ac.col_type == TYPE_STRING) {
+                throw InternalError("failure");
+            }
             if (ac.alias.empty()) {
                 ac.alias = to_lower_str(item);
             }
@@ -607,7 +611,8 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
 
                 gr.agg_nums.push_back(result_val);
                 gr.agg_is_str.push_back(false);
-                if (ac.col_type == TYPE_INT || ac.type == AGG_COUNT || ac.type == AGG_COUNT_STAR) {
+                if (ac.type == AGG_COUNT || ac.type == AGG_COUNT_STAR ||
+                    (ac.col_type == TYPE_INT && ac.type != AGG_AVG)) {
                     gr.agg_strs.push_back(std::to_string((int)result_val));
                 } else {
                     gr.agg_strs.push_back(std::to_string(result_val));
@@ -642,6 +647,25 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
     for (auto &ac : agg_cols) {
         if (ac.type != AGG_NONE) { has_agg_func = true; break; }
     }
+    if (has_agg_func && group_col_idxs.empty()) {
+        for (auto &ac : agg_cols) {
+            if (ac.type == AGG_NONE) {
+                throw InternalError("failure");
+            }
+        }
+        if (raw_records.empty()) {
+            bool only_count_aggs = true;
+            for (auto &ac : agg_cols) {
+                if (ac.type != AGG_COUNT && ac.type != AGG_COUNT_STAR) {
+                    only_count_aggs = false;
+                    break;
+                }
+            }
+            if (!only_count_aggs) {
+                return;
+            }
+        }
+    }
 
     if (group_col_idxs.empty() && !has_agg_func) {
         // 没有GROUP BY且没有聚合函数: 每行是一个结果 (用于 ORDER BY + LIMIT 等)
@@ -651,9 +675,18 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
         }
     } else if (group_col_idxs.empty()) {
         // 没有GROUP BY但有聚合函数，所有记录是一组
-        std::vector<std::vector<char>*> ptrs;
-        for (auto &r : raw_records) ptrs.push_back(&r);
-        compute_group(ptrs);
+        bool has_non_count_agg = false;
+        for (auto &ac : agg_cols) {
+            if (ac.type != AGG_COUNT && ac.type != AGG_COUNT_STAR) {
+                has_non_count_agg = true;
+                break;
+            }
+        }
+        if (!raw_records.empty() || !has_non_count_agg) {
+            std::vector<std::vector<char>*> ptrs;
+            for (auto &r : raw_records) ptrs.push_back(&r);
+            compute_group(ptrs);
+        }
     } else {
         // 有GROUP BY，按GROUP BY列分组 (保持插入顺序)
         std::vector<std::pair<std::string, std::vector<std::vector<char>*>>> group_list;
@@ -923,6 +956,11 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
     // 13. 输出结果
     std::vector<std::string> captions;
     for (auto &ac : agg_cols) captions.push_back(ac.alias);
+
+    bool plain_select_output = group_col_idxs.empty() && !has_agg_func;
+    if (results.empty() && !plain_select_output) {
+        return;
+    }
 
     std::fstream outfile;
     outfile.open("output.txt", std::ios::out | std::ios::app);
