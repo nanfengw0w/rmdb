@@ -10,6 +10,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "execution_manager.h"
 
+#include <map>
 #include <sstream>
 #include <set>
 #include "executor_delete.h"
@@ -910,13 +911,13 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
     std::vector<std::string> captions;
     for (auto &ac : agg_cols) captions.push_back(ac.alias);
 
-    std::fstream outfile;
-    outfile.open("output.txt", std::ios::out | std::ios::app);
-    outfile << "|";
-    for (auto &c : captions) outfile << " " << c << " |";
-    outfile << "\n";
-
     if (!results.empty()) {
+        std::fstream outfile;
+        outfile.open("output.txt", std::ios::out | std::ios::app);
+        outfile << "|";
+        for (auto &c : captions) outfile << " " << c << " |";
+        outfile << "\n";
+
         RecordPrinter rec_printer(captions.size());
         rec_printer.print_separator(context);
         rec_printer.print_record(captions, context);
@@ -937,8 +938,6 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
         outfile.close();
         rec_printer.print_separator(context);
         RecordPrinter::print_record_count(num_rec, context);
-    } else {
-        outfile.close();
     }
 }
 
@@ -1345,7 +1344,76 @@ struct ExplainNode {
     std::vector<std::shared_ptr<ExplainNode>> children;
 };
 
-static std::shared_ptr<ExplainNode> build_explain_tree(SmManager *sm_manager, std::shared_ptr<Plan> plan, bool is_select_star = false) {
+static void add_required_col(std::map<std::string, std::vector<std::string>> &required, const TabCol &col) {
+    if (col.tab_name.empty() || col.col_name.empty()) {
+        return;
+    }
+    auto &cols = required[col.tab_name];
+    if (std::find(cols.begin(), cols.end(), col.col_name) == cols.end()) {
+        cols.push_back(col.col_name);
+    }
+}
+
+static void collect_join_cols(std::shared_ptr<Plan> plan, std::map<std::string, std::vector<std::string>> &required) {
+    if (auto x = std::dynamic_pointer_cast<JoinPlan>(plan)) {
+        for (auto &cond : x->conds_) {
+            add_required_col(required, cond.lhs_col);
+            if (!cond.is_rhs_val) {
+                add_required_col(required, cond.rhs_col);
+            }
+        }
+        collect_join_cols(x->left_, required);
+        collect_join_cols(x->right_, required);
+    } else if (auto x = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
+        collect_join_cols(x->subplan_, required);
+    } else if (auto x = std::dynamic_pointer_cast<SortPlan>(plan)) {
+        collect_join_cols(x->subplan_, required);
+    }
+}
+
+static std::shared_ptr<ExplainNode> wrap_pushdown_project(const std::string &tab_name,
+                                                          const std::map<std::string, std::vector<std::string>> *required,
+                                                          std::shared_ptr<ExplainNode> child) {
+    if (required == nullptr) {
+        return child;
+    }
+    auto it = required->find(tab_name);
+    if (it == required->end() || it->second.empty()) {
+        return child;
+    }
+    auto node = std::make_shared<ExplainNode>();
+    node->type = "Project";
+    std::string cols = "columns=[";
+    for (size_t i = 0; i < it->second.size(); i++) {
+        if (i > 0) cols += ", ";
+        cols += tab_name + "." + it->second[i];
+    }
+    cols += "]";
+    node->attrs.push_back(cols);
+    node->children.push_back(child);
+    return node;
+}
+
+static void multiply_rows(std::shared_ptr<ExplainNode> node, int factor) {
+    if (!node) return;
+    node->rows *= factor;
+    for (auto &child : node->children) {
+        multiply_rows(child, factor);
+    }
+}
+
+static void set_rows_recursive(std::shared_ptr<ExplainNode> node, int rows) {
+    if (!node) return;
+    node->rows = rows;
+    for (auto &child : node->children) {
+        set_rows_recursive(child, rows);
+    }
+}
+
+static std::shared_ptr<ExplainNode> build_explain_tree(SmManager *sm_manager, std::shared_ptr<Plan> plan,
+                                                       bool is_select_star = false,
+                                                       const std::map<std::string, std::vector<std::string>> *required = nullptr,
+                                                       bool enable_pushdown_project = false) {
     if (auto x = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
         auto node = std::make_shared<ExplainNode>();
         node->type = "Project";
@@ -1361,7 +1429,16 @@ static std::shared_ptr<ExplainNode> build_explain_tree(SmManager *sm_manager, st
         }
         cols += "]";
         node->attrs.push_back(cols);
-        node->children.push_back(build_explain_tree(sm_manager, x->subplan_));
+        if (!is_select_star && std::dynamic_pointer_cast<JoinPlan>(x->subplan_)) {
+            std::map<std::string, std::vector<std::string>> pushed_cols;
+            collect_join_cols(x->subplan_, pushed_cols);
+            for (auto &sel_col : x->sel_cols_) {
+                add_required_col(pushed_cols, sel_col);
+            }
+            node->children.push_back(build_explain_tree(sm_manager, x->subplan_, false, &pushed_cols, true));
+        } else {
+            node->children.push_back(build_explain_tree(sm_manager, x->subplan_, false, required, enable_pushdown_project));
+        }
         return node;
     } else if (auto x = std::dynamic_pointer_cast<ScanPlan>(plan)) {
         auto make_scan_node = [&](std::shared_ptr<ScanPlan> sp) {
@@ -1369,11 +1446,21 @@ static std::shared_ptr<ExplainNode> build_explain_tree(SmManager *sm_manager, st
             sn->type = "Scan";
             sn->attrs.push_back("table=" + sp->tab_name_);
             sn->attrs.push_back(std::string("type=") + (sp->tag == T_SeqScan ? "SeqScan" : "IndexScan"));
+            if (sp->tag == T_IndexScan && !sp->index_col_names_.empty()) {
+                std::string index_attr = "using_index=(";
+                for (size_t i = 0; i < sp->index_col_names_.size(); i++) {
+                    if (i > 0) index_attr += ", ";
+                    index_attr += sp->index_col_names_[i];
+                }
+                index_attr += ")";
+                sn->attrs.push_back(index_attr);
+            }
             auto fh = sm_manager->fhs_.at(sp->tab_name_).get();
             int count = 0; RmScan s(fh); while (!s.is_end()) { count++; s.next(); }
             sn->rows = count;
             return sn;
         };
+        std::shared_ptr<ExplainNode> result;
         if (!x->conds_.empty()) {
             auto filter_node = std::make_shared<ExplainNode>();
             filter_node->type = "Filter";
@@ -1396,9 +1483,14 @@ static std::shared_ptr<ExplainNode> build_explain_tree(SmManager *sm_manager, st
             cond += "]";
             filter_node->attrs.push_back(cond);
             filter_node->children.push_back(make_scan_node(x));
-            return filter_node;
+            result = filter_node;
+        } else {
+            result = make_scan_node(x);
         }
-        return make_scan_node(x);
+        if (enable_pushdown_project) {
+            result = wrap_pushdown_project(x->tab_name_, required, result);
+        }
+        return result;
     } else if (auto x = std::dynamic_pointer_cast<JoinPlan>(plan)) {
         auto node = std::make_shared<ExplainNode>();
         node->type = "Join";
@@ -1434,13 +1526,13 @@ static std::shared_ptr<ExplainNode> build_explain_tree(SmManager *sm_manager, st
             cond += "]";
             node->attrs.push_back(cond);
         }
-        node->children.push_back(build_explain_tree(sm_manager, x->left_));
-        node->children.push_back(build_explain_tree(sm_manager, x->right_));
+        node->children.push_back(build_explain_tree(sm_manager, x->left_, false, required, enable_pushdown_project));
+        node->children.push_back(build_explain_tree(sm_manager, x->right_, false, required, enable_pushdown_project));
         return node;
     } else if (auto x = std::dynamic_pointer_cast<SortPlan>(plan)) {
         auto node = std::make_shared<ExplainNode>();
         node->type = "Sort";
-        node->children.push_back(build_explain_tree(sm_manager, x->subplan_));
+        node->children.push_back(build_explain_tree(sm_manager, x->subplan_, false, required, enable_pushdown_project));
         return node;
     }
     return nullptr;
@@ -1458,6 +1550,19 @@ static int count_executor_rows(AbstractExecutor *executor) {
     int count = 0;
     for (executor->beginTuple(); !executor->is_end(); executor->nextTuple()) count++;
     return count;
+}
+
+static bool plan_uses_index_scan(std::shared_ptr<Plan> plan) {
+    if (auto x = std::dynamic_pointer_cast<ScanPlan>(plan)) {
+        return x->tag == T_IndexScan;
+    }
+    if (auto x = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
+        return plan_uses_index_scan(x->subplan_);
+    }
+    if (auto x = std::dynamic_pointer_cast<SortPlan>(plan)) {
+        return plan_uses_index_scan(x->subplan_);
+    }
+    return false;
 }
 
 void QlManager::handle_explain_analyze(const std::string &sql, Context *context) {
@@ -1505,7 +1610,12 @@ void QlManager::handle_explain_analyze(const std::string &sql, Context *context)
             if (!node->children.empty()) fill_rows(node->children[0], x->subplan_);
         } else if (auto x = std::dynamic_pointer_cast<ScanPlan>(p)) {
             // ScanPlan可能产生Filter+Scan或纯Scan
-            if (node->type == "Filter") {
+            if (node->type == "Project") {
+                if (!node->children.empty()) {
+                    fill_rows(node->children[0], p);
+                    node->rows = node->children[0]->rows;
+                }
+            } else if (node->type == "Filter") {
                 // Filter行数 = 执行带条件的Scan后的行数
                 auto exec = build_executor_tree(sm_manager_, p, context);
                 node->rows = count_executor_rows(exec.get());
@@ -1517,28 +1627,12 @@ void QlManager::handle_explain_analyze(const std::string &sql, Context *context)
             node->rows = total_rows;
             if (node->children.size() >= 2) {
                 fill_rows(node->children[0], x->left_);
-                auto left_exec = build_executor_tree(sm_manager_, x->left_, context);
-                int left_rows = count_executor_rows(left_exec.get());
-                if (node->children[1]->type == "Scan") {
-                    // 检查是否是IndexScan
-                    auto right_plan = std::dynamic_pointer_cast<ScanPlan>(x->right_);
-                    if (right_plan && right_plan->tag == T_IndexScan) {
-                        // IndexScan: 每个外层行做一次索引查找，总行数=Join输出行数
-                        node->children[1]->rows = total_rows;
-                    } else {
-                        // SeqScan: 右表被左表每行全表扫描
-                        node->children[1]->rows = left_rows * node->children[1]->rows;
-                    }
-                } else if (node->children[1]->type == "Filter") {
-                    // 右子树是Filter+Scan
-                    // Filter行数 = 左表行数 * 右表过滤后行数
-                    auto right_exec = build_executor_tree(sm_manager_, x->right_, context);
-                    int right_filtered = count_executor_rows(right_exec.get());
-                    node->children[1]->rows = left_rows * right_filtered;
-                    // Scan行数 = 左表行数 * 右表总行数
-                    if (!node->children[1]->children.empty() && node->children[1]->children[0]->type == "Scan") {
-                        node->children[1]->children[0]->rows = left_rows * node->children[1]->children[0]->rows;
-                    }
+                int left_rows = node->children[0]->rows;
+                fill_rows(node->children[1], x->right_);
+                if (plan_uses_index_scan(x->right_)) {
+                    set_rows_recursive(node->children[1], total_rows);
+                } else {
+                    multiply_rows(node->children[1], left_rows);
                 }
             }
         } else if (auto x = std::dynamic_pointer_cast<SortPlan>(p)) {

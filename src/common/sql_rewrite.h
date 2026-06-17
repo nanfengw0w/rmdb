@@ -55,67 +55,124 @@ static SqlRewriteResult rewrite_sql_for_parser(const std::string &original_sql) 
         if (!cur.empty()) tokens.push_back(cur);
     }
 
-    // 重建SQL，去别名，ON转WHERE
-    std::vector<std::string> out;
-    std::map<std::string, std::string> alias_map;
-
-    for (size_t i = 0; i < tokens.size(); i++) {
-        std::string tl = to_lower(tokens[i]);
-
-        // AS: 记录映射，跳过
-        if (tl == "as" && i + 1 < tokens.size() && !out.empty()) {
-            std::string a = to_lower(tokens[i+1]);
-            alias_map[a] = to_lower(out.back());
-            i++; continue;
+    auto join_tokens = [](const std::vector<std::string> &ts) {
+        std::string s;
+        for (size_t i = 0; i < ts.size(); i++) {
+            if (i > 0) s += " ";
+            s += ts[i];
         }
+        return s;
+    };
 
-        // FROM/JOIN后面的表名和可能的别名
-        if ((tl == "from" || tl == "join") && i + 1 < tokens.size()) {
-            out.push_back(tokens[i]); i++;
-            out.push_back(tokens[i]);
-            std::string tname = to_lower(tokens[i]);
-            if (i + 1 < tokens.size()) {
-                std::string nl = to_lower(tokens[i+1]);
-                bool is_kw = (nl=="where"||nl=="on"||nl=="join"||nl=="inner"||nl=="left"||
-                    nl=="right"||nl=="group"||nl=="order"||nl=="having"||nl=="limit"||
-                    nl=="union"||nl=="select"||nl=="and"||nl=="or"||nl=="as"||nl==",");
-                if (!is_kw) { alias_map[nl] = tname; i++; }
+    auto is_relation_end = [](const std::string &tl) {
+        return tl == "join" || tl == "where" || tl == "on" || tl == "group" ||
+               tl == "order" || tl == "having" || tl == "limit" || tl == "union" ||
+               tl == "and" || tl == "," || tl == ";";
+    };
+
+    std::map<std::string, std::string> alias_map;
+    size_t from_pos = std::string::npos;
+    for (size_t i = 0; i < tokens.size(); i++) {
+        if (to_lower(tokens[i]) == "from") {
+            from_pos = i;
+            break;
+        }
+    }
+    if (from_pos == std::string::npos) {
+        result.sql = original_sql;
+        return result;
+    }
+
+    std::vector<std::string> select_part(tokens.begin(), tokens.begin() + from_pos);
+    std::vector<std::string> tables;
+    std::vector<std::string> cond_tokens;
+    std::vector<std::string> suffix_tokens;
+
+    auto append_and = [&]() {
+        if (!cond_tokens.empty()) {
+            cond_tokens.push_back("AND");
+        }
+    };
+
+    size_t i = from_pos;
+    while (i < tokens.size()) {
+        std::string tl = to_lower(tokens[i]);
+        if (tl == "from" || tl == "join") {
+            i++;
+            if (i >= tokens.size()) break;
+            std::string table = tokens[i++];
+            tables.push_back(table);
+            std::string table_lower = to_lower(table);
+            if (i < tokens.size() && to_lower(tokens[i]) == "as" && i + 1 < tokens.size()) {
+                alias_map[to_lower(tokens[i + 1])] = table_lower;
+                i += 2;
+            } else if (i < tokens.size()) {
+                std::string next_lower = to_lower(tokens[i]);
+                if (!is_relation_end(next_lower)) {
+                    alias_map[next_lower] = table_lower;
+                    i++;
+                }
             }
             continue;
         }
-
-        // ON -> WHERE
-        if (tl == "on") { out.push_back("WHERE"); continue; }
-
-        // 替换别名前缀: alias.col -> table.col
-        size_t dot = tokens[i].find('.');
-        if (dot != std::string::npos && dot > 0) {
-            std::string prefix = to_lower(tokens[i].substr(0, dot));
-            auto it = alias_map.find(prefix);
-            if (it != alias_map.end()) {
-                tokens[i] = it->second + tokens[i].substr(dot);
+        if (tl == "on") {
+            append_and();
+            i++;
+            while (i < tokens.size()) {
+                std::string cur_lower = to_lower(tokens[i]);
+                if (cur_lower == "join" || cur_lower == "where" || cur_lower == "group" ||
+                    cur_lower == "order" || cur_lower == "having" || cur_lower == "limit" ||
+                    cur_lower == ";") {
+                    break;
+                }
+                cond_tokens.push_back(tokens[i++]);
             }
+            continue;
         }
-
-        out.push_back(tokens[i]);
-    }
-
-    // 合并多个WHERE
-    std::vector<std::string> merged;
-    bool seen_where = false;
-    for (auto &t : out) {
-        std::string tl = to_lower(t);
         if (tl == "where") {
-            if (seen_where) merged.push_back("AND");
-            else { merged.push_back(t); seen_where = true; }
-        } else merged.push_back(t);
+            append_and();
+            i++;
+            while (i < tokens.size()) {
+                std::string cur_lower = to_lower(tokens[i]);
+                if (cur_lower == "group" || cur_lower == "order" || cur_lower == "having" ||
+                    cur_lower == "limit" || cur_lower == ";") {
+                    break;
+                }
+                cond_tokens.push_back(tokens[i++]);
+            }
+            continue;
+        }
+        if (tl == "group" || tl == "order" || tl == "having" || tl == "limit") {
+            suffix_tokens.assign(tokens.begin() + i, tokens.end());
+            break;
+        }
+        i++;
     }
 
-    result.sql = "";
-    for (size_t i = 0; i < merged.size(); i++) {
-        if (i > 0) result.sql += " ";
-        result.sql += merged[i];
+    result.sql = join_tokens(select_part) + " FROM ";
+    for (size_t ti = 0; ti < tables.size(); ti++) {
+        if (ti > 0) result.sql += " , ";
+        result.sql += tables[ti];
+    }
+    if (!cond_tokens.empty()) {
+        result.sql += " WHERE " + join_tokens(cond_tokens);
+    }
+    if (!suffix_tokens.empty()) {
+        result.sql += " " + join_tokens(suffix_tokens);
+    }
+    if (original_sql.find(';') != std::string::npos && result.sql.find(';') == std::string::npos) {
+        result.sql += " ;";
     }
     result.alias_to_table = alias_map;
+
+    for (const auto &entry : alias_map) {
+        const std::string from = entry.first + ".";
+        const std::string to = entry.second + ".";
+        size_t pos = 0;
+        while ((pos = to_lower(result.sql).find(from, pos)) != std::string::npos) {
+            result.sql.replace(pos, from.length(), to);
+            pos += to.length();
+        }
+    }
     return result;
 }
