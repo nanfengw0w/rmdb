@@ -291,14 +291,14 @@ def main():
     ], expected_output="| grp | c |\n| a | 2 |\n| c | 2 |"):
         passed += 1
 
-    # 2.5 GROUP BY with HAVING that filters all (empty result, no output)
+    # 2.5 GROUP BY with HAVING that filters all (header only)
     total += 1
     if run_test("group_having_empty", [
         "create table t (grp char(10), val int)",
         "insert into t values ('a', 1)",
         "insert into t values ('b', 2)",
         "select grp, COUNT(*) as c from t group by grp having COUNT(*) > 10",
-    ], expected_output=""):
+    ], expected_output="| grp | c |"):
         passed += 1
 
     # 2.6 GROUP BY with HAVING on aggregate not in SELECT
