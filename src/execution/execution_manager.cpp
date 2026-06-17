@@ -930,7 +930,7 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
                 }
                 order_cols.push_back(oc);
             }
-            std::sort(results.begin(), results.end(), [&](const GroupResult &a, const GroupResult &b) {
+            std::stable_sort(results.begin(), results.end(), [&](const GroupResult &a, const GroupResult &b) {
                 for (auto &oc : order_cols) {
                     if (oc.col_idx < 0 || oc.col_idx >= (int)a.agg_nums.size()) continue;
                     if (a.agg_is_str[oc.col_idx] && b.agg_is_str[oc.col_idx]) {
@@ -1573,13 +1573,19 @@ static std::shared_ptr<ExplainNode> build_explain_tree(SmManager *sm_manager, st
                 conds.push_back(condition_to_explain_string(x->conds_[i]));
             }
             filter_node->attrs.push_back(list_attr("condition", conds));
-            filter_node->children.push_back(make_scan_node(x));
+            // 投影下推应该在 Filter 和 Scan 之间
+            auto scan_node = make_scan_node(x);
+            if (enable_pushdown_project) {
+                filter_node->children.push_back(wrap_pushdown_project(x->tab_name_, required, scan_node));
+            } else {
+                filter_node->children.push_back(scan_node);
+            }
             result = filter_node;
         } else {
             result = make_scan_node(x);
-        }
-        if (enable_pushdown_project) {
-            result = wrap_pushdown_project(x->tab_name_, required, result);
+            if (enable_pushdown_project) {
+                result = wrap_pushdown_project(x->tab_name_, required, result);
+            }
         }
         return result;
     } else if (auto x = std::dynamic_pointer_cast<JoinPlan>(plan)) {
