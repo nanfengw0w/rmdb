@@ -653,6 +653,28 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
         if (ac.type != AGG_NONE) { has_agg_func = true; break; }
     }
 
+    // 有聚合函数但没有GROUP BY时，SELECT中不能有非聚合列
+    if (has_agg_func && group_col_idxs.empty()) {
+        for (auto &ac : agg_cols) {
+            if (ac.type == AGG_NONE) {
+                throw InternalError("failure");
+            }
+        }
+        // 空表且有非COUNT聚合：不输出结果
+        if (raw_records.empty()) {
+            bool only_count_aggs = true;
+            for (auto &ac : agg_cols) {
+                if (ac.type != AGG_COUNT && ac.type != AGG_COUNT_STAR) {
+                    only_count_aggs = false;
+                    break;
+                }
+            }
+            if (!only_count_aggs) {
+                return;  // 不输出任何内容
+            }
+        }
+    }
+
     if (group_col_idxs.empty() && !has_agg_func) {
         // 没有GROUP BY且没有聚合函数: 每行是一个结果 (用于 ORDER BY + LIMIT 等)
         for (auto &row : raw_records) {
@@ -661,9 +683,18 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
         }
     } else if (group_col_idxs.empty()) {
         // 没有GROUP BY但有聚合函数，所有记录是一组
-        std::vector<std::vector<char>*> ptrs;
-        for (auto &r : raw_records) ptrs.push_back(&r);
-        compute_group(ptrs);
+        bool has_non_count_agg = false;
+        for (auto &ac : agg_cols) {
+            if (ac.type != AGG_COUNT && ac.type != AGG_COUNT_STAR) {
+                has_non_count_agg = true;
+                break;
+            }
+        }
+        if (!raw_records.empty() || !has_non_count_agg) {
+            std::vector<std::vector<char>*> ptrs;
+            for (auto &r : raw_records) ptrs.push_back(&r);
+            compute_group(ptrs);
+        }
     } else {
         // 有GROUP BY，按GROUP BY列分组 (保持插入顺序)
         std::vector<std::pair<std::string, std::vector<std::vector<char>*>>> group_list;
