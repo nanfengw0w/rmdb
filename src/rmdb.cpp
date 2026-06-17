@@ -158,19 +158,14 @@ void *client_handler(void *sock_fd) {
                            has_word("avg(") ||
                            sql_lower.find(" limit ") != std::string::npos;
             bool has_multi_orderby = false;
-            bool has_plain_orderby = false;
             if (sql_lower.find("order by") != std::string::npos) {
                 size_t ob_pos = sql_lower.find("order by");
                 std::string after_ob = sql_lower.substr(ob_pos + 8);
                 if (after_ob.find(',') != std::string::npos) has_multi_orderby = true;
-                // Single ORDER BY without JOIN also needs aggregate handler
-                if (sql_lower.find(" join ") == std::string::npos) {
-                    has_plain_orderby = true;
-                }
             }
             bool has_union = sql_lower.find(" union ") != std::string::npos;
             bool has_explain = sql_lower.find("explain analyze ") != std::string::npos;
-            if (has_agg || has_multi_orderby || has_plain_orderby || has_union || has_explain) {
+            if (has_agg || has_multi_orderby || has_union || has_explain) {
                 try {
                     auto context_agg = std::make_unique<Context>(lock_manager.get(), log_manager.get(), nullptr, data_send, &offset);
                     SetTransaction(&txn_id, context_agg.get());

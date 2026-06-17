@@ -769,39 +769,35 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
                 bool pass_all = true;
                 for (auto &hv_cond : hv_conds) {
                     // 解析: agg_func(col) op value
-                    // Token化: 按空格分割
-                    std::vector<std::string> hv_tokens;
-                    {
-                        std::istringstream iss2(hv_cond);
-                        std::string tok;
-                        while (iss2 >> tok) hv_tokens.push_back(tok);
-                    }
+                    // 使用括号感知的方式查找操作符位置
                     std::string left_expr, op_str, val_str;
-                    if (hv_tokens.size() >= 3) {
-                        // 操作符是中间的token
-                        left_expr = hv_tokens[0];
-                        for (size_t ti = 1; ti < hv_tokens.size() - 1; ti++) {
-                            if (hv_tokens[ti] == "=" || hv_tokens[ti] == "<" || hv_tokens[ti] == ">" ||
-                                hv_tokens[ti] == "<=" || hv_tokens[ti] == ">=" ||
-                                hv_tokens[ti] == "<>" || hv_tokens[ti] == "!=") {
-                                op_str = hv_tokens[ti];
-                                // 重建 left_expr (可能包含空格，如 "COUNT(*)")
-                                left_expr = "";
-                                for (size_t li = 0; li < ti; li++) {
-                                    if (li > 0) left_expr += " ";
-                                    left_expr += hv_tokens[li];
+                    {
+                        int paren_depth = 0;
+                        size_t op_pos = std::string::npos;
+                        size_t op_len = 0;
+                        for (size_t ci = 0; ci < hv_cond.length(); ci++) {
+                            if (hv_cond[ci] == '(') paren_depth++;
+                            else if (hv_cond[ci] == ')') paren_depth--;
+                            else if (paren_depth == 0) {
+                                // 检查双字符操作符
+                                if (ci + 1 < hv_cond.length()) {
+                                    std::string two = hv_cond.substr(ci, 2);
+                                    if (two == "<=" || two == ">=" || two == "<>" || two == "!=") {
+                                        op_pos = ci; op_len = 2; break;
+                                    }
                                 }
-                                // 重建 val_str
-                                val_str = "";
-                                for (size_t vi = ti + 1; vi < hv_tokens.size(); vi++) {
-                                    if (vi > ti + 1) val_str += " ";
-                                    val_str += hv_tokens[vi];
+                                // 检查单字符操作符
+                                if (hv_cond[ci] == '=' || hv_cond[ci] == '<' || hv_cond[ci] == '>') {
+                                    op_pos = ci; op_len = 1; break;
                                 }
-                                break;
                             }
                         }
+                        if (op_pos == std::string::npos) { pass_all = false; break; }
+                        left_expr = trim_str(hv_cond.substr(0, op_pos));
+                        op_str = hv_cond.substr(op_pos, op_len);
+                        val_str = trim_str(hv_cond.substr(op_pos + op_len));
                     }
-                    if (op_str.empty()) { pass_all = false; break; }
+                    if (op_str.empty() || left_expr.empty() || val_str.empty()) { pass_all = false; break; }
 
                     // 解析左边的聚合函数
                     std::string inner_col;
