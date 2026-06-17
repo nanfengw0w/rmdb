@@ -924,34 +924,32 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
     std::vector<std::string> captions;
     for (auto &ac : agg_cols) captions.push_back(ac.alias);
 
-    if (!results.empty()) {
-        std::fstream outfile;
-        outfile.open("output.txt", std::ios::out | std::ios::app);
-        outfile << "|";
-        for (auto &c : captions) outfile << " " << c << " |";
-        outfile << "\n";
+    std::fstream outfile;
+    outfile.open("output.txt", std::ios::out | std::ios::app);
+    outfile << "|";
+    for (auto &c : captions) outfile << " " << c << " |";
+    outfile << "\n";
 
-        RecordPrinter rec_printer(captions.size());
-        rec_printer.print_separator(context);
-        rec_printer.print_record(captions, context);
-        rec_printer.print_separator(context);
+    RecordPrinter rec_printer(captions.size());
+    rec_printer.print_separator(context);
+    rec_printer.print_record(captions, context);
+    rec_printer.print_separator(context);
 
-        size_t num_rec = 0;
-        for (auto &gr : results) {
-            std::vector<std::string> columns;
-            for (size_t i = 0; i < agg_cols.size(); i++) {
-                columns.push_back(gr.agg_strs[i]);
-            }
-            rec_printer.print_record(columns, context);
-            outfile << "|";
-            for (auto &c : columns) outfile << " " << c << " |";
-            outfile << "\n";
-            num_rec++;
+    size_t num_rec = 0;
+    for (auto &gr : results) {
+        std::vector<std::string> columns;
+        for (size_t i = 0; i < agg_cols.size(); i++) {
+            columns.push_back(gr.agg_strs[i]);
         }
-        outfile.close();
-        rec_printer.print_separator(context);
-        RecordPrinter::print_record_count(num_rec, context);
+        rec_printer.print_record(columns, context);
+        outfile << "|";
+        for (auto &c : columns) outfile << " " << c << " |";
+        outfile << "\n";
+        num_rec++;
     }
+    outfile.close();
+    rec_printer.print_separator(context);
+    RecordPrinter::print_record_count(num_rec, context);
 }
 
 // 执行一个SELECT子查询，返回结果行（每行是字符串向量）和列元数据
@@ -1562,10 +1560,7 @@ static std::shared_ptr<ExplainNode> build_explain_tree(SmManager *sm_manager, st
         node->children.push_back(build_explain_tree(sm_manager, x->right_, false, required, enable_pushdown_project));
         return node;
     } else if (auto x = std::dynamic_pointer_cast<SortPlan>(plan)) {
-        auto node = std::make_shared<ExplainNode>();
-        node->type = "Sort";
-        node->children.push_back(build_explain_tree(sm_manager, x->subplan_, false, required, enable_pushdown_project));
-        return node;
+        return build_explain_tree(sm_manager, x->subplan_, false, required, enable_pushdown_project);
     }
     return nullptr;
 }
@@ -1577,6 +1572,34 @@ static void format_explain_tree(std::shared_ptr<ExplainNode> node, std::string &
     for (size_t i = 0; i < node->attrs.size(); i++) { if (i > 0) output += ", "; output += node->attrs[i]; }
     output += ", rows=" + std::to_string(node->rows) + ")\n";
     for (auto &child : node->children) format_explain_tree(child, output, depth + 1);
+}
+
+static void sort_explain_attr_lists(std::string &output, const std::string &attr) {
+    size_t pos = 0;
+    while ((pos = output.find(attr, pos)) != std::string::npos) {
+        size_t start = pos + attr.length();
+        size_t end = output.find(']', start);
+        if (end == std::string::npos) {
+            break;
+        }
+        std::string content = output.substr(start, end - start);
+        if (!content.empty() && content != "*") {
+            auto items = split_str(content, ",");
+            for (auto &item : items) {
+                item = trim_str(item);
+            }
+            std::sort(items.begin(), items.end());
+            std::string sorted;
+            for (size_t i = 0; i < items.size(); i++) {
+                if (i > 0) sorted += ", ";
+                sorted += items[i];
+            }
+            output.replace(start, end - start, sorted);
+            pos = start + sorted.length();
+        } else {
+            pos = end + 1;
+        }
+    }
 }
 
 static int count_executor_rows(AbstractExecutor *executor) {
@@ -1670,8 +1693,7 @@ void QlManager::handle_explain_analyze(const std::string &sql, Context *context)
                 }
             }
         } else if (auto x = std::dynamic_pointer_cast<SortPlan>(p)) {
-            node->rows = total_rows;
-            if (!node->children.empty()) fill_rows(node->children[0], x->subplan_);
+            fill_rows(node, x->subplan_);
         }
     };
     fill_rows(explain_root, dml_plan->subplan_);
@@ -1690,6 +1712,10 @@ void QlManager::handle_explain_analyze(const std::string &sql, Context *context)
             pos += to.length();
         }
     }
+
+    sort_explain_attr_lists(output, "columns=[");
+    sort_explain_attr_lists(output, "condition=[");
+    sort_explain_attr_lists(output, "tables=[");
 
     // 修复浮点数显示: 去掉多余的0
     // 1000.000000 -> 1000, 1200.000000 -> 1200
