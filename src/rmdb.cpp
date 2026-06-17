@@ -136,13 +136,26 @@ void *client_handler(void *sock_fd) {
                 sql_raw.pop_back();
             std::string sql_lower = sql_raw;
             for (auto &c : sql_lower) c = tolower(c);
+            // Check for aggregate functions - use word boundary to avoid false matches
+            auto has_word = [&](const std::string &word) -> bool {
+                size_t pos = 0;
+                while ((pos = sql_lower.find(word, pos)) != std::string::npos) {
+                    // Check character before: should not be alphanumeric or underscore
+                    if (pos > 0 && (isalnum(sql_lower[pos-1]) || sql_lower[pos-1] == '_')) {
+                        pos += word.length();
+                        continue;
+                    }
+                    return true;
+                }
+                return false;
+            };
             bool has_agg = sql_lower.find("group by") != std::string::npos ||
                            sql_lower.find("having") != std::string::npos ||
-                           sql_lower.find("count(") != std::string::npos ||
-                           sql_lower.find("max(") != std::string::npos ||
-                           sql_lower.find("min(") != std::string::npos ||
-                           sql_lower.find("sum(") != std::string::npos ||
-                           sql_lower.find("avg(") != std::string::npos ||
+                           has_word("count(") ||
+                           has_word("max(") ||
+                           has_word("min(") ||
+                           has_word("sum(") ||
+                           has_word("avg(") ||
                            sql_lower.find(" limit ") != std::string::npos;
             bool has_multi_orderby = false;
             if (sql_lower.find("order by") != std::string::npos) {

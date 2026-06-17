@@ -25,9 +25,9 @@ static SqlRewriteResult rewrite_sql_for_parser(const std::string &original_sql) 
     // 检测 SELECT *
     std::string ol = to_lower(original_sql);
     {
-        size_t sel_pos = ol.find("select ");
+        size_t sel_pos = ol.find("select");
         if (sel_pos != std::string::npos) {
-            size_t after_sel = sel_pos + 7;
+            size_t after_sel = sel_pos + 6;
             while (after_sel < ol.size() && ol[after_sel] == ' ') after_sel++;
             if (after_sel < ol.size() && ol[after_sel] == '*') {
                 result.is_select_star = true;

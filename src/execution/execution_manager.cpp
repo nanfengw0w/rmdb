@@ -307,6 +307,11 @@ static AggType parse_agg_func(const std::string &col_expr, std::string &inner_co
     if (lp == std::string::npos || rp == std::string::npos || rp <= lp) return AGG_NONE;
     std::string func = to_lower_str(trim_str(col_expr.substr(0, lp)));
     inner_col = trim_str(col_expr.substr(lp + 1, rp - lp - 1));
+    // Handle COUNT( * ) with spaces
+    if (func == "count" && (inner_col == "*" || inner_col == "* ")) {
+        inner_col = "*";
+        return AGG_COUNT_STAR;
+    }
     if (func == "count") return AGG_COUNT;
     if (func == "max") return AGG_MAX;
     if (func == "min") return AGG_MIN;
@@ -607,7 +612,12 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
 
                 gr.agg_nums.push_back(result_val);
                 gr.agg_is_str.push_back(false);
-                if (ac.col_type == TYPE_INT || ac.type == AGG_COUNT || ac.type == AGG_COUNT_STAR) {
+                if (ac.type == AGG_COUNT || ac.type == AGG_COUNT_STAR) {
+                    gr.agg_strs.push_back(std::to_string((int)result_val));
+                } else if (ac.type == AGG_AVG) {
+                    // AVG always outputs float
+                    gr.agg_strs.push_back(std::to_string(result_val));
+                } else if (ac.col_type == TYPE_INT) {
                     gr.agg_strs.push_back(std::to_string((int)result_val));
                 } else {
                     gr.agg_strs.push_back(std::to_string(result_val));
@@ -1372,9 +1382,9 @@ static std::string value_to_explain_string(const Value &val) {
         return std::to_string(val.int_val);
     }
     if (val.type == TYPE_FLOAT) {
-        std::ostringstream oss;
-        oss << val.float_val;
-        return oss.str();
+        // Use std::to_string for consistent formatting, trailing zeros will be cleaned up later
+        std::string s = std::to_string(val.float_val);
+        return s;
     }
     return "'" + val.str_val + "'";
 }
@@ -1718,15 +1728,46 @@ void QlManager::handle_explain_analyze(const std::string &sql, Context *context)
     sort_explain_attr_lists(output, "tables=[");
 
     // 修复浮点数显示: 去掉多余的0
-    // 1000.000000 -> 1000, 1200.000000 -> 1200
+    // 1000.000000 -> 1000, 700.500000 -> 700.5
     {
         size_t pos = 0;
-        while ((pos = output.find(".000000", pos)) != std::string::npos) {
-            // 检查前面是否是数字
-            if (pos > 0 && isdigit(output[pos-1])) {
-                output.erase(pos, 7); // 去掉 ".000000"
+        while (pos < output.size()) {
+            // 找到小数点
+            size_t dot_pos = output.find('.', pos);
+            if (dot_pos == std::string::npos) break;
+            // 检查小数点前后是否是数字
+            if (dot_pos == 0 || !isdigit(output[dot_pos - 1])) {
+                pos = dot_pos + 1;
+                continue;
+            }
+            // 找到小数部分的结尾
+            size_t end = dot_pos + 1;
+            while (end < output.size() && isdigit(output[end])) end++;
+            // 检查小数部分是否全是0
+            std::string frac = output.substr(dot_pos + 1, end - dot_pos - 1);
+            bool all_zeros = true;
+            for (char c : frac) {
+                if (c != '0') { all_zeros = false; break; }
+            }
+            if (all_zeros) {
+                // 去掉 ".000000" 部分
+                output.erase(dot_pos, end - dot_pos);
+                pos = dot_pos;
             } else {
-                pos += 7;
+                // 去掉尾部的0: 700.500000 -> 700.5
+                size_t last_nonzero = dot_pos;
+                for (size_t k = dot_pos + 1; k < end; k++) {
+                    if (output[k] != '0') last_nonzero = k;
+                }
+                if (last_nonzero > dot_pos) {
+                    // 保留到最后一个非零位
+                    output.erase(last_nonzero + 1, end - last_nonzero - 1);
+                    pos = last_nonzero + 1;
+                } else {
+                    // 全是0，去掉整个小数部分
+                    output.erase(dot_pos, end - dot_pos);
+                    pos = dot_pos;
+                }
             }
         }
     }
