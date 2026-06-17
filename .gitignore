@@ -2,3 +2,4 @@
 .DS_Store
 *.log
 BufferPoolManagerTest_db/
+tmp_*

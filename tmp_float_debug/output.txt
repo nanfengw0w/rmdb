@@ -1,3 +1,0 @@
-Project(columns=[t.a], rows=1)
-	Filter(condition=[t.a>3.5], rows=1)
-		Scan(table=t, type=SeqScan, rows=3)
