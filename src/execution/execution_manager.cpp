@@ -969,6 +969,17 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
     std::vector<std::string> captions;
     for (auto &ac : agg_cols) captions.push_back(ac.alias);
 
+    // 空结果只输出 header（不输出数据行）
+    if (results.empty()) {
+        std::fstream outfile;
+        outfile.open("output.txt", std::ios::out | std::ios::app);
+        outfile << "|";
+        for (auto &c : captions) outfile << " " << c << " |";
+        outfile << "\n";
+        outfile.close();
+        return;
+    }
+
     std::fstream outfile;
     outfile.open("output.txt", std::ios::out | std::ios::app);
     outfile << "|";
