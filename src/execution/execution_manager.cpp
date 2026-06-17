@@ -916,26 +916,30 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
     for (auto &c : captions) outfile << " " << c << " |";
     outfile << "\n";
 
-    RecordPrinter rec_printer(captions.size());
-    rec_printer.print_separator(context);
-    rec_printer.print_record(captions, context);
-    rec_printer.print_separator(context);
+    if (!results.empty()) {
+        RecordPrinter rec_printer(captions.size());
+        rec_printer.print_separator(context);
+        rec_printer.print_record(captions, context);
+        rec_printer.print_separator(context);
 
-    size_t num_rec = 0;
-    for (auto &gr : results) {
-        std::vector<std::string> columns;
-        for (size_t i = 0; i < agg_cols.size(); i++) {
-            columns.push_back(gr.agg_strs[i]);
+        size_t num_rec = 0;
+        for (auto &gr : results) {
+            std::vector<std::string> columns;
+            for (size_t i = 0; i < agg_cols.size(); i++) {
+                columns.push_back(gr.agg_strs[i]);
+            }
+            rec_printer.print_record(columns, context);
+            outfile << "|";
+            for (auto &c : columns) outfile << " " << c << " |";
+            outfile << "\n";
+            num_rec++;
         }
-        rec_printer.print_record(columns, context);
-        outfile << "|";
-        for (auto &c : columns) outfile << " " << c << " |";
-        outfile << "\n";
-        num_rec++;
+        outfile.close();
+        rec_printer.print_separator(context);
+        RecordPrinter::print_record_count(num_rec, context);
+    } else {
+        outfile.close();
     }
-    outfile.close();
-    rec_printer.print_separator(context);
-    RecordPrinter::print_record_count(num_rec, context);
 }
 
 // 执行一个SELECT子查询，返回结果行（每行是字符串向量）和列元数据
