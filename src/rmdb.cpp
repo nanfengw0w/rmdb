@@ -152,9 +152,7 @@ void *client_handler(void *sock_fd) {
             }
             bool has_union = sql_lower.find(" union ") != std::string::npos;
             bool has_explain = sql_lower.find("explain analyze ") != std::string::npos;
-            bool has_plain_orderby = sql_lower.find("order by") != std::string::npos &&
-                                     sql_lower.find(" join ") == std::string::npos;
-            if (has_agg || has_multi_orderby || has_plain_orderby || has_union || has_explain) {
+            if (has_agg || has_multi_orderby || has_union || has_explain) {
                 try {
                     auto context_agg = std::make_unique<Context>(lock_manager.get(), log_manager.get(), nullptr, data_send, &offset);
                     SetTransaction(&txn_id, context_agg.get());
