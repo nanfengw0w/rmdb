@@ -734,33 +734,41 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
             // 解析HAVING条件: agg_func(col) op value [AND ...]
             std::vector<std::string> hv_conds;
             {
-                std::string hl = to_lower_str(having_clause);
+                std::string hc = having_clause;
+                std::string hc_lower = to_lower_str(hc);
                 size_t pos = 0;
-                while (true) {
-                    // 在HAVING中，" and " 可能出现在聚合函数内部，需要跳过括号
-                    size_t search_pos = pos;
+                while (pos < hc.length()) {
                     size_t and_pos = std::string::npos;
-                    while (search_pos < hl.length()) {
-                        size_t found = hl.find(" and ", search_pos);
-                        if (found == std::string::npos) break;
-                        // 检查是否在括号内
-                        int paren_depth = 0;
-                        for (size_t k = pos; k < found; k++) {
-                            if (having_clause[k] == '(') paren_depth++;
-                            else if (having_clause[k] == ')') paren_depth--;
+                    size_t and_len = 0;
+                    for (size_t i = pos; i < hc.length(); i++) {
+                        if (hc[i] == '(') {
+                            int pd = 1; i++;
+                            while (i < hc.length() && pd > 0) {
+                                if (hc[i] == '(') pd++;
+                                if (hc[i] == ')') pd--;
+                                i++;
+                            }
+                            if (i < hc.length()) i--;
+                            continue;
                         }
-                        if (paren_depth == 0) {
-                            and_pos = found;
+                        if (i + 3 > hc.length()) continue;
+                        if (hc_lower[i] != 'a' || hc_lower[i+1] != 'n' || hc_lower[i+2] != 'd') continue;
+                        // 边界检查: 前面不能是字母 (避免匹配band/brand等)
+                        bool left_ok = (i == 0 || !isalpha(hc_lower[i-1]));
+                        if (left_ok) {
+                            and_pos = i;
+                            and_len = 3;
+                            if (and_pos > 0 && hc[and_pos-1] == ' ') { and_pos--; and_len++; }
+                            if (and_pos + and_len < hc.length() && hc[and_pos+and_len] == ' ') { and_len++; }
                             break;
                         }
-                        search_pos = found + 5;
                     }
                     if (and_pos == std::string::npos) {
-                        hv_conds.push_back(trim_str(having_clause.substr(pos)));
+                        hv_conds.push_back(trim_str(hc.substr(pos)));
                         break;
                     }
-                    hv_conds.push_back(trim_str(having_clause.substr(pos, and_pos - pos)));
-                    pos = and_pos + 5;
+                    hv_conds.push_back(trim_str(hc.substr(pos, and_pos - pos)));
+                    pos = and_pos + and_len;
                 }
             }
 
