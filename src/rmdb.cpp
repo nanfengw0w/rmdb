@@ -149,8 +149,19 @@ void *client_handler(void *sock_fd) {
                 }
                 return false;
             };
-            bool has_agg = sql_lower.find("group by") != std::string::npos ||
-                           sql_lower.find("having") != std::string::npos ||
+            // Check for keywords with word boundary to avoid false matches in column/table names
+            auto has_keyword = [&](const std::string &kw) -> bool {
+                size_t pos = sql_lower.find(kw);
+                if (pos == std::string::npos) return false;
+                // Check character before keyword
+                if (pos > 0 && (isalnum(sql_lower[pos-1]) || sql_lower[pos-1] == '_')) return false;
+                // Check character after keyword
+                size_t end = pos + kw.length();
+                if (end < sql_lower.length() && (isalnum(sql_lower[end]) || sql_lower[end] == '_')) return false;
+                return true;
+            };
+            bool has_agg = has_keyword("group by") ||
+                           has_keyword("having") ||
                            has_word("count(") ||
                            has_word("max(") ||
                            has_word("min(") ||
@@ -158,7 +169,7 @@ void *client_handler(void *sock_fd) {
                            has_word("avg(") ||
                            sql_lower.find(" limit ") != std::string::npos;
             bool has_multi_orderby = false;
-            if (sql_lower.find("order by") != std::string::npos) {
+            if (has_keyword("order by")) {
                 size_t ob_pos = sql_lower.find("order by");
                 std::string after_ob = sql_lower.substr(ob_pos + 8);
                 if (after_ob.find(',') != std::string::npos) has_multi_orderby = true;
