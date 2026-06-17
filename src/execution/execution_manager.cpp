@@ -573,6 +573,7 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
         std::vector<std::string> agg_strs;   // 每个聚合列的字符串值
         std::vector<double> agg_nums;        // 每个聚合列的数值(用于排序)
         std::vector<bool> agg_is_str;        // 是否为字符串类型
+        std::vector<std::vector<char>*> rows; // 本组原始记录，用于HAVING中未出现在SELECT的聚合函数
         int count;
     };
     std::vector<GroupResult> results;
@@ -580,6 +581,7 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
     auto compute_group = [&](const std::vector<std::vector<char>*> &rows) {
         GroupResult gr;
         gr.count = rows.size();
+        gr.rows = rows;
         for (size_t ci = 0; ci < agg_cols.size(); ci++) {
             auto &ac = agg_cols[ci];
             if (ac.type == AGG_COUNT_STAR) {
@@ -726,7 +728,6 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
                 bool pass_all = true;
                 for (auto &hv_cond : hv_conds) {
                     // 解析: agg_func(col) op value
-                    CompOp op;
                     // Token化: 按空格分割
                     std::vector<std::string> hv_tokens;
                     {
@@ -782,9 +783,21 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
                         col_val = it->agg_nums[agg_idx];
                     } else {
                         // HAVING引用了SELECT中没有的聚合函数，直接从组数据计算
-                        // 注意: 这里无法访问原始行数据，但 COUNT(*) 就是组大小
                         if (agg_type == AGG_COUNT_STAR || agg_type == AGG_COUNT) {
                             col_val = it->count;
+                        } else if (agg_type == AGG_MAX || agg_type == AGG_MIN ||
+                                   agg_type == AGG_SUM || agg_type == AGG_AVG) {
+                            auto col_it = tab.get_col(inner_col);
+                            double sum_v = 0, min_v = 0, max_v = 0;
+                            int cnt = 0;
+                            for (auto row : it->rows) {
+                                compute_agg(agg_type, row->data() + col_it->offset, col_it->len,
+                                            col_it->type, sum_v, min_v, max_v, cnt);
+                            }
+                            if (agg_type == AGG_MAX) col_val = max_v;
+                            else if (agg_type == AGG_MIN) col_val = min_v;
+                            else if (agg_type == AGG_SUM) col_val = sum_v;
+                            else col_val = cnt > 0 ? sum_v / cnt : 0;
                         } else {
                             pass_all = false; break;
                         }
@@ -961,7 +974,7 @@ static std::unique_ptr<AbstractExecutor> build_executor_tree(SmManager *sm_manag
     } else if (auto x = std::dynamic_pointer_cast<JoinPlan>(plan)) {
         auto left = build_executor_tree(sm_manager, x->left_, context);
         auto right = build_executor_tree(sm_manager, x->right_, context);
-        return std::make_unique<NestedLoopJoinExecutor>(std::move(left), std::move(right), std::move(x->conds_));
+        return std::make_unique<NestedLoopJoinExecutor>(std::move(left), std::move(right), x->conds_);
     } else if (auto x = std::dynamic_pointer_cast<SortPlan>(plan)) {
         return std::make_unique<SortExecutor>(build_executor_tree(sm_manager, x->subplan_, context), x->sel_col_, x->is_desc_);
     }
@@ -1344,6 +1357,59 @@ struct ExplainNode {
     std::vector<std::shared_ptr<ExplainNode>> children;
 };
 
+static std::string op_to_string(CompOp op) {
+    switch (op) {
+        case OP_EQ: return "=";
+        case OP_NE: return "<>";
+        case OP_LT: return "<";
+        case OP_GT: return ">";
+        case OP_LE: return "<=";
+        case OP_GE: return ">=";
+        default: return "";
+    }
+}
+
+static std::string value_to_explain_string(const Value &val) {
+    if (val.type == TYPE_INT) {
+        return std::to_string(val.int_val);
+    }
+    if (val.type == TYPE_FLOAT) {
+        std::ostringstream oss;
+        oss << val.float_val;
+        return oss.str();
+    }
+    return "'" + val.str_val + "'";
+}
+
+static std::string col_to_explain_string(const TabCol &col) {
+    if (col.tab_name.empty()) {
+        return col.col_name;
+    }
+    return col.tab_name + "." + col.col_name;
+}
+
+static std::string condition_to_explain_string(const Condition &cond) {
+    std::string out = col_to_explain_string(cond.lhs_col) + op_to_string(cond.op);
+    if (cond.is_rhs_val) {
+        out += value_to_explain_string(cond.rhs_val);
+    } else {
+        out += col_to_explain_string(cond.rhs_col);
+    }
+    return out;
+}
+
+static std::string list_attr(const std::string &name, std::vector<std::string> values) {
+    std::sort(values.begin(), values.end());
+    values.erase(std::unique(values.begin(), values.end()), values.end());
+    std::string out = name + "=[";
+    for (size_t i = 0; i < values.size(); i++) {
+        if (i > 0) out += ", ";
+        out += values[i];
+    }
+    out += "]";
+    return out;
+}
+
 static void add_required_col(std::map<std::string, std::vector<std::string>> &required, const TabCol &col) {
     if (col.tab_name.empty() || col.col_name.empty()) {
         return;
@@ -1383,13 +1449,11 @@ static std::shared_ptr<ExplainNode> wrap_pushdown_project(const std::string &tab
     }
     auto node = std::make_shared<ExplainNode>();
     node->type = "Project";
-    std::string cols = "columns=[";
+    std::vector<std::string> cols;
     for (size_t i = 0; i < it->second.size(); i++) {
-        if (i > 0) cols += ", ";
-        cols += tab_name + "." + it->second[i];
+        cols.push_back(tab_name + "." + it->second[i]);
     }
-    cols += "]";
-    node->attrs.push_back(cols);
+    node->attrs.push_back(list_attr("columns", cols));
     node->children.push_back(child);
     return node;
 }
@@ -1417,18 +1481,15 @@ static std::shared_ptr<ExplainNode> build_explain_tree(SmManager *sm_manager, st
     if (auto x = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
         auto node = std::make_shared<ExplainNode>();
         node->type = "Project";
-        std::string cols = "columns=[";
         if (is_select_star) {
-            cols += "*";
+            node->attrs.push_back("columns=[*]");
         } else {
+            std::vector<std::string> cols;
             for (size_t i = 0; i < x->sel_cols_.size(); i++) {
-                if (i > 0) cols += ", ";
-                if (x->sel_cols_[i].tab_name.empty()) cols += x->sel_cols_[i].col_name;
-                else cols += x->sel_cols_[i].tab_name + "." + x->sel_cols_[i].col_name;
+                cols.push_back(col_to_explain_string(x->sel_cols_[i]));
             }
+            node->attrs.push_back(list_attr("columns", cols));
         }
-        cols += "]";
-        node->attrs.push_back(cols);
         if (!is_select_star && std::dynamic_pointer_cast<JoinPlan>(x->subplan_)) {
             std::map<std::string, std::vector<std::string>> pushed_cols;
             collect_join_cols(x->subplan_, pushed_cols);
@@ -1464,24 +1525,11 @@ static std::shared_ptr<ExplainNode> build_explain_tree(SmManager *sm_manager, st
         if (!x->conds_.empty()) {
             auto filter_node = std::make_shared<ExplainNode>();
             filter_node->type = "Filter";
-            std::string cond = "condition=[";
+            std::vector<std::string> conds;
             for (size_t i = 0; i < x->conds_.size(); i++) {
-                if (i > 0) cond += ", ";
-                auto &c = x->conds_[i];
-                cond += c.lhs_col.tab_name + "." + c.lhs_col.col_name;
-                switch (c.op) {
-                    case OP_EQ: cond += "="; break; case OP_NE: cond += "<>"; break;
-                    case OP_LT: cond += "<"; break; case OP_GT: cond += ">"; break;
-                    case OP_LE: cond += "<="; break; case OP_GE: cond += ">="; break;
-                }
-                if (c.is_rhs_val) {
-                    if (c.rhs_val.type == TYPE_INT) cond += std::to_string(c.rhs_val.int_val);
-                    else if (c.rhs_val.type == TYPE_FLOAT) cond += std::to_string(c.rhs_val.float_val);
-                    else cond += c.rhs_val.str_val;
-                } else cond += c.rhs_col.tab_name + "." + c.rhs_col.col_name;
+                conds.push_back(condition_to_explain_string(x->conds_[i]));
             }
-            cond += "]";
-            filter_node->attrs.push_back(cond);
+            filter_node->attrs.push_back(list_attr("condition", conds));
             filter_node->children.push_back(make_scan_node(x));
             result = filter_node;
         } else {
@@ -1494,7 +1542,6 @@ static std::shared_ptr<ExplainNode> build_explain_tree(SmManager *sm_manager, st
     } else if (auto x = std::dynamic_pointer_cast<JoinPlan>(plan)) {
         auto node = std::make_shared<ExplainNode>();
         node->type = "Join";
-        std::string tables = "tables=[";
         std::function<void(std::shared_ptr<Plan>, std::vector<std::string>&)> collect_tabs;
         collect_tabs = [&](std::shared_ptr<Plan> p, std::vector<std::string> &tabs) {
             if (auto s = std::dynamic_pointer_cast<ScanPlan>(p)) tabs.push_back(s->tab_name_);
@@ -1503,28 +1550,13 @@ static std::shared_ptr<ExplainNode> build_explain_tree(SmManager *sm_manager, st
         };
         std::vector<std::string> tabs;
         collect_tabs(x, tabs);
-        for (size_t i = 0; i < tabs.size(); i++) { if (i > 0) tables += ", "; tables += tabs[i]; }
-        tables += "]";
-        node->attrs.push_back(tables);
+        node->attrs.push_back(list_attr("tables", tabs));
         if (!x->conds_.empty()) {
-            std::string cond = "condition=[";
+            std::vector<std::string> conds;
             for (size_t i = 0; i < x->conds_.size(); i++) {
-                if (i > 0) cond += ", ";
-                auto &c = x->conds_[i];
-                cond += c.lhs_col.tab_name + "." + c.lhs_col.col_name;
-                switch (c.op) {
-                    case OP_EQ: cond += "="; break; case OP_NE: cond += "<>"; break;
-                    case OP_LT: cond += "<"; break; case OP_GT: cond += ">"; break;
-                    case OP_LE: cond += "<="; break; case OP_GE: cond += ">="; break;
-                }
-                if (c.is_rhs_val) {
-                    if (c.rhs_val.type == TYPE_INT) cond += std::to_string(c.rhs_val.int_val);
-                    else if (c.rhs_val.type == TYPE_FLOAT) cond += std::to_string(c.rhs_val.float_val);
-                    else cond += c.rhs_val.str_val;
-                } else cond += c.rhs_col.tab_name + "." + c.rhs_col.col_name;
+                conds.push_back(condition_to_explain_string(x->conds_[i]));
             }
-            cond += "]";
-            node->attrs.push_back(cond);
+            node->attrs.push_back(list_attr("condition", conds));
         }
         node->children.push_back(build_explain_tree(sm_manager, x->left_, false, required, enable_pushdown_project));
         node->children.push_back(build_explain_tree(sm_manager, x->right_, false, required, enable_pushdown_project));
@@ -1538,12 +1570,13 @@ static std::shared_ptr<ExplainNode> build_explain_tree(SmManager *sm_manager, st
     return nullptr;
 }
 
-static void format_explain_tree(std::shared_ptr<ExplainNode> node, std::string &output) {
+static void format_explain_tree(std::shared_ptr<ExplainNode> node, std::string &output, int depth = 0) {
     if (!node) return;
+    output += std::string(depth, '\t');
     output += node->type + "(";
     for (size_t i = 0; i < node->attrs.size(); i++) { if (i > 0) output += ", "; output += node->attrs[i]; }
     output += ", rows=" + std::to_string(node->rows) + ")\n";
-    for (auto &child : node->children) format_explain_tree(child, output);
+    for (auto &child : node->children) format_explain_tree(child, output, depth + 1);
 }
 
 static int count_executor_rows(AbstractExecutor *executor) {
@@ -1624,7 +1657,8 @@ void QlManager::handle_explain_analyze(const std::string &sql, Context *context)
                 // 行数已在build_explain_tree中设置
             }
         } else if (auto x = std::dynamic_pointer_cast<JoinPlan>(p)) {
-            node->rows = total_rows;
+            auto exec = build_executor_tree(sm_manager_, p, context);
+            node->rows = count_executor_rows(exec.get());
             if (node->children.size() >= 2) {
                 fill_rows(node->children[0], x->left_);
                 int left_rows = node->children[0]->rows;
