@@ -1004,21 +1004,21 @@ struct SubQueryResult {
 };
 
 // 递归构建执行器
-static std::unique_ptr<AbstractExecutor> build_executor_tree(SmManager *sm_manager, std::shared_ptr<Plan> plan, Context *context, bool force_seqscan = false) {
+static std::unique_ptr<AbstractExecutor> build_executor_tree(SmManager *sm_manager, std::shared_ptr<Plan> plan, Context *context) {
     if (auto x = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
-        return std::make_unique<ProjectionExecutor>(build_executor_tree(sm_manager, x->subplan_, context, force_seqscan), x->sel_cols_);
+        return std::make_unique<ProjectionExecutor>(build_executor_tree(sm_manager, x->subplan_, context), x->sel_cols_);
     } else if (auto x = std::dynamic_pointer_cast<ScanPlan>(plan)) {
-        if (force_seqscan || x->tag == T_SeqScan) {
+        if (x->tag == T_SeqScan) {
             return std::make_unique<SeqScanExecutor>(sm_manager, x->tab_name_, x->conds_, context);
         } else {
             return std::make_unique<IndexScanExecutor>(sm_manager, x->tab_name_, x->conds_, x->index_col_names_, context);
         }
     } else if (auto x = std::dynamic_pointer_cast<JoinPlan>(plan)) {
-        auto left = build_executor_tree(sm_manager, x->left_, context, force_seqscan);
-        auto right = build_executor_tree(sm_manager, x->right_, context, force_seqscan);
+        auto left = build_executor_tree(sm_manager, x->left_, context);
+        auto right = build_executor_tree(sm_manager, x->right_, context);
         return std::make_unique<NestedLoopJoinExecutor>(std::move(left), std::move(right), x->conds_);
     } else if (auto x = std::dynamic_pointer_cast<SortPlan>(plan)) {
-        return std::make_unique<SortExecutor>(build_executor_tree(sm_manager, x->subplan_, context, force_seqscan), x->sel_col_, x->is_desc_);
+        return std::make_unique<SortExecutor>(build_executor_tree(sm_manager, x->subplan_, context), x->sel_col_, x->is_desc_);
     }
     return nullptr;
 }
@@ -1716,7 +1716,7 @@ void QlManager::handle_explain_analyze(const std::string &sql, Context *context)
 
     // 填充行数 - 通过执行器包装器统计每层行数
     // 对于简单SELECT（单表），直接执行获取各层行数
-    auto root_executor = build_executor_tree(sm_manager_, dml_plan->subplan_, context, true);
+    auto root_executor = build_executor_tree(sm_manager_, dml_plan->subplan_, context);
     int total_rows = count_executor_rows(root_executor.get());
 
     // 递归填充行数
@@ -1735,14 +1735,14 @@ void QlManager::handle_explain_analyze(const std::string &sql, Context *context)
                 }
             } else if (node->type == "Filter") {
                 // Filter行数 = 执行带条件的Scan后的行数
-                auto exec = build_executor_tree(sm_manager_, p, context, true);
+                auto exec = build_executor_tree(sm_manager_, p, context);
                 node->rows = count_executor_rows(exec.get());
                 if (!node->children.empty()) fill_rows(node->children[0], p);
             } else if (node->type == "Scan") {
                 // 行数已在build_explain_tree中设置
             }
         } else if (auto x = std::dynamic_pointer_cast<JoinPlan>(p)) {
-            auto exec = build_executor_tree(sm_manager_, p, context, true);
+            auto exec = build_executor_tree(sm_manager_, p, context);
             node->rows = count_executor_rows(exec.get());
             if (node->children.size() >= 2) {
                 fill_rows(node->children[0], x->left_);
