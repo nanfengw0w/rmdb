@@ -1445,7 +1445,7 @@ static std::string list_attr(const std::string &name, std::vector<std::string> v
     values.erase(std::unique(values.begin(), values.end()), values.end());
     std::string out = name + "=[";
     for (size_t i = 0; i < values.size(); i++) {
-        if (i > 0) out += ",";
+        if (i > 0) out += ", ";
         out += values[i];
     }
     out += "]";
