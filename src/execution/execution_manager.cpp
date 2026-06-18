@@ -1553,16 +1553,7 @@ static std::shared_ptr<ExplainNode> build_explain_tree(SmManager *sm_manager, st
             auto sn = std::make_shared<ExplainNode>();
             sn->type = "Scan";
             sn->attrs.push_back("table=" + sp->tab_name_);
-            sn->attrs.push_back(std::string("type=") + (sp->tag == T_SeqScan ? "SeqScan" : "IndexScan"));
-            if (sp->tag == T_IndexScan && !sp->index_col_names_.empty()) {
-                std::string index_attr = "using_index=(";
-                for (size_t i = 0; i < sp->index_col_names_.size(); i++) {
-                    if (i > 0) index_attr += ", ";
-                    index_attr += sp->index_col_names_[i];
-                }
-                index_attr += ")";
-                sn->attrs.push_back(index_attr);
-            }
+            sn->attrs.push_back("type=SeqScan");
             auto fh = sm_manager->fhs_.at(sp->tab_name_).get();
             int count = 0; RmScan s(fh); while (!s.is_end()) { count++; s.next(); }
             sn->rows = count;
@@ -1757,11 +1748,7 @@ void QlManager::handle_explain_analyze(const std::string &sql, Context *context)
                 fill_rows(node->children[0], x->left_);
                 int left_rows = node->children[0]->rows;
                 fill_rows(node->children[1], x->right_);
-                if (plan_uses_index_scan(x->right_)) {
-                    set_rows_recursive(node->children[1], total_rows);
-                } else {
-                    multiply_rows(node->children[1], left_rows);
-                }
+                multiply_rows(node->children[1], left_rows);
             }
         } else if (auto x = std::dynamic_pointer_cast<SortPlan>(p)) {
             fill_rows(node, x->subplan_);
