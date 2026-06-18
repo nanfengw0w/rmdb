@@ -1701,19 +1701,6 @@ static int count_executor_rows(AbstractExecutor *executor) {
     return count;
 }
 
-static bool plan_uses_index_scan(std::shared_ptr<Plan> plan) {
-    if (auto x = std::dynamic_pointer_cast<ScanPlan>(plan)) {
-        return x->tag == T_IndexScan;
-    }
-    if (auto x = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
-        return plan_uses_index_scan(x->subplan_);
-    }
-    if (auto x = std::dynamic_pointer_cast<SortPlan>(plan)) {
-        return plan_uses_index_scan(x->subplan_);
-    }
-    return false;
-}
-
 void QlManager::handle_explain_analyze(const std::string &sql, Context *context) {
     std::string sql_lower = to_lower_str(sql);
     size_t pos = 0;
@@ -1801,7 +1788,7 @@ void QlManager::handle_explain_analyze(const std::string &sql, Context *context)
                 fill_rows(node->children[0], x->left_);
                 int left_rows = node->children[0]->rows;
                 fill_rows(node->children[1], x->right_);
-                if (plan_uses_index_scan(x->right_)) {
+                if (join_uses_right_index(x)) {
                     set_rows_recursive(node->children[1], node->rows);
                 } else {
                     multiply_rows(node->children[1], left_rows);
