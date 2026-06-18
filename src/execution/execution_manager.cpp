@@ -1779,8 +1779,12 @@ void QlManager::handle_explain_analyze(const std::string &sql, Context *context)
     fill_rows = [&](std::shared_ptr<ExplainNode> node, std::shared_ptr<Plan> p) {
         if (!node || !p) return;
         if (auto x = std::dynamic_pointer_cast<ProjectionPlan>(p)) {
-            node->rows = total_rows;
-            if (!node->children.empty()) fill_rows(node->children[0], x->subplan_);
+            if (!node->children.empty()) {
+                fill_rows(node->children[0], x->subplan_);
+                node->rows = node->children[0]->rows;
+            } else {
+                node->rows = total_rows;
+            }
         } else if (auto x = std::dynamic_pointer_cast<ScanPlan>(p)) {
             // ScanPlan可能产生Filter+Scan或纯Scan
             if (node->type == "Project") {
