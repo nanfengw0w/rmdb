@@ -60,9 +60,45 @@ static SqlRewriteResult rewrite_sql_for_parser(const std::string &original_sql) 
         }
     }
 
-    // 检查是否需要重写（有JOIN）
+    // 检查是否有显式 JOIN 或逗号连接。逗号连接也可能带别名，需要同一套预处理。
     std::string ol_normalized = " " + normalize_sql_space(ol) + " ";
-    if (ol_normalized.find(" join ") == std::string::npos) {
+    bool has_join = ol_normalized.find(" join ") != std::string::npos;
+    bool has_implicit_join = false;
+    bool has_single_table_alias = false;
+    {
+        size_t from_pos_check = ol_normalized.find(" from ");
+        if (from_pos_check != std::string::npos) {
+            size_t clause_end = ol_normalized.size();
+            for (const auto &kw : {" where ", " group ", " order ", " having ", " limit ", " union ", " ;"}) {
+                size_t kw_pos = ol_normalized.find(kw, from_pos_check + 6);
+                if (kw_pos != std::string::npos) {
+                    clause_end = std::min(clause_end, kw_pos);
+                }
+            }
+            std::string from_clause = ol_normalized.substr(from_pos_check + 6, clause_end - from_pos_check - 6);
+            has_implicit_join = from_clause.find(',') != std::string::npos;
+            if (!has_join && !has_implicit_join) {
+                std::string normalized_from = normalize_sql_space(from_clause);
+                int token_count = 0;
+                bool in_token = false;
+                for (char c : normalized_from) {
+                    if (sql_is_space(c)) {
+                        if (in_token) {
+                            token_count++;
+                            in_token = false;
+                        }
+                    } else {
+                        in_token = true;
+                    }
+                }
+                if (in_token) {
+                    token_count++;
+                }
+                has_single_table_alias = token_count > 1;
+            }
+        }
+    }
+    if (!has_join && !has_implicit_join && !has_single_table_alias) {
         result.sql = original_sql;
         return result;
     }
@@ -133,25 +169,38 @@ static SqlRewriteResult rewrite_sql_for_parser(const std::string &original_sql) 
         }
     };
 
+    auto process_table_alias = [&](size_t &idx) {
+        if (idx >= tokens.size()) {
+            return;
+        }
+        std::string table = tokens[idx++];
+        tables.push_back(table);
+        std::string table_lower = to_lower(table);
+        if (idx < tokens.size() && to_lower(tokens[idx]) == "as" && idx + 1 < tokens.size()) {
+            alias_map[to_lower(tokens[idx + 1])] = table_lower;
+            idx += 2;
+        } else if (idx < tokens.size()) {
+            std::string next_lower = to_lower(tokens[idx]);
+            if (!is_relation_end(next_lower)) {
+                alias_map[next_lower] = table_lower;
+                idx++;
+            }
+        }
+    };
+
     size_t i = from_pos;
     while (i < tokens.size()) {
         std::string tl = to_lower(tokens[i]);
         if (tl == "from" || tl == "join") {
             i++;
             if (i >= tokens.size()) break;
-            std::string table = tokens[i++];
-            tables.push_back(table);
-            std::string table_lower = to_lower(table);
-            if (i < tokens.size() && to_lower(tokens[i]) == "as" && i + 1 < tokens.size()) {
-                alias_map[to_lower(tokens[i + 1])] = table_lower;
-                i += 2;
-            } else if (i < tokens.size()) {
-                std::string next_lower = to_lower(tokens[i]);
-                if (!is_relation_end(next_lower)) {
-                    alias_map[next_lower] = table_lower;
-                    i++;
-                }
-            }
+            process_table_alias(i);
+            continue;
+        }
+        if (tl == ",") {
+            i++;
+            if (i >= tokens.size()) break;
+            process_table_alias(i);
             continue;
         }
         if (tl == "on") {

@@ -39,6 +39,7 @@ class IndexScanExecutor : public AbstractExecutor {
     std::vector<Rid> matched_rids_;
     size_t matched_pos_;
     bool is_end_;
+    std::optional<std::vector<char>> runtime_eq_key_;
 
     SmManager *sm_manager_;
 
@@ -92,6 +93,20 @@ class IndexScanExecutor : public AbstractExecutor {
         is_end_ = true;
 
         if (ih_ == nullptr) {
+            return;
+        }
+
+        if (runtime_eq_key_.has_value()) {
+            std::vector<Rid> result;
+            if (ih_->get_value(runtime_eq_key_->data(), &result, nullptr)) {
+                for (auto &candidate_rid : result) {
+                    auto record = fh_->get_record(candidate_rid, context_);
+                    if (eval_conds(record.get(), fed_conds_)) {
+                        matched_rids_.push_back(candidate_rid);
+                    }
+                }
+            }
+            finish_materialized_scan();
             return;
         }
 
@@ -187,6 +202,28 @@ class IndexScanExecutor : public AbstractExecutor {
     size_t tupleLen() const override { return len_; }
 
     const std::vector<ColMeta> &cols() const override { return cols_; }
+
+    std::string getType() override { return "IndexScanExecutor"; }
+
+    bool can_runtime_lookup(const TabCol &col) const {
+        return index_meta_.col_num == 1 &&
+               col.tab_name == tab_name_ &&
+               !index_meta_.cols.empty() &&
+               col.col_name == index_meta_.cols[0].name;
+    }
+
+    void set_runtime_lookup_key(const TabCol &col, const char *value) {
+        if (!can_runtime_lookup(col)) {
+            runtime_eq_key_.reset();
+            return;
+        }
+        runtime_eq_key_ = std::vector<char>(index_meta_.col_tot_len, 0);
+        memcpy(runtime_eq_key_->data(), value, index_meta_.cols[0].len);
+    }
+
+    void clear_runtime_lookup_key() {
+        runtime_eq_key_.reset();
+    }
 
    private:
     void materialize_index_scan(const Iid &lower, const Iid &upper) {

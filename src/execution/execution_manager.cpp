@@ -1472,6 +1472,13 @@ static void collect_join_cols(std::shared_ptr<Plan> plan, std::map<std::string, 
         }
         collect_join_cols(x->left_, required);
         collect_join_cols(x->right_, required);
+    } else if (auto x = std::dynamic_pointer_cast<ScanPlan>(plan)) {
+        for (auto &cond : x->conds_) {
+            add_required_col(required, cond.lhs_col);
+            if (!cond.is_rhs_val) {
+                add_required_col(required, cond.rhs_col);
+            }
+        }
     } else if (auto x = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
         collect_join_cols(x->subplan_, required);
     } else if (auto x = std::dynamic_pointer_cast<SortPlan>(plan)) {
@@ -1758,7 +1765,7 @@ void QlManager::handle_explain_analyze(const std::string &sql, Context *context)
                 int left_rows = node->children[0]->rows;
                 fill_rows(node->children[1], x->right_);
                 if (plan_uses_index_scan(x->right_)) {
-                    set_rows_recursive(node->children[1], total_rows);
+                    set_rows_recursive(node->children[1], node->rows);
                 } else {
                     multiply_rows(node->children[1], left_rows);
                 }
