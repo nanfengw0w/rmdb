@@ -1472,17 +1472,9 @@ static void collect_join_cols(std::shared_ptr<Plan> plan, std::map<std::string, 
         }
         collect_join_cols(x->left_, required);
         collect_join_cols(x->right_, required);
-    } else if (auto x = std::dynamic_pointer_cast<ScanPlan>(plan)) {
-        for (auto &cond : x->conds_) {
-            add_required_col(required, cond.lhs_col);
-            if (!cond.is_rhs_val) {
-                add_required_col(required, cond.rhs_col);
-            }
-        }
     } else if (auto x = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
         collect_join_cols(x->subplan_, required);
     } else if (auto x = std::dynamic_pointer_cast<SortPlan>(plan)) {
-        add_required_col(required, x->sel_col_);
         collect_join_cols(x->subplan_, required);
     }
 }
@@ -1556,7 +1548,16 @@ static std::shared_ptr<ExplainNode> build_explain_tree(SmManager *sm_manager, st
             auto sn = std::make_shared<ExplainNode>();
             sn->type = "Scan";
             sn->attrs.push_back("table=" + sp->tab_name_);
-            sn->attrs.push_back("type=SeqScan");
+            sn->attrs.push_back(std::string("type=") + (sp->tag == T_SeqScan ? "SeqScan" : "IndexScan"));
+            if (sp->tag == T_IndexScan && !sp->index_col_names_.empty()) {
+                std::string index_attr = "using_index=(";
+                for (size_t i = 0; i < sp->index_col_names_.size(); i++) {
+                    if (i > 0) index_attr += ", ";
+                    index_attr += sp->index_col_names_[i];
+                }
+                index_attr += ")";
+                sn->attrs.push_back(index_attr);
+            }
             auto fh = sm_manager->fhs_.at(sp->tab_name_).get();
             int count = 0; RmScan s(fh); while (!s.is_end()) { count++; s.next(); }
             sn->rows = count;
@@ -1571,18 +1572,13 @@ static std::shared_ptr<ExplainNode> build_explain_tree(SmManager *sm_manager, st
                 conds.push_back(condition_to_explain_string(x->conds_[i]));
             }
             filter_node->attrs.push_back(list_attr("condition", conds));
-            auto scan_node = make_scan_node(x);
-            if (enable_pushdown_project) {
-                filter_node->children.push_back(wrap_pushdown_project(x->tab_name_, required, scan_node));
-            } else {
-                filter_node->children.push_back(scan_node);
-            }
+            filter_node->children.push_back(make_scan_node(x));
             result = filter_node;
         } else {
             result = make_scan_node(x);
-            if (enable_pushdown_project) {
-                result = wrap_pushdown_project(x->tab_name_, required, result);
-            }
+        }
+        if (enable_pushdown_project) {
+            result = wrap_pushdown_project(x->tab_name_, required, result);
         }
         return result;
     } else if (auto x = std::dynamic_pointer_cast<JoinPlan>(plan)) {
@@ -1671,9 +1667,31 @@ static bool plan_uses_index_scan(std::shared_ptr<Plan> plan) {
 
 void QlManager::handle_explain_analyze(const std::string &sql, Context *context) {
     std::string sql_lower = to_lower_str(sql);
-    size_t pos = sql_lower.find("explain analyze ");
-    if (pos == std::string::npos) throw InternalError("Invalid EXPLAIN ANALYZE syntax");
-    std::string inner_sql = trim_str(sql.substr(pos + 16));
+    size_t pos = 0;
+    while (pos < sql_lower.size() && isspace(static_cast<unsigned char>(sql_lower[pos]))) {
+        pos++;
+    }
+    if (sql_lower.compare(pos, 7, "explain") != 0) {
+        throw InternalError("Invalid EXPLAIN ANALYZE syntax");
+    }
+    pos += 7;
+    if (pos >= sql_lower.size() || !isspace(static_cast<unsigned char>(sql_lower[pos]))) {
+        throw InternalError("Invalid EXPLAIN ANALYZE syntax");
+    }
+    while (pos < sql_lower.size() && isspace(static_cast<unsigned char>(sql_lower[pos]))) {
+        pos++;
+    }
+    if (sql_lower.compare(pos, 7, "analyze") != 0) {
+        throw InternalError("Invalid EXPLAIN ANALYZE syntax");
+    }
+    pos += 7;
+    if (pos >= sql_lower.size() || !isspace(static_cast<unsigned char>(sql_lower[pos]))) {
+        throw InternalError("Invalid EXPLAIN ANALYZE syntax");
+    }
+    while (pos < sql_lower.size() && isspace(static_cast<unsigned char>(sql_lower[pos]))) {
+        pos++;
+    }
+    std::string inner_sql = trim_str(sql.substr(pos));
     if (!inner_sql.empty() && inner_sql.back() == ';') inner_sql.pop_back();
     inner_sql = trim_str(inner_sql);
 
@@ -1734,7 +1752,11 @@ void QlManager::handle_explain_analyze(const std::string &sql, Context *context)
                 fill_rows(node->children[0], x->left_);
                 int left_rows = node->children[0]->rows;
                 fill_rows(node->children[1], x->right_);
-                multiply_rows(node->children[1], left_rows);
+                if (plan_uses_index_scan(x->right_)) {
+                    set_rows_recursive(node->children[1], total_rows);
+                } else {
+                    multiply_rows(node->children[1], left_rows);
+                }
             }
         } else if (auto x = std::dynamic_pointer_cast<SortPlan>(p)) {
             fill_rows(node, x->subplan_);

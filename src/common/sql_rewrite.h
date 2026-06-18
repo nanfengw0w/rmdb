@@ -3,6 +3,7 @@
 #include <vector>
 #include <map>
 #include <algorithm>
+#include <cctype>
 
 // SQL预处理：去别名、ON转WHERE、合并WHERE
 // 返回预处理后的SQL和别名映射
@@ -14,8 +15,32 @@ struct SqlRewriteResult {
 
 static std::string to_lower(const std::string &s) {
     std::string r = s;
-    for (auto &c : r) c = tolower(c);
+    for (auto &c : r) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
     return r;
+}
+
+static bool sql_is_space(char c) {
+    return std::isspace(static_cast<unsigned char>(c)) != 0;
+}
+
+static std::string normalize_sql_space(const std::string &s) {
+    std::string result;
+    bool in_space = true;
+    for (char c : s) {
+        if (sql_is_space(c)) {
+            if (!in_space) {
+                result.push_back(' ');
+                in_space = true;
+            }
+        } else {
+            result.push_back(c);
+            in_space = false;
+        }
+    }
+    if (!result.empty() && result.back() == ' ') {
+        result.pop_back();
+    }
+    return result;
 }
 
 static SqlRewriteResult rewrite_sql_for_parser(const std::string &original_sql) {
@@ -28,7 +53,7 @@ static SqlRewriteResult rewrite_sql_for_parser(const std::string &original_sql) 
         size_t sel_pos = ol.find("select");
         if (sel_pos != std::string::npos) {
             size_t after_sel = sel_pos + 6;
-            while (after_sel < ol.size() && ol[after_sel] == ' ') after_sel++;
+            while (after_sel < ol.size() && sql_is_space(ol[after_sel])) after_sel++;
             if (after_sel < ol.size() && ol[after_sel] == '*') {
                 result.is_select_star = true;
             }
@@ -36,7 +61,8 @@ static SqlRewriteResult rewrite_sql_for_parser(const std::string &original_sql) 
     }
 
     // 检查是否需要重写（有JOIN）
-    if (ol.find(" join ") == std::string::npos) {
+    std::string ol_normalized = " " + normalize_sql_space(ol) + " ";
+    if (ol_normalized.find(" join ") == std::string::npos) {
         result.sql = original_sql;
         return result;
     }
@@ -47,10 +73,10 @@ static SqlRewriteResult rewrite_sql_for_parser(const std::string &original_sql) 
         std::string cur;
         for (size_t ci = 0; ci < original_sql.size(); ci++) {
             char c = original_sql[ci];
-            if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '(' || c == ')' ||
+            if (sql_is_space(c) || c == '(' || c == ')' ||
                 c == ',' || c == ';' || c == '=' || c == '<' || c == '>' || c == '!') {
                 if (!cur.empty()) { tokens.push_back(cur); cur.clear(); }
-                if (c != ' ' && c != '\t' && c != '\n' && c != '\r') {
+                if (!sql_is_space(c)) {
                     if (ci + 1 < original_sql.size()) {
                         char next = original_sql[ci + 1];
                         if ((c == '<' && (next == '>' || next == '=')) ||

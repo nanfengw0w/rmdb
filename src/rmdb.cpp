@@ -216,7 +216,8 @@ void *client_handler(void *sock_fd) {
                 if (after_ob.find(',') != std::string::npos) has_multi_orderby = true;
             }
             bool has_union = sql_lower.find(" union ") != std::string::npos;
-            bool has_explain = sql_lower.find("explain analyze ") != std::string::npos;
+            std::string sql_words = " " + normalize_sql_space(sql_lower) + " ";
+            bool has_explain = sql_words.find(" explain analyze ") != std::string::npos;
             if (has_agg || has_multi_orderby || has_union || has_explain) {
                 try {
                     memset(data_send, '\0', BUFFER_LENGTH);
