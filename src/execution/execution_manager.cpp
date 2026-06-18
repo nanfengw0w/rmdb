@@ -1475,6 +1475,7 @@ static void collect_join_cols(std::shared_ptr<Plan> plan, std::map<std::string, 
     } else if (auto x = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
         collect_join_cols(x->subplan_, required);
     } else if (auto x = std::dynamic_pointer_cast<SortPlan>(plan)) {
+        add_required_col(required, x->sel_col_);
         collect_join_cols(x->subplan_, required);
     }
 }
@@ -1532,7 +1533,11 @@ static std::shared_ptr<ExplainNode> build_explain_tree(SmManager *sm_manager, st
             }
             node->attrs.push_back(list_attr("columns", cols));
         }
-        if (!is_select_star && std::dynamic_pointer_cast<JoinPlan>(x->subplan_)) {
+        auto pushdown_base = x->subplan_;
+        while (auto sort = std::dynamic_pointer_cast<SortPlan>(pushdown_base)) {
+            pushdown_base = sort->subplan_;
+        }
+        if (!is_select_star && std::dynamic_pointer_cast<JoinPlan>(pushdown_base)) {
             std::map<std::string, std::vector<std::string>> pushed_cols;
             collect_join_cols(x->subplan_, pushed_cols);
             for (auto &sel_col : x->sel_cols_) {

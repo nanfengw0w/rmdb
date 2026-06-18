@@ -253,10 +253,28 @@ std::shared_ptr<Plan> Planner::generate_sort_plan(std::shared_ptr<Query> query, 
         const auto &sel_tab_cols = sm_manager_->db_.get_table(sel_tab_name).cols;
         all_cols.insert(all_cols.end(), sel_tab_cols.begin(), sel_tab_cols.end());
     }
+    TabCol order_col = {.tab_name = x->order->cols->tab_name, .col_name = x->order->cols->col_name};
     TabCol sel_col;
+    bool found = false;
     for (auto &col : all_cols) {
-        if(col.name.compare(x->order->cols->col_name) == 0 )
+        bool matches = false;
+        if (order_col.tab_name.empty()) {
+            matches = col.name == order_col.col_name;
+        } else {
+            matches = col.tab_name == order_col.tab_name && col.name == order_col.col_name;
+        }
+        if (!matches) {
+            continue;
+        }
+        if (found && order_col.tab_name.empty()) {
+            throw AmbiguousColumnError(order_col.col_name);
+        }
         sel_col = {.tab_name = col.tab_name, .col_name = col.name};
+        found = true;
+    }
+    if (!found) {
+        throw ColumnNotFoundError(order_col.tab_name.empty() ? order_col.col_name
+                                                            : order_col.tab_name + "." + order_col.col_name);
     }
     return std::make_shared<SortPlan>(T_Sort, std::move(plan), sel_col, 
                                     x->order->orderby_dir == ast::OrderBy_DESC);
