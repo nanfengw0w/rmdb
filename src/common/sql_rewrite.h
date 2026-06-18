@@ -272,8 +272,15 @@ static SqlRewriteResult rewrite_sql_for_parser(const std::string &original_sql) 
         const std::string from = entry.first + ".";
         const std::string to = entry.second + ".";
         size_t pos = 0;
-        while ((pos = to_lower(result.sql).find(from, pos)) != std::string::npos) {
+        std::string sql_lower = to_lower(result.sql);
+        while ((pos = sql_lower.find(from, pos)) != std::string::npos) {
+            // 检查前一个字符不是字母/数字/下划线（避免 sc. 中的 c. 被错误替换）
+            if (pos > 0 && (isalnum(static_cast<unsigned char>(sql_lower[pos - 1])) || sql_lower[pos - 1] == '_')) {
+                pos += from.length();
+                continue;
+            }
             result.sql.replace(pos, from.length(), to);
+            sql_lower = to_lower(result.sql);
             pos += to.length();
         }
     }
