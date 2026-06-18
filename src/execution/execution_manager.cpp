@@ -994,7 +994,6 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
     }
     outfile.close();
     rec_printer.print_separator(context);
-    RecordPrinter::print_record_count(num_rec, context);
 }
 
 // 执行一个SELECT子查询，返回结果行（每行是字符串向量）和列元数据
@@ -1412,6 +1411,18 @@ static std::string op_to_string(CompOp op) {
     }
 }
 
+static CompOp swapped_op(CompOp op) {
+    switch (op) {
+        case OP_EQ: return OP_EQ;
+        case OP_NE: return OP_NE;
+        case OP_LT: return OP_GT;
+        case OP_GT: return OP_LT;
+        case OP_LE: return OP_GE;
+        case OP_GE: return OP_LE;
+        default: return op;
+    }
+}
+
 static std::string value_to_explain_string(const Value &val) {
     if (val.type == TYPE_INT) {
         return std::to_string(val.int_val);
@@ -1439,6 +1450,37 @@ static std::string condition_to_explain_string(const Condition &cond) {
         out += col_to_explain_string(cond.rhs_col);
     }
     return out;
+}
+
+static void collect_plan_tables(std::shared_ptr<Plan> plan, std::vector<std::string> &tables) {
+    if (auto x = std::dynamic_pointer_cast<ScanPlan>(plan)) {
+        tables.push_back(x->tab_name_);
+    } else if (auto x = std::dynamic_pointer_cast<JoinPlan>(plan)) {
+        collect_plan_tables(x->left_, tables);
+        collect_plan_tables(x->right_, tables);
+    } else if (auto x = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
+        collect_plan_tables(x->subplan_, tables);
+    } else if (auto x = std::dynamic_pointer_cast<SortPlan>(plan)) {
+        collect_plan_tables(x->subplan_, tables);
+    }
+}
+
+static bool table_in_plan_side(const std::vector<std::string> &tables, const std::string &tab_name) {
+    return std::find(tables.begin(), tables.end(), tab_name) != tables.end();
+}
+
+static Condition normalize_join_condition_for_explain(const Condition &cond,
+                                                      const std::vector<std::string> &left_tables) {
+    Condition normalized = cond;
+    if (!normalized.is_rhs_val) {
+        bool lhs_on_left = table_in_plan_side(left_tables, normalized.lhs_col.tab_name);
+        bool rhs_on_left = table_in_plan_side(left_tables, normalized.rhs_col.tab_name);
+        if (!lhs_on_left && rhs_on_left) {
+            std::swap(normalized.lhs_col, normalized.rhs_col);
+            normalized.op = swapped_op(normalized.op);
+        }
+    }
+    return normalized;
 }
 
 static std::string list_attr(const std::string &name, std::vector<std::string> values) {
@@ -1585,19 +1627,16 @@ static std::shared_ptr<ExplainNode> build_explain_tree(SmManager *sm_manager, st
     } else if (auto x = std::dynamic_pointer_cast<JoinPlan>(plan)) {
         auto node = std::make_shared<ExplainNode>();
         node->type = "Join";
-        std::function<void(std::shared_ptr<Plan>, std::vector<std::string>&)> collect_tabs;
-        collect_tabs = [&](std::shared_ptr<Plan> p, std::vector<std::string> &tabs) {
-            if (auto s = std::dynamic_pointer_cast<ScanPlan>(p)) tabs.push_back(s->tab_name_);
-            else if (auto j = std::dynamic_pointer_cast<JoinPlan>(p)) { collect_tabs(j->left_, tabs); collect_tabs(j->right_, tabs); }
-            else if (auto pr = std::dynamic_pointer_cast<ProjectionPlan>(p)) collect_tabs(pr->subplan_, tabs);
-        };
         std::vector<std::string> tabs;
-        collect_tabs(x, tabs);
+        collect_plan_tables(x, tabs);
         node->attrs.push_back(list_attr("tables", tabs));
         if (!x->conds_.empty()) {
+            std::vector<std::string> left_tables;
+            collect_plan_tables(x->left_, left_tables);
             std::vector<std::string> conds;
             for (size_t i = 0; i < x->conds_.size(); i++) {
-                conds.push_back(condition_to_explain_string(x->conds_[i]));
+                auto cond = normalize_join_condition_for_explain(x->conds_[i], left_tables);
+                conds.push_back(condition_to_explain_string(cond));
             }
             node->attrs.push_back(list_attr("condition", conds));
         }
@@ -1771,7 +1810,8 @@ void QlManager::handle_explain_analyze(const std::string &sql, Context *context)
             size_t dot_pos = output.find('.', pos);
             if (dot_pos == std::string::npos) break;
             // 检查小数点前后是否是数字
-            if (dot_pos == 0 || !isdigit(output[dot_pos - 1])) {
+            if (dot_pos == 0 || dot_pos + 1 >= output.size() ||
+                !isdigit(output[dot_pos - 1]) || !isdigit(output[dot_pos + 1])) {
                 pos = dot_pos + 1;
                 continue;
             }

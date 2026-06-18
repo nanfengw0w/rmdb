@@ -178,6 +178,8 @@ void *client_handler(void *sock_fd) {
             bool has_explain = sql_lower.find("explain analyze ") != std::string::npos;
             if (has_agg || has_multi_orderby || has_union || has_explain) {
                 try {
+                    memset(data_send, '\0', BUFFER_LENGTH);
+                    offset = 0;
                     auto context_agg = std::make_unique<Context>(lock_manager.get(), log_manager.get(), nullptr, data_send, &offset);
                     SetTransaction(&txn_id, context_agg.get());
                     if (has_explain) {
