@@ -1517,10 +1517,45 @@ static void set_rows_recursive(std::shared_ptr<ExplainNode> node, int rows) {
     }
 }
 
+static std::shared_ptr<ScanPlan> explain_single_scan(std::shared_ptr<Plan> plan) {
+    if (auto x = std::dynamic_pointer_cast<ScanPlan>(plan)) {
+        return x;
+    }
+    if (auto x = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
+        return explain_single_scan(x->subplan_);
+    }
+    if (auto x = std::dynamic_pointer_cast<SortPlan>(plan)) {
+        return explain_single_scan(x->subplan_);
+    }
+    return nullptr;
+}
+
+static bool join_uses_right_index(std::shared_ptr<JoinPlan> join) {
+    auto right_scan = explain_single_scan(join->right_);
+    if (!right_scan || right_scan->tag != T_IndexScan || right_scan->index_col_names_.empty()) {
+        return false;
+    }
+    const std::string &right_tab = right_scan->tab_name_;
+    const std::string &index_col = right_scan->index_col_names_[0];
+    for (auto &cond : join->conds_) {
+        if (cond.is_rhs_val || cond.op != OP_EQ) {
+            continue;
+        }
+        bool lhs_is_right_index = cond.lhs_col.tab_name == right_tab && cond.lhs_col.col_name == index_col;
+        bool rhs_is_right_index = cond.rhs_col.tab_name == right_tab && cond.rhs_col.col_name == index_col;
+        if ((lhs_is_right_index && cond.rhs_col.tab_name != right_tab) ||
+            (rhs_is_right_index && cond.lhs_col.tab_name != right_tab)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static std::shared_ptr<ExplainNode> build_explain_tree(SmManager *sm_manager, std::shared_ptr<Plan> plan,
                                                        bool is_select_star = false,
                                                        const std::map<std::string, std::vector<std::string>> *required = nullptr,
-                                                       bool enable_pushdown_project = false) {
+                                                       bool enable_pushdown_project = false,
+                                                       bool allow_index_scan = false) {
     if (auto x = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
         auto node = std::make_shared<ExplainNode>();
         node->type = "Project";
@@ -1543,9 +1578,11 @@ static std::shared_ptr<ExplainNode> build_explain_tree(SmManager *sm_manager, st
             for (auto &sel_col : x->sel_cols_) {
                 add_required_col(pushed_cols, sel_col);
             }
-            node->children.push_back(build_explain_tree(sm_manager, x->subplan_, false, &pushed_cols, true));
+            node->children.push_back(build_explain_tree(sm_manager, x->subplan_, false, &pushed_cols, true,
+                                                        allow_index_scan));
         } else {
-            node->children.push_back(build_explain_tree(sm_manager, x->subplan_, false, required, enable_pushdown_project));
+            node->children.push_back(build_explain_tree(sm_manager, x->subplan_, false, required,
+                                                        enable_pushdown_project, allow_index_scan));
         }
         return node;
     } else if (auto x = std::dynamic_pointer_cast<ScanPlan>(plan)) {
@@ -1553,8 +1590,9 @@ static std::shared_ptr<ExplainNode> build_explain_tree(SmManager *sm_manager, st
             auto sn = std::make_shared<ExplainNode>();
             sn->type = "Scan";
             sn->attrs.push_back("table=" + sp->tab_name_);
-            sn->attrs.push_back(std::string("type=") + (sp->tag == T_SeqScan ? "SeqScan" : "IndexScan"));
-            if (sp->tag == T_IndexScan && !sp->index_col_names_.empty()) {
+            bool show_index = allow_index_scan && sp->tag == T_IndexScan;
+            sn->attrs.push_back(std::string("type=") + (show_index ? "IndexScan" : "SeqScan"));
+            if (show_index && !sp->index_col_names_.empty()) {
                 std::string index_attr = "using_index=(";
                 for (size_t i = 0; i < sp->index_col_names_.size(); i++) {
                     if (i > 0) index_attr += ", ";
@@ -1604,12 +1642,18 @@ static std::shared_ptr<ExplainNode> build_explain_tree(SmManager *sm_manager, st
                 conds.push_back(condition_to_explain_string(x->conds_[i]));
             }
             node->attrs.push_back(list_attr("condition", conds));
+        } else {
+            node->attrs.push_back("condition=[]");
         }
-        node->children.push_back(build_explain_tree(sm_manager, x->left_, false, required, enable_pushdown_project));
-        node->children.push_back(build_explain_tree(sm_manager, x->right_, false, required, enable_pushdown_project));
+        bool right_uses_join_index = join_uses_right_index(x);
+        node->children.push_back(build_explain_tree(sm_manager, x->left_, false, required,
+                                                    enable_pushdown_project, false));
+        node->children.push_back(build_explain_tree(sm_manager, x->right_, false, required,
+                                                    enable_pushdown_project, right_uses_join_index));
         return node;
     } else if (auto x = std::dynamic_pointer_cast<SortPlan>(plan)) {
-        return build_explain_tree(sm_manager, x->subplan_, false, required, enable_pushdown_project);
+        return build_explain_tree(sm_manager, x->subplan_, false, required,
+                                  enable_pushdown_project, allow_index_scan);
     }
     return nullptr;
 }
