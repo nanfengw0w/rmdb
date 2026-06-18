@@ -43,6 +43,34 @@ static void set_response(char *data_send, int *offset, const std::string &msg) {
     *offset = static_cast<int>(len);
 }
 
+static std::string strip_sql_line_comments(const std::string &sql) {
+    std::string result;
+    bool in_string = false;
+    for (size_t i = 0; i < sql.size(); i++) {
+        if (sql[i] == '\'') {
+            in_string = !in_string;
+            result.push_back(sql[i]);
+            continue;
+        }
+        if (!in_string && sql[i] == '-' && i + 1 < sql.size() && sql[i + 1] == '-') {
+            i += 2;
+            while (i < sql.size() && sql[i] != '\n' && sql[i] != '\r') {
+                i++;
+            }
+            if (i < sql.size()) {
+                result.push_back(' ');
+            }
+            continue;
+        }
+        result.push_back(sql[i]);
+    }
+    return result;
+}
+
+static bool is_blank_sql(const std::string &sql) {
+    return sql.find_first_not_of(" \t\r\n;") == std::string::npos;
+}
+
 // 构建全局所需的管理器对象
 auto disk_manager = std::make_unique<DiskManager>();
 auto buffer_pool_manager = std::make_unique<BufferPoolManager>(BUFFER_POOL_SIZE, disk_manager.get());
@@ -113,6 +141,19 @@ void *client_handler(void *sock_fd) {
         }
         
         printf("i_recvBytes: %d \n ", i_recvBytes);
+
+        std::string sanitized_sql = strip_sql_line_comments(std::string(data_recv));
+        if (is_blank_sql(sanitized_sql)) {
+            memset(data_send, '\0', BUFFER_LENGTH);
+            offset = 0;
+            if (write(fd, data_send, 1) == -1) {
+                break;
+            }
+            continue;
+        }
+        memset(data_recv, 0, BUFFER_LENGTH);
+        size_t sanitized_len = std::min(sanitized_sql.size(), static_cast<size_t>(BUFFER_LENGTH - 1));
+        memcpy(data_recv, sanitized_sql.data(), sanitized_len);
 
         if (strcmp(data_recv, "exit") == 0) {
             std::cout << "Client exit." << std::endl;
