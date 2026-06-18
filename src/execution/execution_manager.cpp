@@ -1416,8 +1416,23 @@ static std::string value_to_explain_string(const Value &val) {
         return std::to_string(val.int_val);
     }
     if (val.type == TYPE_FLOAT) {
-        // Use std::to_string for consistent formatting, trailing zeros will be cleaned up later
-        std::string s = std::to_string(val.float_val);
+        // 检查是否为整数值（如 1000.0 → 1000）
+        float f = val.float_val;
+        if (f == static_cast<int>(f)) {
+            return std::to_string(static_cast<int>(f));
+        }
+        // 非整数：去掉尾部多余的0（如 700.500000 → 700.5）
+        std::string s = std::to_string(f);
+        size_t dot = s.find('.');
+        if (dot != std::string::npos) {
+            size_t last_nonzero = dot;
+            for (size_t k = dot + 1; k < s.size(); k++) {
+                if (s[k] != '0') last_nonzero = k;
+            }
+            if (last_nonzero > dot) {
+                s.erase(last_nonzero + 1);
+            }
+        }
         return s;
     }
     return "'" + val.str_val + "'";
@@ -1818,52 +1833,6 @@ void QlManager::handle_explain_analyze(const std::string &sql, Context *context)
     sort_explain_attr_lists(output, "columns=[");
     sort_explain_attr_lists(output, "condition=[");
     sort_explain_attr_lists(output, "tables=[");
-
-    // 修复浮点数显示: 去掉多余的0
-    // 1000.000000 -> 1000, 700.500000 -> 700.5
-    {
-        size_t pos = 0;
-        while (pos < output.size()) {
-            // 找到小数点
-            size_t dot_pos = output.find('.', pos);
-            if (dot_pos == std::string::npos) break;
-            // 检查小数点前后是否是数字
-            if (dot_pos == 0 || dot_pos + 1 >= output.size() ||
-                !isdigit(output[dot_pos - 1]) || !isdigit(output[dot_pos + 1])) {
-                pos = dot_pos + 1;
-                continue;
-            }
-            // 找到小数部分的结尾
-            size_t end = dot_pos + 1;
-            while (end < output.size() && isdigit(output[end])) end++;
-            // 检查小数部分是否全是0
-            std::string frac = output.substr(dot_pos + 1, end - dot_pos - 1);
-            bool all_zeros = true;
-            for (char c : frac) {
-                if (c != '0') { all_zeros = false; break; }
-            }
-            if (all_zeros) {
-                // 去掉 ".000000" 部分
-                output.erase(dot_pos, end - dot_pos);
-                pos = dot_pos;
-            } else {
-                // 去掉尾部的0: 700.500000 -> 700.5
-                size_t last_nonzero = dot_pos;
-                for (size_t k = dot_pos + 1; k < end; k++) {
-                    if (output[k] != '0') last_nonzero = k;
-                }
-                if (last_nonzero > dot_pos) {
-                    // 保留到最后一个非零位
-                    output.erase(last_nonzero + 1, end - last_nonzero - 1);
-                    pos = last_nonzero + 1;
-                } else {
-                    // 全是0，去掉整个小数部分
-                    output.erase(dot_pos, end - dot_pos);
-                    pos = dot_pos;
-                }
-            }
-        }
-    }
 
     std::fstream outfile;
     outfile.open("output.txt", std::ios::out | std::ios::app);
