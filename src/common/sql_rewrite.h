@@ -284,5 +284,13 @@ static SqlRewriteResult rewrite_sql_for_parser(const std::string &original_sql) 
             pos += to.length();
         }
     }
+    // 将 != 替换为 <>（解析器不正确处理 !=）
+    {
+        size_t pos = 0;
+        while ((pos = result.sql.find("!=", pos)) != std::string::npos) {
+            result.sql.replace(pos, 2, "<>");
+            pos += 2;
+        }
+    }
     return result;
 }
