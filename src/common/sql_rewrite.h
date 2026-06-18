@@ -41,15 +41,28 @@ static SqlRewriteResult rewrite_sql_for_parser(const std::string &original_sql) 
         return result;
     }
 
-    // 按token分割
+    // 按token分割，保留双字符比较操作符
     std::vector<std::string> tokens;
     {
         std::string cur;
-        for (char c : original_sql) {
+        for (size_t ci = 0; ci < original_sql.size(); ci++) {
+            char c = original_sql[ci];
             if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '(' || c == ')' ||
                 c == ',' || c == ';' || c == '=' || c == '<' || c == '>' || c == '!') {
                 if (!cur.empty()) { tokens.push_back(cur); cur.clear(); }
-                if (c != ' ' && c != '\t' && c != '\n' && c != '\r') tokens.push_back(std::string(1, c));
+                if (c != ' ' && c != '\t' && c != '\n' && c != '\r') {
+                    if (ci + 1 < original_sql.size()) {
+                        char next = original_sql[ci + 1];
+                        if ((c == '<' && (next == '>' || next == '=')) ||
+                            (c == '>' && next == '=') ||
+                            (c == '!' && next == '=')) {
+                            tokens.push_back(std::string(1, c) + std::string(1, next));
+                            ci++;
+                            continue;
+                        }
+                    }
+                    tokens.push_back(std::string(1, c));
+                }
             } else cur += c;
         }
         if (!cur.empty()) tokens.push_back(cur);
