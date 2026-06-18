@@ -60,25 +60,9 @@ static SqlRewriteResult rewrite_sql_for_parser(const std::string &original_sql) 
         }
     }
 
-    // 检查是否有JOIN或隐式JOIN（逗号分隔的多表）
-    // 即使没有JOIN，也需要处理别名替换
+    // 检查是否需要重写（有JOIN）
     std::string ol_normalized = " " + normalize_sql_space(ol) + " ";
-    bool has_join = ol_normalized.find(" join ") != std::string::npos;
-    // 检查FROM后是否有逗号分隔的多表（隐式JOIN）
-    bool has_implicit_join = false;
-    {
-        size_t from_pos_check = ol_normalized.find(" from ");
-        if (from_pos_check != std::string::npos) {
-            // 检查FROM后、WHERE前是否有逗号
-            size_t where_pos = ol_normalized.find(" where ", from_pos_check);
-            size_t end_pos = (where_pos != std::string::npos) ? where_pos : ol_normalized.size();
-            std::string from_clause = ol_normalized.substr(from_pos_check + 6, end_pos - from_pos_check - 6);
-            if (from_clause.find(',') != std::string::npos) {
-                has_implicit_join = true;
-            }
-        }
-    }
-    if (!has_join && !has_implicit_join) {
+    if (ol_normalized.find(" join ") == std::string::npos) {
         result.sql = original_sql;
         return result;
     }
@@ -149,37 +133,25 @@ static SqlRewriteResult rewrite_sql_for_parser(const std::string &original_sql) 
         }
     };
 
-    // 处理表名和别名的辅助函数
-    auto process_table_alias = [&](size_t &idx) {
-        if (idx >= tokens.size()) return;
-        std::string table = tokens[idx++];
-        tables.push_back(table);
-        std::string table_lower = to_lower(table);
-        if (idx < tokens.size() && to_lower(tokens[idx]) == "as" && idx + 1 < tokens.size()) {
-            alias_map[to_lower(tokens[idx + 1])] = table_lower;
-            idx += 2;
-        } else if (idx < tokens.size()) {
-            std::string next_lower = to_lower(tokens[idx]);
-            if (!is_relation_end(next_lower)) {
-                alias_map[next_lower] = table_lower;
-                idx++;
-            }
-        }
-    };
-
     size_t i = from_pos;
     while (i < tokens.size()) {
         std::string tl = to_lower(tokens[i]);
         if (tl == "from" || tl == "join") {
             i++;
             if (i >= tokens.size()) break;
-            process_table_alias(i);
-            continue;
-        }
-        if (tl == ",") {
-            i++;
-            if (i >= tokens.size()) break;
-            process_table_alias(i);
+            std::string table = tokens[i++];
+            tables.push_back(table);
+            std::string table_lower = to_lower(table);
+            if (i < tokens.size() && to_lower(tokens[i]) == "as" && i + 1 < tokens.size()) {
+                alias_map[to_lower(tokens[i + 1])] = table_lower;
+                i += 2;
+            } else if (i < tokens.size()) {
+                std::string next_lower = to_lower(tokens[i]);
+                if (!is_relation_end(next_lower)) {
+                    alias_map[next_lower] = table_lower;
+                    i++;
+                }
+            }
             continue;
         }
         if (tl == "on") {
