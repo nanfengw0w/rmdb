@@ -113,12 +113,14 @@ int push_conds(Condition *cond, std::shared_ptr<Plan> plan)
         }
         // 左子节点匹配到条件的右边
         if(left_res == 2) {
-            // 需要将左右两边的条件变换位置
-            std::map<CompOp, CompOp> swap_op = {
-                {OP_EQ, OP_EQ}, {OP_NE, OP_NE}, {OP_LT, OP_GT}, {OP_GT, OP_LT}, {OP_LE, OP_GE}, {OP_GE, OP_LE},
-            };
-            std::swap(cond->lhs_col, cond->rhs_col);
-            cond->op = swap_op.at(cond->op);
+            // 等值条件对称，不需要交换，保持原始格式输出一致
+            if (cond->op != OP_EQ) {
+                std::map<CompOp, CompOp> swap_op = {
+                    {OP_EQ, OP_EQ}, {OP_NE, OP_NE}, {OP_LT, OP_GT}, {OP_GT, OP_LT}, {OP_LE, OP_GE}, {OP_GE, OP_LE},
+                };
+                std::swap(cond->lhs_col, cond->rhs_col);
+                cond->op = swap_op.at(cond->op);
+            }
         }
         x->conds_.emplace_back(std::move(*cond));
         return 3;
@@ -190,21 +192,87 @@ std::shared_ptr<Plan> Planner::make_one_rel(std::shared_ptr<Query> query)
         return table_scan_executors[0];
     }
     std::vector<Condition> remaining_conds = std::move(query->conds);
-    std::vector<std::string> joined_tables{tables[0]};
-    std::shared_ptr<Plan> join_root = table_scan_executors[0];
+
+    // 多表连接顺序优化：当有3+表且存在单表过滤条件时，贪心选择连接顺序
+    std::vector<size_t> join_order(tables.size());
+    if (tables.size() >= 3) {
+        bool has_filters = false;
+        for (size_t i = 0; i < tables.size(); i++) {
+            auto scan = std::dynamic_pointer_cast<ScanPlan>(table_scan_executors[i]);
+            if (scan && !scan->conds_.empty()) { has_filters = true; break; }
+        }
+        if (has_filters) {
+            std::vector<bool> used(tables.size(), false);
+            std::vector<std::string> joined_tabs;
+            auto is_joined_fn = [&](const std::string &tab) {
+                return std::find(joined_tabs.begin(), joined_tabs.end(), tab) != joined_tabs.end();
+            };
+            // 选择过滤条件最多的表作为起始表
+            int best_start = 0;
+            int best_fc = -1;
+            for (size_t i = 0; i < tables.size(); i++) {
+                auto scan = std::dynamic_pointer_cast<ScanPlan>(table_scan_executors[i]);
+                int fc = scan ? (int)scan->conds_.size() : 0;
+                if (fc > best_fc) { best_fc = fc; best_start = (int)i; }
+            }
+            join_order[0] = best_start;
+            used[best_start] = true;
+            joined_tabs.push_back(tables[best_start]);
+            // 贪心选择后续表：优先选有连接条件且过滤条件最多的表
+            for (size_t step = 1; step < tables.size(); step++) {
+                int best_next = -1;
+                int best_score = -1;
+                for (size_t i = 0; i < tables.size(); i++) {
+                    if (used[i]) continue;
+                    bool can_join = false;
+                    for (auto &cond : remaining_conds) {
+                        bool lhs_new = (cond.lhs_col.tab_name == tables[i]);
+                        bool rhs_new = (!cond.is_rhs_val && cond.rhs_col.tab_name == tables[i]);
+                        bool lhs_joined = is_joined_fn(cond.lhs_col.tab_name);
+                        bool rhs_joined = cond.is_rhs_val || is_joined_fn(cond.rhs_col.tab_name);
+                        if ((lhs_new && rhs_joined) || (rhs_new && lhs_joined)) {
+                            can_join = true; break;
+                        }
+                    }
+                    if (!can_join) continue;
+                    auto scan = std::dynamic_pointer_cast<ScanPlan>(table_scan_executors[i]);
+                    int fc = scan ? (int)scan->conds_.size() : 0;
+                    if (fc > best_score) { best_score = fc; best_next = (int)i; }
+                }
+                if (best_next == -1) {
+                    for (size_t i = 0; i < tables.size(); i++) {
+                        if (!used[i]) { best_next = (int)i; break; }
+                    }
+                }
+                if (best_next >= 0) {
+                    join_order[step] = best_next;
+                    used[best_next] = true;
+                    joined_tabs.push_back(tables[best_next]);
+                }
+            }
+        } else {
+            for (size_t i = 0; i < tables.size(); i++) join_order[i] = i;
+        }
+    } else {
+        for (size_t i = 0; i < tables.size(); i++) join_order[i] = i;
+    }
+
+    std::vector<std::string> joined_tables{tables[join_order[0]]};
+    std::shared_ptr<Plan> join_root = table_scan_executors[join_order[0]];
 
     auto is_joined = [&](const std::string &tab_name) {
         return std::find(joined_tables.begin(), joined_tables.end(), tab_name) != joined_tables.end();
     };
 
     for (size_t i = 1; i < tables.size(); i++) {
+        size_t idx = join_order[i];
         std::vector<Condition> join_conds;
         auto it = remaining_conds.begin();
         while (it != remaining_conds.end()) {
-            bool lhs_ready = is_joined(it->lhs_col.tab_name) || it->lhs_col.tab_name == tables[i];
-            bool rhs_ready = it->is_rhs_val || is_joined(it->rhs_col.tab_name) || it->rhs_col.tab_name == tables[i];
-            bool touches_new_table = it->lhs_col.tab_name == tables[i] ||
-                                     (!it->is_rhs_val && it->rhs_col.tab_name == tables[i]);
+            bool lhs_ready = is_joined(it->lhs_col.tab_name) || it->lhs_col.tab_name == tables[idx];
+            bool rhs_ready = it->is_rhs_val || is_joined(it->rhs_col.tab_name) || it->rhs_col.tab_name == tables[idx];
+            bool touches_new_table = it->lhs_col.tab_name == tables[idx] ||
+                                     (!it->is_rhs_val && it->rhs_col.tab_name == tables[idx]);
 
             if (lhs_ready && rhs_ready && touches_new_table) {
                 join_conds.emplace_back(std::move(*it));
@@ -215,20 +283,19 @@ std::shared_ptr<Plan> Planner::make_one_rel(std::shared_ptr<Query> query)
         }
 
         // 检查JOIN条件中是否有索引可用于内表
-        auto right_scan = std::dynamic_pointer_cast<ScanPlan>(table_scan_executors[i]);
+        auto right_scan = std::dynamic_pointer_cast<ScanPlan>(table_scan_executors[idx]);
         if (right_scan && right_scan->tag == T_SeqScan) {
             std::vector<std::string> join_index_cols;
-            bool has_join_index = get_index_cols(tables[i], join_conds, join_index_cols);
+            bool has_join_index = get_index_cols(tables[idx], join_conds, join_index_cols);
             if (has_join_index) {
-                // 升级为IndexScan
-                table_scan_executors[i] = std::make_shared<ScanPlan>(T_IndexScan, sm_manager_,
-                    tables[i], right_scan->conds_, join_index_cols);
+                table_scan_executors[idx] = std::make_shared<ScanPlan>(T_IndexScan, sm_manager_,
+                    tables[idx], right_scan->conds_, join_index_cols);
             }
         }
 
         join_root = std::make_shared<JoinPlan>(T_NestLoop, std::move(join_root),
-                                               std::move(table_scan_executors[i]), std::move(join_conds));
-        joined_tables.emplace_back(tables[i]);
+                                               std::move(table_scan_executors[idx]), std::move(join_conds));
+        joined_tables.emplace_back(tables[idx]);
     }
 
     for (auto &cond : remaining_conds) {
