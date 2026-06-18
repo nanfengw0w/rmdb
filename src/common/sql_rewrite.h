@@ -109,6 +109,21 @@ static SqlRewriteResult rewrite_sql_for_parser(const std::string &original_sql) 
         std::string cur;
         for (size_t ci = 0; ci < original_sql.size(); ci++) {
             char c = original_sql[ci];
+            if (c == '\'') {
+                if (!cur.empty()) { tokens.push_back(cur); cur.clear(); }
+                std::string lit;
+                lit.push_back(c);
+                ci++;
+                while (ci < original_sql.size()) {
+                    lit.push_back(original_sql[ci]);
+                    if (original_sql[ci] == '\'') {
+                        break;
+                    }
+                    ci++;
+                }
+                tokens.push_back(lit);
+                continue;
+            }
             if (sql_is_space(c) || c == '(' || c == ')' ||
                 c == ',' || c == ';' || c == '=' || c == '<' || c == '>' || c == '!') {
                 if (!cur.empty()) { tokens.push_back(cur); cur.clear(); }
