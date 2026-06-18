@@ -1472,14 +1472,6 @@ static void collect_join_cols(std::shared_ptr<Plan> plan, std::map<std::string, 
         }
         collect_join_cols(x->left_, required);
         collect_join_cols(x->right_, required);
-    } else if (auto x = std::dynamic_pointer_cast<ScanPlan>(plan)) {
-        // Also include columns referenced by Scan filter conditions
-        for (auto &cond : x->conds_) {
-            add_required_col(required, cond.lhs_col);
-            if (!cond.is_rhs_val) {
-                add_required_col(required, cond.rhs_col);
-            }
-        }
     } else if (auto x = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
         collect_join_cols(x->subplan_, required);
     } else if (auto x = std::dynamic_pointer_cast<SortPlan>(plan)) {
