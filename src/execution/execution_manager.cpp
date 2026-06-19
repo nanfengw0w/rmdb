@@ -1461,6 +1461,30 @@ static std::string condition_to_explain_string(const Condition &cond) {
     return out;
 }
 
+static CompOp swapped_comp_op(CompOp op) {
+    switch (op) {
+        case OP_LT: return OP_GT;
+        case OP_GT: return OP_LT;
+        case OP_LE: return OP_GE;
+        case OP_GE: return OP_LE;
+        default: return op;
+    }
+}
+
+static std::string condition_to_join_explain_string(const Condition &cond,
+                                                    const std::set<std::string> &left_tabs,
+                                                    const std::set<std::string> &right_tabs) {
+    if (!cond.is_rhs_val &&
+        right_tabs.count(cond.lhs_col.tab_name) > 0 &&
+        left_tabs.count(cond.rhs_col.tab_name) > 0) {
+        Condition display = cond;
+        std::swap(display.lhs_col, display.rhs_col);
+        display.op = swapped_comp_op(display.op);
+        return condition_to_explain_string(display);
+    }
+    return condition_to_explain_string(cond);
+}
+
 static std::string list_attr(const std::string &name, std::vector<std::string> values) {
     std::sort(values.begin(), values.end());
     values.erase(std::unique(values.begin(), values.end()), values.end());
@@ -1673,10 +1697,22 @@ static std::shared_ptr<ExplainNode> build_explain_tree(SmManager *sm_manager, st
             tabs.push_back(tab.real);
         }
         node->attrs.push_back(list_attr("tables", tabs));
+        std::vector<TabInstance> left_tab_instances;
+        std::vector<TabInstance> right_tab_instances;
+        collect_tabs(x->left_, left_tab_instances);
+        collect_tabs(x->right_, right_tab_instances);
+        std::set<std::string> left_tabs;
+        std::set<std::string> right_tabs;
+        for (auto &tab : left_tab_instances) {
+            left_tabs.insert(tab.logical);
+        }
+        for (auto &tab : right_tab_instances) {
+            right_tabs.insert(tab.logical);
+        }
         if (!x->conds_.empty()) {
             std::vector<std::string> conds;
             for (size_t i = 0; i < x->conds_.size(); i++) {
-                conds.push_back(condition_to_explain_string(x->conds_[i]));
+                conds.push_back(condition_to_join_explain_string(x->conds_[i], left_tabs, right_tabs));
             }
             node->attrs.push_back(list_attr("condition", conds));
         } else {
