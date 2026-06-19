@@ -1492,6 +1492,14 @@ static void collect_join_cols(std::shared_ptr<Plan> plan, std::map<std::string, 
     } else if (auto x = std::dynamic_pointer_cast<SortPlan>(plan)) {
         add_required_col(required, x->sel_col_);
         collect_join_cols(x->subplan_, required);
+    } else if (auto x = std::dynamic_pointer_cast<ScanPlan>(plan)) {
+        // 也收集WHERE条件（Filter）引用的列
+        for (auto &cond : x->conds_) {
+            add_required_col(required, cond.lhs_col);
+            if (!cond.is_rhs_val) {
+                add_required_col(required, cond.rhs_col);
+            }
+        }
     }
 }
 
