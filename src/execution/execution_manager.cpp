@@ -1557,6 +1557,9 @@ static bool join_uses_right_index(std::shared_ptr<JoinPlan> join) {
     if (!right_scan || right_scan->tag != T_IndexScan || right_scan->index_col_names_.empty()) {
         return false;
     }
+    if (!right_scan->conds_.empty()) {
+        return false;
+    }
     const std::string &right_tab = right_scan->tab_name_;
     const std::string &index_col = right_scan->index_col_names_[0];
     for (auto &cond : join->conds_) {
