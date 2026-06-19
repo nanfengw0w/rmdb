@@ -113,14 +113,12 @@ int push_conds(Condition *cond, std::shared_ptr<Plan> plan)
         }
         // 左子节点匹配到条件的右边
         if(left_res == 2) {
-            // 等值条件对称，不需要交换，保持原始格式输出一致
-            if (cond->op != OP_EQ) {
-                std::map<CompOp, CompOp> swap_op = {
-                    {OP_EQ, OP_EQ}, {OP_NE, OP_NE}, {OP_LT, OP_GT}, {OP_GT, OP_LT}, {OP_LE, OP_GE}, {OP_GE, OP_LE},
-                };
-                std::swap(cond->lhs_col, cond->rhs_col);
-                cond->op = swap_op.at(cond->op);
-            }
+            // 需要将左右两边的条件变换位置
+            std::map<CompOp, CompOp> swap_op = {
+                {OP_EQ, OP_EQ}, {OP_NE, OP_NE}, {OP_LT, OP_GT}, {OP_GT, OP_LT}, {OP_LE, OP_GE}, {OP_GE, OP_LE},
+            };
+            std::swap(cond->lhs_col, cond->rhs_col);
+            cond->op = swap_op.at(cond->op);
         }
         x->conds_.emplace_back(std::move(*cond));
         return 3;
