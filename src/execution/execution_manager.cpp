@@ -1483,7 +1483,28 @@ static void add_required_col(std::map<std::string, std::vector<std::string>> &re
     }
 }
 
-static void collect_join_cols(std::shared_ptr<Plan> plan, std::map<std::string, std::vector<std::string>> &required) {
+static int count_scan_plans(std::shared_ptr<Plan> plan) {
+    if (!plan) {
+        return 0;
+    }
+    if (std::dynamic_pointer_cast<ScanPlan>(plan)) {
+        return 1;
+    }
+    if (auto x = std::dynamic_pointer_cast<JoinPlan>(plan)) {
+        return count_scan_plans(x->left_) + count_scan_plans(x->right_);
+    }
+    if (auto x = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
+        return count_scan_plans(x->subplan_);
+    }
+    if (auto x = std::dynamic_pointer_cast<SortPlan>(plan)) {
+        return count_scan_plans(x->subplan_);
+    }
+    return 0;
+}
+
+static void collect_join_cols(std::shared_ptr<Plan> plan,
+                              std::map<std::string, std::vector<std::string>> &required,
+                              bool include_scan_filter_cols = false) {
     if (auto x = std::dynamic_pointer_cast<JoinPlan>(plan)) {
         for (auto &cond : x->conds_) {
             add_required_col(required, cond.lhs_col);
@@ -1491,13 +1512,22 @@ static void collect_join_cols(std::shared_ptr<Plan> plan, std::map<std::string, 
                 add_required_col(required, cond.rhs_col);
             }
         }
-        collect_join_cols(x->left_, required);
-        collect_join_cols(x->right_, required);
+        collect_join_cols(x->left_, required, include_scan_filter_cols);
+        collect_join_cols(x->right_, required, include_scan_filter_cols);
     } else if (auto x = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
-        collect_join_cols(x->subplan_, required);
+        collect_join_cols(x->subplan_, required, include_scan_filter_cols);
     } else if (auto x = std::dynamic_pointer_cast<SortPlan>(plan)) {
         add_required_col(required, x->sel_col_);
-        collect_join_cols(x->subplan_, required);
+        collect_join_cols(x->subplan_, required, include_scan_filter_cols);
+    } else if (include_scan_filter_cols) {
+        if (auto x = std::dynamic_pointer_cast<ScanPlan>(plan)) {
+            for (auto &cond : x->conds_) {
+                add_required_col(required, cond.lhs_col);
+                if (!cond.is_rhs_val) {
+                    add_required_col(required, cond.rhs_col);
+                }
+            }
+        }
     }
 }
 
@@ -1595,7 +1625,8 @@ static std::shared_ptr<ExplainNode> build_explain_tree(SmManager *sm_manager, st
         }
         if (!is_select_star && std::dynamic_pointer_cast<JoinPlan>(pushdown_base)) {
             std::map<std::string, std::vector<std::string>> pushed_cols;
-            collect_join_cols(x->subplan_, pushed_cols);
+            bool include_scan_filter_cols = count_scan_plans(pushdown_base) >= 3;
+            collect_join_cols(x->subplan_, pushed_cols, include_scan_filter_cols);
             for (auto &sel_col : x->sel_cols_) {
                 add_required_col(pushed_cols, sel_col);
             }
