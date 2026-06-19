@@ -1461,6 +1461,150 @@ static std::string condition_to_explain_string(const Condition &cond) {
     return out;
 }
 
+static std::vector<std::string> tokenize_explain_sql(const std::string &sql) {
+    std::vector<std::string> tokens;
+    std::string cur;
+    for (size_t i = 0; i < sql.size(); i++) {
+        char c = sql[i];
+        if (c == '\'') {
+            if (!cur.empty()) {
+                tokens.push_back(cur);
+                cur.clear();
+            }
+            std::string lit;
+            lit.push_back(c);
+            i++;
+            while (i < sql.size()) {
+                lit.push_back(sql[i]);
+                if (sql[i] == '\'') {
+                    break;
+                }
+                i++;
+            }
+            tokens.push_back(lit);
+            continue;
+        }
+        if (sql_is_space(c) || c == '(' || c == ')' || c == ',' || c == ';' ||
+            c == '=' || c == '<' || c == '>' || c == '!') {
+            if (!cur.empty()) {
+                tokens.push_back(cur);
+                cur.clear();
+            }
+            if (!sql_is_space(c)) {
+                if (i + 1 < sql.size()) {
+                    char next = sql[i + 1];
+                    if ((c == '<' && (next == '>' || next == '=')) ||
+                        (c == '>' && next == '=') ||
+                        (c == '!' && next == '=')) {
+                        tokens.push_back(std::string(1, c) + std::string(1, next));
+                        i++;
+                        continue;
+                    }
+                }
+                tokens.push_back(std::string(1, c));
+            }
+        } else {
+            cur.push_back(c);
+        }
+    }
+    if (!cur.empty()) {
+        tokens.push_back(cur);
+    }
+    return tokens;
+}
+
+static std::string canonical_number_for_explain_key(const std::string &token) {
+    if (!is_sql_number_token(token)) {
+        return token;
+    }
+    bool is_float = token.find('.') != std::string::npos;
+    if (!is_float) {
+        try {
+            return std::to_string(std::stoi(token));
+        } catch (...) {
+            return token;
+        }
+    }
+    try {
+        float f = std::stof(token);
+        if (f == static_cast<int>(f)) {
+            return std::to_string(static_cast<int>(f)) + ".0";
+        }
+        std::string s = std::to_string(f);
+        size_t dot = s.find('.');
+        if (dot != std::string::npos) {
+            size_t last_nonzero = dot;
+            for (size_t k = dot + 1; k < s.size(); k++) {
+                if (s[k] != '0') {
+                    last_nonzero = k;
+                }
+            }
+            if (last_nonzero > dot) {
+                s.erase(last_nonzero + 1);
+            }
+        }
+        return s;
+    } catch (...) {
+        return token;
+    }
+}
+
+static bool is_explain_condition_operand(const std::string &token) {
+    if (token.empty()) {
+        return false;
+    }
+    std::string lower = to_lower(token);
+    static const std::set<std::string> keywords = {
+        "select", "from", "where", "join", "inner", "on", "and", "order",
+        "by", "group", "having", "limit", "as"
+    };
+    return keywords.count(lower) == 0 && token != "(" && token != ")" &&
+           token != "," && token != ";";
+}
+
+static std::map<std::string, std::string> collect_original_condition_formats(const std::string &sql) {
+    std::map<std::string, std::string> replacements;
+    auto tokens = tokenize_explain_sql(sql);
+    for (size_t i = 0; i + 2 < tokens.size(); i++) {
+        const std::string &lhs = tokens[i];
+        const std::string &op = tokens[i + 1];
+        const std::string &rhs = tokens[i + 2];
+        if (!is_sql_comp_token(op) || !is_explain_condition_operand(lhs) ||
+            !is_explain_condition_operand(rhs) || is_sql_value_token(lhs)) {
+            continue;
+        }
+        std::string canonical_op = (op == "!=") ? "<>" : op;
+        std::string canonical_rhs = rhs;
+        if (is_sql_number_token(rhs)) {
+            canonical_rhs = canonical_number_for_explain_key(rhs);
+        }
+        std::string key = lhs + canonical_op + canonical_rhs;
+        std::string original = lhs + op + rhs;
+        if (key != original) {
+            replacements[key] = original;
+        }
+    }
+    return replacements;
+}
+
+static void apply_condition_format_overrides(std::string &output,
+                                             const std::map<std::string, std::string> &replacements) {
+    if (replacements.empty()) {
+        return;
+    }
+    std::vector<std::pair<std::string, std::string>> items(replacements.begin(), replacements.end());
+    std::sort(items.begin(), items.end(), [](const auto &lhs, const auto &rhs) {
+        return lhs.first.size() > rhs.first.size();
+    });
+    for (auto &entry : items) {
+        size_t pos = 0;
+        while ((pos = output.find(entry.first, pos)) != std::string::npos) {
+            output.replace(pos, entry.first.size(), entry.second);
+            pos += entry.second.size();
+        }
+    }
+}
+
 static std::string list_attr(const std::string &name, std::vector<std::string> values) {
     std::sort(values.begin(), values.end());
     values.erase(std::unique(values.begin(), values.end()), values.end());
@@ -1858,6 +2002,7 @@ void QlManager::handle_explain_analyze(const std::string &sql, Context *context)
     std::string inner_sql = trim_str(sql.substr(pos));
     if (!inner_sql.empty() && inner_sql.back() == ';') inner_sql.pop_back();
     inner_sql = trim_str(inner_sql);
+    auto condition_format_overrides = collect_original_condition_formats(inner_sql);
 
     // 使用共享的SQL预处理函数
     auto rewrite_result = rewrite_sql_for_parser(inner_sql);
@@ -1954,6 +2099,7 @@ void QlManager::handle_explain_analyze(const std::string &sql, Context *context)
         alias_replacements.emplace_back(table + ".", alias + ".");
     }
     replace_qualified_name_prefixes(output, alias_replacements);
+    apply_condition_format_overrides(output, condition_format_overrides);
 
     sort_explain_attr_lists(output, "columns=[");
     sort_explain_attr_lists(output, "condition=[");
