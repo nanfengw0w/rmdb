@@ -142,6 +142,27 @@ std::shared_ptr<Plan> pop_scan(int *scantbl, std::string table, std::vector<std:
     return nullptr;
 }
 
+static bool contains_table(const std::vector<std::string> &tables, const std::string &tab_name) {
+    return std::find(tables.begin(), tables.end(), tab_name) != tables.end();
+}
+
+static void orient_join_cond(Condition &cond, const std::vector<std::string> &joined_tables,
+                             const std::string &right_table) {
+    if (cond.is_rhs_val || cond.rhs_col.tab_name == right_table) {
+        return;
+    }
+    bool lhs_is_right = cond.lhs_col.tab_name == right_table;
+    bool rhs_is_left = contains_table(joined_tables, cond.rhs_col.tab_name);
+    if (!lhs_is_right || !rhs_is_left) {
+        return;
+    }
+    std::map<CompOp, CompOp> swap_op = {
+        {OP_EQ, OP_EQ}, {OP_NE, OP_NE}, {OP_LT, OP_GT}, {OP_GT, OP_LT}, {OP_LE, OP_GE}, {OP_GE, OP_LE},
+    };
+    std::swap(cond.lhs_col, cond.rhs_col);
+    cond.op = swap_op.at(cond.op);
+}
+
 
 std::shared_ptr<Query> Planner::logical_optimization(std::shared_ptr<Query> query, Context *context)
 {
@@ -208,6 +229,7 @@ std::shared_ptr<Plan> Planner::make_one_rel(std::shared_ptr<Query> query)
                                      (!it->is_rhs_val && it->rhs_col.tab_name == tables[i]);
 
             if (lhs_ready && rhs_ready && touches_new_table) {
+                orient_join_cond(*it, joined_tables, tables[i]);
                 join_conds.emplace_back(std::move(*it));
                 it = remaining_conds.erase(it);
             } else {
