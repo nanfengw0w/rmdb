@@ -1625,7 +1625,7 @@ static std::shared_ptr<ExplainNode> build_explain_tree(SmManager *sm_manager, st
         }
         if (!is_select_star && std::dynamic_pointer_cast<JoinPlan>(pushdown_base)) {
             std::map<std::string, std::vector<std::string>> pushed_cols;
-            bool include_scan_filter_cols = true;
+            bool include_scan_filter_cols = count_scan_plans(pushdown_base) >= 3;
             collect_join_cols(x->subplan_, pushed_cols, include_scan_filter_cols);
             for (auto &sel_col : x->sel_cols_) {
                 add_required_col(pushed_cols, sel_col);
