@@ -45,12 +45,34 @@ static std::string normalize_sql_space(const std::string &s) {
     return result;
 }
 
+static std::string normalize_not_equal_operator(const std::string &sql) {
+    std::string result;
+    result.reserve(sql.size());
+    bool in_string = false;
+    for (size_t i = 0; i < sql.size(); i++) {
+        char c = sql[i];
+        if (c == '\'') {
+            in_string = !in_string;
+            result.push_back(c);
+            continue;
+        }
+        if (!in_string && c == '!' && i + 1 < sql.size() && sql[i + 1] == '=') {
+            result += "<>";
+            i++;
+            continue;
+        }
+        result.push_back(c);
+    }
+    return result;
+}
+
 static SqlRewriteResult rewrite_sql_for_parser(const std::string &original_sql) {
     SqlRewriteResult result;
     result.is_select_star = false;
+    std::string parser_sql = normalize_not_equal_operator(original_sql);
 
     // 检测 SELECT *
-    std::string ol = to_lower(original_sql);
+    std::string ol = to_lower(parser_sql);
     {
         size_t sel_pos = ol.find("select");
         if (sel_pos != std::string::npos) {
@@ -101,7 +123,7 @@ static SqlRewriteResult rewrite_sql_for_parser(const std::string &original_sql) 
         }
     }
     if (!has_join && !has_implicit_join && !has_single_table_alias) {
-        result.sql = original_sql;
+        result.sql = parser_sql;
         return result;
     }
 
@@ -109,16 +131,16 @@ static SqlRewriteResult rewrite_sql_for_parser(const std::string &original_sql) 
     std::vector<std::string> tokens;
     {
         std::string cur;
-        for (size_t ci = 0; ci < original_sql.size(); ci++) {
-            char c = original_sql[ci];
+        for (size_t ci = 0; ci < parser_sql.size(); ci++) {
+            char c = parser_sql[ci];
             if (c == '\'') {
                 if (!cur.empty()) { tokens.push_back(cur); cur.clear(); }
                 std::string lit;
                 lit.push_back(c);
                 ci++;
-                while (ci < original_sql.size()) {
-                    lit.push_back(original_sql[ci]);
-                    if (original_sql[ci] == '\'') {
+                while (ci < parser_sql.size()) {
+                    lit.push_back(parser_sql[ci]);
+                    if (parser_sql[ci] == '\'') {
                         break;
                     }
                     ci++;
@@ -130,8 +152,8 @@ static SqlRewriteResult rewrite_sql_for_parser(const std::string &original_sql) 
                 c == ',' || c == ';' || c == '=' || c == '<' || c == '>' || c == '!') {
                 if (!cur.empty()) { tokens.push_back(cur); cur.clear(); }
                 if (!sql_is_space(c)) {
-                    if (ci + 1 < original_sql.size()) {
-                        char next = original_sql[ci + 1];
+                    if (ci + 1 < parser_sql.size()) {
+                        char next = parser_sql[ci + 1];
                         if ((c == '<' && (next == '>' || next == '=')) ||
                             (c == '>' && next == '=') ||
                             (c == '!' && next == '=')) {
@@ -286,7 +308,7 @@ static SqlRewriteResult rewrite_sql_for_parser(const std::string &original_sql) 
     if (!suffix_tokens.empty()) {
         result.sql += " " + join_tokens(suffix_tokens);
     }
-    if (original_sql.find(';') != std::string::npos && result.sql.find(';') == std::string::npos) {
+    if (parser_sql.find(';') != std::string::npos && result.sql.find(';') == std::string::npos) {
         result.sql += " ;";
     }
     result.alias_to_table = alias_map;
