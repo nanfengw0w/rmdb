@@ -10,6 +10,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "execution_manager.h"
 
+#include <cctype>
 #include <map>
 #include <sstream>
 #include <set>
@@ -1710,6 +1711,62 @@ static void sort_explain_attr_lists(std::string &output, const std::string &attr
     }
 }
 
+static bool is_identifier_char(char ch) {
+    return std::isalnum(static_cast<unsigned char>(ch)) || ch == '_';
+}
+
+static void replace_qualified_name_prefixes(std::string &text,
+                                            std::vector<std::pair<std::string, std::string>> replacements) {
+    struct Pattern {
+        std::string from;
+        std::string lowered_from;
+        std::string to;
+    };
+    std::vector<Pattern> patterns;
+    for (auto &entry : replacements) {
+        if (entry.first.empty() || entry.first == entry.second) {
+            continue;
+        }
+        patterns.push_back({entry.first, to_lower_str(entry.first), entry.second});
+    }
+    if (patterns.empty()) {
+        return;
+    }
+    std::sort(patterns.begin(), patterns.end(), [](const Pattern &lhs, const Pattern &rhs) {
+        return lhs.from.length() > rhs.from.length();
+    });
+
+    std::string lowered = to_lower_str(text);
+    std::string result;
+    result.reserve(text.size());
+    bool in_string = false;
+    for (size_t pos = 0; pos < text.size();) {
+        if (text[pos] == '\'') {
+            in_string = !in_string;
+            result.push_back(text[pos++]);
+            continue;
+        }
+        if (!in_string) {
+            bool replaced = false;
+            for (auto &pattern : patterns) {
+                if (pos + pattern.from.length() <= text.size() &&
+                    lowered.compare(pos, pattern.lowered_from.length(), pattern.lowered_from) == 0 &&
+                    (pos == 0 || !is_identifier_char(lowered[pos - 1]))) {
+                    result += pattern.to;
+                    pos += pattern.from.length();
+                    replaced = true;
+                    break;
+                }
+            }
+            if (replaced) {
+                continue;
+            }
+        }
+        result.push_back(text[pos++]);
+    }
+    text.swap(result);
+}
+
 static int count_executor_rows(AbstractExecutor *executor) {
     int count = 0;
     for (executor->beginTuple(); !executor->is_end(); executor->nextTuple()) count++;
@@ -1823,16 +1880,11 @@ void QlManager::handle_explain_analyze(const std::string &sql, Context *context)
     format_explain_tree(explain_root, output);
 
     // 将表名替换回别名（用于condition和columns显示）
+    std::vector<std::pair<std::string, std::string>> alias_replacements;
     for (auto &[alias, table] : rewrite_result.alias_to_table) {
-        // 替换 "table." 为 "alias." （仅在condition和columns中）
-        std::string from = table + ".";
-        std::string to = alias + ".";
-        size_t pos = 0;
-        while ((pos = output.find(from, pos)) != std::string::npos) {
-            output.replace(pos, from.length(), to);
-            pos += to.length();
-        }
+        alias_replacements.emplace_back(table + ".", alias + ".");
     }
+    replace_qualified_name_prefixes(output, alias_replacements);
 
     sort_explain_attr_lists(output, "columns=[");
     sort_explain_attr_lists(output, "condition=[");
