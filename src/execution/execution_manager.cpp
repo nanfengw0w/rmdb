@@ -1883,6 +1883,9 @@ void QlManager::handle_explain_analyze(const std::string &sql, Context *context)
     // 将表名替换回别名（用于condition和columns显示）
     std::vector<std::pair<std::string, std::string>> alias_replacements;
     for (auto &[alias, table] : rewrite_result.alias_to_table) {
+        if (rewrite_result.query_aliases.count(alias)) {
+            continue;
+        }
         alias_replacements.emplace_back(table + ".", alias + ".");
     }
     replace_qualified_name_prefixes(output, alias_replacements);

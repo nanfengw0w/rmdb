@@ -261,13 +261,9 @@ static SqlRewriteResult rewrite_sql_for_parser(const std::string &original_sql) 
         i++;
     }
 
-    std::map<std::string, int> table_ref_count;
-    for (auto &table_ref : tables) {
-        table_ref_count[to_lower(table_ref.table)]++;
-    }
     std::set<std::string> preserved_aliases;
     for (auto &table_ref : tables) {
-        if (!table_ref.alias.empty() && table_ref_count[to_lower(table_ref.table)] > 1) {
+        if (!table_ref.alias.empty()) {
             std::string alias_lower = to_lower(table_ref.alias);
             preserved_aliases.insert(alias_lower);
             result.query_aliases[alias_lower] = to_lower(table_ref.table);
