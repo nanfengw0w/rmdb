@@ -1643,14 +1643,37 @@ static std::shared_ptr<ExplainNode> build_explain_tree(SmManager *sm_manager, st
     } else if (auto x = std::dynamic_pointer_cast<JoinPlan>(plan)) {
         auto node = std::make_shared<ExplainNode>();
         node->type = "Join";
-        std::function<void(std::shared_ptr<Plan>, std::vector<std::string>&)> collect_tabs;
-        collect_tabs = [&](std::shared_ptr<Plan> p, std::vector<std::string> &tabs) {
-            if (auto s = std::dynamic_pointer_cast<ScanPlan>(p)) tabs.push_back(sm_manager->resolve_table_name(s->tab_name_));
-            else if (auto j = std::dynamic_pointer_cast<JoinPlan>(p)) { collect_tabs(j->left_, tabs); collect_tabs(j->right_, tabs); }
-            else if (auto pr = std::dynamic_pointer_cast<ProjectionPlan>(p)) collect_tabs(pr->subplan_, tabs);
+        struct TabInstance {
+            std::string logical;
+            std::string real;
         };
+        std::function<void(std::shared_ptr<Plan>, std::vector<TabInstance>&)> collect_tabs;
+        collect_tabs = [&](std::shared_ptr<Plan> p, std::vector<TabInstance> &tabs) {
+            if (auto s = std::dynamic_pointer_cast<ScanPlan>(p)) {
+                tabs.push_back({s->tab_name_, sm_manager->resolve_table_name(s->tab_name_)});
+            }
+            else if (auto j = std::dynamic_pointer_cast<JoinPlan>(p)) {
+                collect_tabs(j->left_, tabs);
+                collect_tabs(j->right_, tabs);
+            }
+            else if (auto pr = std::dynamic_pointer_cast<ProjectionPlan>(p)) {
+                collect_tabs(pr->subplan_, tabs);
+            }
+        };
+        std::vector<TabInstance> tab_instances;
+        collect_tabs(x, tab_instances);
+        std::map<std::string, int> real_counts;
+        for (auto &tab : tab_instances) {
+            real_counts[tab.real]++;
+        }
         std::vector<std::string> tabs;
-        collect_tabs(x, tabs);
+        for (auto &tab : tab_instances) {
+            if (real_counts[tab.real] > 1 && tab.logical != tab.real) {
+                tabs.push_back(tab.logical);
+            } else {
+                tabs.push_back(tab.real);
+            }
+        }
         node->attrs.push_back(list_attr("tables", tabs));
         if (!x->conds_.empty()) {
             std::vector<std::string> conds;

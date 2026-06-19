@@ -15,6 +15,7 @@ See the Mulan PSL v2 for more details. */
 #include "sm_defs.h"
 #include "sm_meta.h"
 #include "common/context.h"
+#include <cctype>
 #include <map>
 #include <unordered_map>
 #include <utility>
@@ -56,10 +57,19 @@ class SmManager {
 
     IxManager* get_ix_manager() { return ix_manager_; }  
 
+    static std::string normalize_alias_key(const std::string& name) {
+        std::string key = name;
+        for (auto &ch : key) {
+            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        }
+        return key;
+    }
+
     void set_table_aliases(const std::map<std::string, std::string>& aliases) {
         table_aliases_.clear();
         for (const auto &entry : aliases) {
             table_aliases_[entry.first] = entry.second;
+            table_aliases_[normalize_alias_key(entry.first)] = entry.second;
         }
     }
 
@@ -67,6 +77,10 @@ class SmManager {
 
     std::string resolve_table_name(const std::string& tab_name) const {
         auto it = table_aliases_.find(tab_name);
+        if (it != table_aliases_.end()) {
+            return it->second;
+        }
+        it = table_aliases_.find(normalize_alias_key(tab_name));
         return it == table_aliases_.end() ? tab_name : it->second;
     }
 
