@@ -289,8 +289,16 @@ void *client_handler(void *sock_fd) {
 
         // SQL预处理：去别名、ON转WHERE
         auto rewrite_result = rewrite_sql_for_parser(std::string(data_recv));
-        std::string processed_sql = rewrite_result.sql;
         SmTableAliasGuard alias_guard(sm_manager.get(), rewrite_result.query_aliases);
+        std::string processed_sql = expand_qualified_stars(
+            rewrite_result.sql,
+            [&](const std::string &tab_name) {
+                std::vector<std::string> col_names;
+                for (auto &col : sm_manager->get_query_cols(tab_name)) {
+                    col_names.push_back(col.name);
+                }
+                return col_names;
+            });
 
         // 用于判断是否已经调用了yy_delete_buffer来删除buf
         bool finish_analyze = false;

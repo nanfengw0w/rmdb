@@ -5,6 +5,7 @@
 #include <set>
 #include <algorithm>
 #include <cctype>
+#include <functional>
 #include <utility>
 
 // SQL预处理：去别名、ON转WHERE、合并WHERE
@@ -44,6 +45,18 @@ static std::string normalize_sql_space(const std::string &s) {
         result.pop_back();
     }
     return result;
+}
+
+static std::string sql_trim_str(const std::string &s) {
+    size_t begin = 0;
+    while (begin < s.size() && sql_is_space(s[begin])) {
+        begin++;
+    }
+    size_t end = s.size();
+    while (end > begin && sql_is_space(s[end - 1])) {
+        end--;
+    }
+    return s.substr(begin, end - begin);
 }
 
 static std::string normalize_not_equal_operator(const std::string &sql) {
@@ -458,4 +471,153 @@ static SqlRewriteResult rewrite_sql_for_parser(const std::string &original_sql) 
         }
     }
     return result;
+}
+
+static bool sql_word_boundary(const std::string &s, size_t pos, size_t len) {
+    auto is_word = [](char ch) {
+        return std::isalnum(static_cast<unsigned char>(ch)) || ch == '_';
+    };
+    return (pos == 0 || !is_word(s[pos - 1])) &&
+           (pos + len >= s.size() || !is_word(s[pos + len]));
+}
+
+static size_t find_sql_keyword_outside_strings(const std::string &sql, const std::string &keyword,
+                                               size_t start = 0) {
+    std::string lowered = to_lower(sql);
+    std::string kw = to_lower(keyword);
+    bool in_string = false;
+    int paren_depth = 0;
+    for (size_t pos = start; pos + kw.size() <= sql.size(); pos++) {
+        char ch = sql[pos];
+        if (ch == '\'') {
+            in_string = !in_string;
+            continue;
+        }
+        if (in_string) {
+            continue;
+        }
+        if (ch == '(') {
+            paren_depth++;
+            continue;
+        }
+        if (ch == ')' && paren_depth > 0) {
+            paren_depth--;
+            continue;
+        }
+        if (paren_depth == 0 && lowered.compare(pos, kw.size(), kw) == 0 &&
+            sql_word_boundary(lowered, pos, kw.size())) {
+            return pos;
+        }
+    }
+    return std::string::npos;
+}
+
+static std::vector<std::string> split_select_items(const std::string &select_list) {
+    std::vector<std::string> items;
+    std::string item;
+    bool in_string = false;
+    int paren_depth = 0;
+    for (char ch : select_list) {
+        if (ch == '\'') {
+            in_string = !in_string;
+            item.push_back(ch);
+            continue;
+        }
+        if (!in_string) {
+            if (ch == '(') {
+                paren_depth++;
+            } else if (ch == ')' && paren_depth > 0) {
+                paren_depth--;
+            } else if (ch == ',' && paren_depth == 0) {
+                items.push_back(sql_trim_str(item));
+                item.clear();
+                continue;
+            }
+        }
+        item.push_back(ch);
+    }
+    items.push_back(sql_trim_str(item));
+    return items;
+}
+
+static bool parse_qualified_star_item(const std::string &item, std::string &tab_name) {
+    std::string compact;
+    compact.reserve(item.size());
+    for (char ch : item) {
+        if (!sql_is_space(ch)) {
+            compact.push_back(ch);
+        }
+    }
+    if (compact.size() < 3 || compact.back() != '*') {
+        return false;
+    }
+    size_t dot = compact.find('.');
+    if (dot == std::string::npos || dot == 0 || dot + 1 >= compact.size() || compact[dot + 1] != '*') {
+        return false;
+    }
+    if (compact.find('.', dot + 1) != std::string::npos || dot + 2 != compact.size()) {
+        return false;
+    }
+    auto is_identifier_start = [](char ch) {
+        return std::isalpha(static_cast<unsigned char>(ch)) || ch == '_';
+    };
+    auto is_identifier_char = [](char ch) {
+        return std::isalnum(static_cast<unsigned char>(ch)) || ch == '_';
+    };
+    if (!is_identifier_start(compact[0])) {
+        return false;
+    }
+    for (size_t i = 1; i < dot; i++) {
+        if (!is_identifier_char(compact[i])) {
+            return false;
+        }
+    }
+    tab_name = compact.substr(0, dot);
+    return true;
+}
+
+static std::string expand_qualified_stars(
+    const std::string &sql,
+    const std::function<std::vector<std::string>(const std::string&)> &get_column_names) {
+    size_t select_pos = find_sql_keyword_outside_strings(sql, "select");
+    if (select_pos == std::string::npos) {
+        return sql;
+    }
+    size_t from_pos = find_sql_keyword_outside_strings(sql, "from", select_pos + 6);
+    if (from_pos == std::string::npos || from_pos <= select_pos + 6) {
+        return sql;
+    }
+
+    std::string select_list = sql.substr(select_pos + 6, from_pos - (select_pos + 6));
+    auto items = split_select_items(select_list);
+    bool changed = false;
+    std::vector<std::string> expanded_items;
+    for (auto &item : items) {
+        std::string tab_name;
+        if (!parse_qualified_star_item(item, tab_name)) {
+            expanded_items.push_back(item);
+            continue;
+        }
+        auto col_names = get_column_names(tab_name);
+        if (col_names.empty()) {
+            expanded_items.push_back(item);
+            continue;
+        }
+        changed = true;
+        for (auto &col_name : col_names) {
+            expanded_items.push_back(tab_name + "." + col_name);
+        }
+    }
+    if (!changed) {
+        return sql;
+    }
+
+    std::string expanded_select;
+    for (size_t i = 0; i < expanded_items.size(); i++) {
+        if (i > 0) {
+            expanded_select += ", ";
+        }
+        expanded_select += expanded_items[i];
+    }
+    return sql.substr(0, select_pos + 6) + " " + expanded_select + " " + sql.substr(from_pos);
 }
