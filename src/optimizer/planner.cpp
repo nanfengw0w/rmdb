@@ -197,7 +197,40 @@ std::shared_ptr<Plan> Planner::make_one_rel(std::shared_ptr<Query> query)
     auto is_joined = [&](const std::string &tab_name) {
         return std::find(joined_tables.begin(), joined_tables.end(), tab_name) != joined_tables.end();
     };
+    std::vector<size_t> remaining_table_ids;
     for (size_t i = 1; i < tables.size(); i++) {
+        remaining_table_ids.push_back(i);
+    }
+
+    auto connects_to_joined = [&](const Condition &cond, const std::string &tab_name) {
+        if (cond.is_rhs_val) {
+            return false;
+        }
+        bool lhs_is_tab = cond.lhs_col.tab_name == tab_name;
+        bool rhs_is_tab = cond.rhs_col.tab_name == tab_name;
+        bool lhs_joined = is_joined(cond.lhs_col.tab_name);
+        bool rhs_joined = is_joined(cond.rhs_col.tab_name);
+        return (lhs_is_tab && rhs_joined) || (rhs_is_tab && lhs_joined);
+    };
+
+    while (!remaining_table_ids.empty()) {
+        size_t remaining_pos = 0;
+        for (size_t pos = 0; pos < remaining_table_ids.size(); pos++) {
+            const std::string &candidate = tables[remaining_table_ids[pos]];
+            bool has_connecting_cond = false;
+            for (auto &cond : remaining_conds) {
+                if (connects_to_joined(cond, candidate)) {
+                    has_connecting_cond = true;
+                    break;
+                }
+            }
+            if (has_connecting_cond) {
+                remaining_pos = pos;
+                break;
+            }
+        }
+
+        size_t i = remaining_table_ids[remaining_pos];
         std::vector<Condition> join_conds;
         auto it = remaining_conds.begin();
         while (it != remaining_conds.end()) {
@@ -229,6 +262,7 @@ std::shared_ptr<Plan> Planner::make_one_rel(std::shared_ptr<Query> query)
         join_root = std::make_shared<JoinPlan>(T_NestLoop, std::move(join_root),
                                                std::move(table_scan_executors[i]), std::move(join_conds));
         joined_tables.emplace_back(tables[i]);
+        remaining_table_ids.erase(remaining_table_ids.begin() + remaining_pos);
     }
 
     for (auto &cond : remaining_conds) {
