@@ -197,39 +197,7 @@ std::shared_ptr<Plan> Planner::make_one_rel(std::shared_ptr<Query> query)
     auto is_joined = [&](const std::string &tab_name) {
         return std::find(joined_tables.begin(), joined_tables.end(), tab_name) != joined_tables.end();
     };
-    auto connects_to_joined = [&](const std::string &tab_name) {
-        for (auto &cond : remaining_conds) {
-            if (cond.is_rhs_val) {
-                continue;
-            }
-            if (cond.lhs_col.tab_name == tab_name && is_joined(cond.rhs_col.tab_name)) {
-                return true;
-            }
-            if (cond.rhs_col.tab_name == tab_name && is_joined(cond.lhs_col.tab_name)) {
-                return true;
-            }
-        }
-        return false;
-    };
-
-    std::vector<size_t> pending_tables;
     for (size_t i = 1; i < tables.size(); i++) {
-        pending_tables.push_back(i);
-    }
-
-    while (!pending_tables.empty()) {
-        size_t chosen_pos = 0;
-        if (!connects_to_joined(tables[pending_tables[chosen_pos]])) {
-            for (size_t pos = 1; pos < pending_tables.size(); pos++) {
-                if (connects_to_joined(tables[pending_tables[pos]])) {
-                    chosen_pos = pos;
-                    break;
-                }
-            }
-        }
-        size_t i = pending_tables[chosen_pos];
-        pending_tables.erase(pending_tables.begin() + chosen_pos);
-
         std::vector<Condition> join_conds;
         auto it = remaining_conds.begin();
         while (it != remaining_conds.end()) {
