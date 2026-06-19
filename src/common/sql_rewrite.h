@@ -211,6 +211,15 @@ static SqlRewriteResult rewrite_sql_for_parser(const std::string &original_sql) 
             cond_tokens.push_back("AND");
         }
     };
+    auto append_condition_token = [&](const std::string &token) {
+        // The base parser only accepts a flat AND list of binary predicates.
+        // Parentheses around those predicates do not change semantics, so
+        // remove them during JOIN/WHERE rewriting.
+        if (token == "(" || token == ")") {
+            return;
+        }
+        cond_tokens.push_back(token);
+    };
 
     auto process_table_alias = [&](size_t &idx) {
         if (idx >= tokens.size()) {
@@ -259,7 +268,7 @@ static SqlRewriteResult rewrite_sql_for_parser(const std::string &original_sql) 
                     cur_lower == ";") {
                     break;
                 }
-                cond_tokens.push_back(tokens[i++]);
+                append_condition_token(tokens[i++]);
             }
             continue;
         }
@@ -276,7 +285,7 @@ static SqlRewriteResult rewrite_sql_for_parser(const std::string &original_sql) 
                     cur_lower == "limit" || cur_lower == ";") {
                     break;
                 }
-                cond_tokens.push_back(tokens[i++]);
+                append_condition_token(tokens[i++]);
             }
             continue;
         }
