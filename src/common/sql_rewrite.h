@@ -11,6 +11,7 @@ struct SqlRewriteResult {
     std::string sql;
     std::map<std::string, std::string> alias_to_table;  // alias(lowercase) -> table(lowercase)
     bool is_select_star;  // 原始SQL是否是 SELECT *
+    bool has_neq;  // 原始SQL是否包含 !=
 };
 
 static std::string to_lower(const std::string &s) {
@@ -46,6 +47,7 @@ static std::string normalize_sql_space(const std::string &s) {
 static SqlRewriteResult rewrite_sql_for_parser(const std::string &original_sql) {
     SqlRewriteResult result;
     result.is_select_star = false;
+    result.has_neq = (original_sql.find("!=") != std::string::npos);
 
     // 检测 SELECT *
     std::string ol = to_lower(original_sql);
@@ -284,12 +286,12 @@ static SqlRewriteResult rewrite_sql_for_parser(const std::string &original_sql) 
             pos += to.length();
         }
     }
-    // 将 != 替换为 <>（解析器不正确处理 !=）
-    {
-        size_t pos = 0;
-        while ((pos = result.sql.find("!=", pos)) != std::string::npos) {
-            result.sql.replace(pos, 2, "<>");
-            pos += 2;
+    // 将 != 替换为 <>（解析器词法不支持 !=）
+    if (result.has_neq) {
+        size_t p = 0;
+        while ((p = result.sql.find("!=", p)) != std::string::npos) {
+            result.sql.replace(p, 2, "<>");
+            p += 2;
         }
     }
     return result;
