@@ -1683,6 +1683,27 @@ static void format_explain_tree(std::shared_ptr<ExplainNode> node, std::string &
     for (auto &child : node->children) format_explain_tree(child, output, depth + 1);
 }
 
+static std::vector<std::string> split_explain_attr_list(const std::string &content) {
+    std::vector<std::string> items;
+    std::string item;
+    bool in_string = false;
+    for (char ch : content) {
+        if (ch == '\'') {
+            in_string = !in_string;
+            item.push_back(ch);
+            continue;
+        }
+        if (ch == ',' && !in_string) {
+            items.push_back(trim_str(item));
+            item.clear();
+            continue;
+        }
+        item.push_back(ch);
+    }
+    items.push_back(trim_str(item));
+    return items;
+}
+
 static void sort_explain_attr_lists(std::string &output, const std::string &attr) {
     size_t pos = 0;
     while ((pos = output.find(attr, pos)) != std::string::npos) {
@@ -1693,10 +1714,7 @@ static void sort_explain_attr_lists(std::string &output, const std::string &attr
         }
         std::string content = output.substr(start, end - start);
         if (!content.empty() && content != "*") {
-            auto items = split_str(content, ",");
-            for (auto &item : items) {
-                item = trim_str(item);
-            }
+            auto items = split_explain_attr_list(content);
             std::sort(items.begin(), items.end());
             std::string sorted;
             for (size_t i = 0; i < items.size(); i++) {
