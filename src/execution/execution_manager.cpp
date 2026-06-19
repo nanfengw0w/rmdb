@@ -1668,17 +1668,9 @@ static std::shared_ptr<ExplainNode> build_explain_tree(SmManager *sm_manager, st
         };
         std::vector<TabInstance> tab_instances;
         collect_tabs(x, tab_instances);
-        std::map<std::string, int> real_counts;
-        for (auto &tab : tab_instances) {
-            real_counts[tab.real]++;
-        }
         std::vector<std::string> tabs;
         for (auto &tab : tab_instances) {
-            if (real_counts[tab.real] > 1 && tab.logical != tab.real) {
-                tabs.push_back(tab.logical);
-            } else {
-                tabs.push_back(tab.real);
-            }
+            tabs.push_back(tab.real);
         }
         node->attrs.push_back(list_attr("tables", tabs));
         if (!x->conds_.empty()) {
