@@ -1838,15 +1838,6 @@ void QlManager::handle_explain_analyze(const std::string &sql, Context *context)
     sort_explain_attr_lists(output, "condition=[");
     sort_explain_attr_lists(output, "tables=[");
 
-    // 如果原始SQL包含 !=，将输出中的 <> 还原为 !=
-    if (rewrite_result.has_neq) {
-        size_t p = 0;
-        while ((p = output.find("<>", p)) != std::string::npos) {
-            output.replace(p, 2, "!=");
-            p += 2;
-        }
-    }
-
     std::fstream outfile;
     outfile.open("output.txt", std::ios::out | std::ios::app);
     outfile << output;
