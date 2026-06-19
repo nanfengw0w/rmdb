@@ -103,8 +103,7 @@ TabCol Analyze::check_column(const std::vector<ColMeta> &all_cols, TabCol target
 
 void Analyze::get_all_cols(const std::vector<std::string> &tab_names, std::vector<ColMeta> &all_cols) {
     for (auto &sel_tab_name : tab_names) {
-        // è¿édb_ä¸è½åæget_db(), æ³¨æè¦ä¼ æé
-        const auto &sel_tab_cols = sm_manager_->db_.get_table(sel_tab_name).cols;
+        auto sel_tab_cols = sm_manager_->get_query_cols(sel_tab_name);
         all_cols.insert(all_cols.end(), sel_tab_cols.begin(), sel_tab_cols.end());
     }
 }
@@ -137,7 +136,7 @@ void Analyze::check_clause(const std::vector<std::string> &tab_names, std::vecto
         if (!cond.is_rhs_val) {
             cond.rhs_col = check_column(all_cols, cond.rhs_col);
         }
-        TabMeta &lhs_tab = sm_manager_->db_.get_table(cond.lhs_col.tab_name);
+        TabMeta &lhs_tab = sm_manager_->db_.get_table(sm_manager_->resolve_table_name(cond.lhs_col.tab_name));
         auto lhs_col = lhs_tab.get_col(cond.lhs_col.col_name);
         ColType lhs_type = lhs_col->type;
         ColType rhs_type;
@@ -148,7 +147,7 @@ void Analyze::check_clause(const std::vector<std::string> &tab_names, std::vecto
                 rhs_type = TYPE_FLOAT;
             }
         } else {
-            TabMeta &rhs_tab = sm_manager_->db_.get_table(cond.rhs_col.tab_name);
+            TabMeta &rhs_tab = sm_manager_->db_.get_table(sm_manager_->resolve_table_name(cond.rhs_col.tab_name));
             auto rhs_col = rhs_tab.get_col(cond.rhs_col.col_name);
             rhs_type = rhs_col->type;
         }

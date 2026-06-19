@@ -25,7 +25,8 @@ See the Mulan PSL v2 for more details. */
 // 支持最左匹配原则：自动调整where条件顺序，支持单点查询和范围查询
 bool Planner::get_index_cols(std::string tab_name, std::vector<Condition> curr_conds, std::vector<std::string>& index_col_names) {
     index_col_names.clear();
-    TabMeta& tab = sm_manager_->db_.get_table(tab_name);
+    std::string real_tab_name = sm_manager_->resolve_table_name(tab_name);
+    TabMeta& tab = sm_manager_->db_.get_table(real_tab_name);
 
     for (auto& index : tab.indexes) {
         if (index.cols.empty()) {
@@ -249,8 +250,7 @@ std::shared_ptr<Plan> Planner::generate_sort_plan(std::shared_ptr<Query> query, 
     std::vector<std::string> tables = query->tables;
     std::vector<ColMeta> all_cols;
     for (auto &sel_tab_name : tables) {
-        // 这里db_不能写成get_db(), 注意要传指针
-        const auto &sel_tab_cols = sm_manager_->db_.get_table(sel_tab_name).cols;
+        auto sel_tab_cols = sm_manager_->get_query_cols(sel_tab_name);
         all_cols.insert(all_cols.end(), sel_tab_cols.begin(), sel_tab_cols.end());
     }
     TabCol order_col = {.tab_name = x->order->cols->tab_name, .col_name = x->order->cols->col_name};

@@ -36,9 +36,8 @@ class SeqScanExecutor : public AbstractExecutor {
         sm_manager_ = sm_manager;
         tab_name_ = std::move(tab_name);
         conds_ = std::move(conds);
-        TabMeta &tab = sm_manager_->db_.get_table(tab_name_);
-        fh_ = sm_manager_->fhs_.at(tab_name_).get();
-        cols_ = tab.cols;
+        fh_ = sm_manager_->get_table_fh(tab_name_);
+        cols_ = sm_manager_->get_query_cols(tab_name_);
         len_ = cols_.back().offset + cols_.back().len;
         context_ = context;
         fed_conds_ = conds_;

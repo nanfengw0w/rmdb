@@ -290,6 +290,7 @@ void *client_handler(void *sock_fd) {
         // SQL预处理：去别名、ON转WHERE
         auto rewrite_result = rewrite_sql_for_parser(std::string(data_recv));
         std::string processed_sql = rewrite_result.sql;
+        SmTableAliasGuard alias_guard(sm_manager.get(), rewrite_result.query_aliases);
 
         // 用于判断是否已经调用了yy_delete_buffer来删除buf
         bool finish_analyze = false;

@@ -62,8 +62,7 @@ class ScanPlan : public Plan
             Plan::tag = tag;
             tab_name_ = std::move(tab_name);
             conds_ = std::move(conds);
-            TabMeta &tab = sm_manager->db_.get_table(tab_name_);
-            cols_ = tab.cols;
+            cols_ = sm_manager->get_query_cols(tab_name_);
             len_ = cols_.back().offset + cols_.back().len;
             fed_conds_ = conds_;
             index_col_names_ = index_col_names;

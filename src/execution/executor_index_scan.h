@@ -54,12 +54,13 @@ class IndexScanExecutor : public AbstractExecutor {
         sm_manager_ = sm_manager;
         context_ = context;
         tab_name_ = std::move(tab_name);
-        tab_ = sm_manager_->db_.get_table(tab_name_);
+        std::string real_tab_name = sm_manager_->resolve_table_name(tab_name_);
+        tab_ = sm_manager_->db_.get_table(real_tab_name);
         conds_ = std::move(conds);
         index_col_names_ = index_col_names;
         index_meta_ = *(tab_.get_index_meta(index_col_names_));
-        fh_ = sm_manager_->fhs_.at(tab_name_).get();
-        cols_ = tab_.cols;
+        fh_ = sm_manager_->get_table_fh(tab_name_);
+        cols_ = sm_manager_->get_query_cols(tab_name_);
         len_ = cols_.back().offset + cols_.back().len;
         std::map<CompOp, CompOp> swap_op = {
             {OP_EQ, OP_EQ}, {OP_NE, OP_NE}, {OP_LT, OP_GT}, {OP_GT, OP_LT}, {OP_LE, OP_GE}, {OP_GE, OP_LE},
@@ -79,7 +80,7 @@ class IndexScanExecutor : public AbstractExecutor {
         matched_pos_ = 0;
 
         // Get the index handle
-        std::string ix_name = sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_col_names_);
+        std::string ix_name = sm_manager_->get_ix_manager()->get_index_name(real_tab_name, index_col_names_);
         if (sm_manager_->ihs_.count(ix_name)) {
             ih_ = sm_manager_->ihs_.at(ix_name).get();
         } else {

@@ -2,6 +2,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <set>
 #include <algorithm>
 #include <cctype>
 
@@ -10,6 +11,7 @@
 struct SqlRewriteResult {
     std::string sql;
     std::map<std::string, std::string> alias_to_table;  // alias(lowercase) -> table(lowercase)
+    std::map<std::string, std::string> query_aliases;   // aliases kept as logical table instances
     bool is_select_star;  // 原始SQL是否是 SELECT *
 };
 
@@ -174,7 +176,11 @@ static SqlRewriteResult rewrite_sql_for_parser(const std::string &original_sql) 
     }
 
     std::vector<std::string> select_part(tokens.begin(), tokens.begin() + from_pos);
-    std::vector<std::string> tables;
+    struct TableRef {
+        std::string table;
+        std::string alias;
+    };
+    std::vector<TableRef> tables;
     std::vector<std::string> cond_tokens;
     std::vector<std::string> suffix_tokens;
 
@@ -189,18 +195,21 @@ static SqlRewriteResult rewrite_sql_for_parser(const std::string &original_sql) 
             return;
         }
         std::string table = tokens[idx++];
-        tables.push_back(table);
         std::string table_lower = to_lower(table);
+        std::string alias;
         if (idx < tokens.size() && to_lower(tokens[idx]) == "as" && idx + 1 < tokens.size()) {
-            alias_map[to_lower(tokens[idx + 1])] = table_lower;
+            alias = tokens[idx + 1];
+            alias_map[to_lower(alias)] = table_lower;
             idx += 2;
         } else if (idx < tokens.size()) {
             std::string next_lower = to_lower(tokens[idx]);
             if (!is_relation_end(next_lower)) {
+                alias = tokens[idx];
                 alias_map[next_lower] = table_lower;
                 idx++;
             }
         }
+        tables.push_back({table, alias});
     };
 
     size_t i = from_pos;
@@ -252,10 +261,28 @@ static SqlRewriteResult rewrite_sql_for_parser(const std::string &original_sql) 
         i++;
     }
 
+    std::map<std::string, int> table_ref_count;
+    for (auto &table_ref : tables) {
+        table_ref_count[to_lower(table_ref.table)]++;
+    }
+    std::set<std::string> preserved_aliases;
+    for (auto &table_ref : tables) {
+        if (!table_ref.alias.empty() && table_ref_count[to_lower(table_ref.table)] > 1) {
+            std::string alias_lower = to_lower(table_ref.alias);
+            preserved_aliases.insert(alias_lower);
+            result.query_aliases[alias_lower] = to_lower(table_ref.table);
+        }
+    }
+
     result.sql = join_tokens(select_part) + " FROM ";
     for (size_t ti = 0; ti < tables.size(); ti++) {
         if (ti > 0) result.sql += " , ";
-        result.sql += tables[ti];
+        std::string alias_lower = to_lower(tables[ti].alias);
+        if (!tables[ti].alias.empty() && preserved_aliases.count(alias_lower)) {
+            result.sql += tables[ti].alias;
+        } else {
+            result.sql += tables[ti].table;
+        }
     }
     if (!cond_tokens.empty()) {
         result.sql += " WHERE " + join_tokens(cond_tokens);
@@ -269,6 +296,9 @@ static SqlRewriteResult rewrite_sql_for_parser(const std::string &original_sql) 
     result.alias_to_table = alias_map;
 
     for (const auto &entry : alias_map) {
+        if (preserved_aliases.count(entry.first)) {
+            continue;
+        }
         const std::string from = entry.first + ".";
         const std::string to = entry.second + ".";
         size_t pos = 0;

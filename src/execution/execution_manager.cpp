@@ -1605,7 +1605,7 @@ static std::shared_ptr<ExplainNode> build_explain_tree(SmManager *sm_manager, st
         auto make_scan_node = [&](std::shared_ptr<ScanPlan> sp) {
             auto sn = std::make_shared<ExplainNode>();
             sn->type = "Scan";
-            sn->attrs.push_back("table=" + sp->tab_name_);
+            sn->attrs.push_back("table=" + sm_manager->resolve_table_name(sp->tab_name_));
             bool show_index = allow_index_scan && sp->tag == T_IndexScan;
             sn->attrs.push_back(std::string("type=") + (show_index ? "IndexScan" : "SeqScan"));
             if (show_index && !sp->index_col_names_.empty()) {
@@ -1617,7 +1617,7 @@ static std::shared_ptr<ExplainNode> build_explain_tree(SmManager *sm_manager, st
                 index_attr += ")";
                 sn->attrs.push_back(index_attr);
             }
-            auto fh = sm_manager->fhs_.at(sp->tab_name_).get();
+            auto fh = sm_manager->get_table_fh(sp->tab_name_);
             int count = 0; RmScan s(fh); while (!s.is_end()) { count++; s.next(); }
             sn->rows = count;
             return sn;
@@ -1645,7 +1645,7 @@ static std::shared_ptr<ExplainNode> build_explain_tree(SmManager *sm_manager, st
         node->type = "Join";
         std::function<void(std::shared_ptr<Plan>, std::vector<std::string>&)> collect_tabs;
         collect_tabs = [&](std::shared_ptr<Plan> p, std::vector<std::string> &tabs) {
-            if (auto s = std::dynamic_pointer_cast<ScanPlan>(p)) tabs.push_back(s->tab_name_);
+            if (auto s = std::dynamic_pointer_cast<ScanPlan>(p)) tabs.push_back(sm_manager->resolve_table_name(s->tab_name_));
             else if (auto j = std::dynamic_pointer_cast<JoinPlan>(p)) { collect_tabs(j->left_, tabs); collect_tabs(j->right_, tabs); }
             else if (auto pr = std::dynamic_pointer_cast<ProjectionPlan>(p)) collect_tabs(pr->subplan_, tabs);
         };
@@ -1806,6 +1806,7 @@ void QlManager::handle_explain_analyze(const std::string &sql, Context *context)
     // 使用共享的SQL预处理函数
     auto rewrite_result = rewrite_sql_for_parser(inner_sql);
     inner_sql = rewrite_result.sql;
+    SmTableAliasGuard alias_guard(sm_manager_, rewrite_result.query_aliases);
 
     ast::parse_tree = nullptr;
     std::string sql_semi = inner_sql;

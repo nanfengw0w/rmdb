@@ -15,6 +15,9 @@ See the Mulan PSL v2 for more details. */
 #include "sm_defs.h"
 #include "sm_meta.h"
 #include "common/context.h"
+#include <map>
+#include <unordered_map>
+#include <utility>
 
 class Context;
 
@@ -30,6 +33,7 @@ class SmManager {
     DbMeta db_;             // 当前打开的数据库的元数据
     std::unordered_map<std::string, std::unique_ptr<RmFileHandle>> fhs_;    // file name -> record file handle, 当前数据库中每张表的数据文件
     std::unordered_map<std::string, std::unique_ptr<IxIndexHandle>> ihs_;   // file name -> index file handle, 当前数据库中每个索引的文件
+    std::unordered_map<std::string, std::string> table_aliases_;             // query table alias -> real table name
    private:
     DiskManager* disk_manager_;
     BufferPoolManager* buffer_pool_manager_;
@@ -51,6 +55,35 @@ class SmManager {
     RmManager* get_rm_manager() { return rm_manager_; }  
 
     IxManager* get_ix_manager() { return ix_manager_; }  
+
+    void set_table_aliases(const std::map<std::string, std::string>& aliases) {
+        table_aliases_.clear();
+        for (const auto &entry : aliases) {
+            table_aliases_[entry.first] = entry.second;
+        }
+    }
+
+    void clear_table_aliases() { table_aliases_.clear(); }
+
+    std::string resolve_table_name(const std::string& tab_name) const {
+        auto it = table_aliases_.find(tab_name);
+        return it == table_aliases_.end() ? tab_name : it->second;
+    }
+
+    std::vector<ColMeta> get_query_cols(const std::string& tab_name) {
+        auto real_tab = resolve_table_name(tab_name);
+        auto cols = db_.get_table(real_tab).cols;
+        if (real_tab != tab_name) {
+            for (auto &col : cols) {
+                col.tab_name = tab_name;
+            }
+        }
+        return cols;
+    }
+
+    RmFileHandle* get_table_fh(const std::string& tab_name) {
+        return fhs_.at(resolve_table_name(tab_name)).get();
+    }
 
     bool is_dir(const std::string& db_name);
 
@@ -79,4 +112,20 @@ class SmManager {
     void drop_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context);
     
     void drop_index(const std::string& tab_name, const std::vector<ColMeta>& col_names, Context* context);
+};
+
+class SmTableAliasGuard {
+   public:
+    SmTableAliasGuard(SmManager* sm_manager, const std::map<std::string, std::string>& aliases)
+        : sm_manager_(sm_manager), old_aliases_(sm_manager->table_aliases_) {
+        sm_manager_->set_table_aliases(aliases);
+    }
+
+    ~SmTableAliasGuard() {
+        sm_manager_->table_aliases_ = std::move(old_aliases_);
+    }
+
+   private:
+    SmManager* sm_manager_;
+    std::unordered_map<std::string, std::string> old_aliases_;
 };
