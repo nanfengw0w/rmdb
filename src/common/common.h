@@ -38,20 +38,24 @@ struct Value {
     std::string str_val;  // string value
 
     std::shared_ptr<RmRecord> raw;  // raw record buffer
+    bool is_float_literal = false;  // true when RHS was written as a float literal
 
     void set_int(int int_val_) {
         type = TYPE_INT;
         int_val = int_val_;
+        is_float_literal = false;
     }
 
     void set_float(float float_val_) {
         type = TYPE_FLOAT;
         float_val = float_val_;
+        is_float_literal = false;
     }
 
     void set_str(std::string str_val_) {
         type = TYPE_STRING;
         str_val = std::move(str_val_);
+        is_float_literal = false;
     }
 
     void init_raw(int len) {

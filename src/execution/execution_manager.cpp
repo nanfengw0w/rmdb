@@ -1417,10 +1417,15 @@ static std::string value_to_explain_string(const Value &val) {
         return std::to_string(val.int_val);
     }
     if (val.type == TYPE_FLOAT) {
-        // 检查是否为整数值（如 1000.0 → 1000）
+        // Keep integer literals coerced to FLOAT as integers, but preserve an
+        // explicit float literal such as 1000.0 in EXPLAIN output.
         float f = val.float_val;
         if (f == static_cast<int>(f)) {
-            return std::to_string(static_cast<int>(f));
+            std::string out = std::to_string(static_cast<int>(f));
+            if (val.is_float_literal) {
+                out += ".0";
+            }
+            return out;
         }
         // 非整数：去掉尾部多余的0（如 700.500000 → 700.5）
         std::string s = std::to_string(f);
