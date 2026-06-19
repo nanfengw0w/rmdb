@@ -5,6 +5,7 @@
 #include <set>
 #include <algorithm>
 #include <cctype>
+#include <utility>
 
 // SQL预处理：去别名、ON转WHERE、合并WHERE
 // 返回预处理后的SQL和别名映射
@@ -66,6 +67,80 @@ static std::string normalize_not_equal_operator(const std::string &sql) {
     return result;
 }
 
+static bool is_sql_comp_token(const std::string &token) {
+    return token == "=" || token == "<>" || token == "!=" || token == "<" ||
+           token == ">" || token == "<=" || token == ">=";
+}
+
+static std::string swap_sql_comp_token(const std::string &token) {
+    if (token == "<") return ">";
+    if (token == ">") return "<";
+    if (token == "<=") return ">=";
+    if (token == ">=") return "<=";
+    return token;
+}
+
+static bool is_sql_number_token(const std::string &token) {
+    if (token.empty()) {
+        return false;
+    }
+    size_t pos = 0;
+    if (token[pos] == '+' || token[pos] == '-') {
+        pos++;
+    }
+    bool has_digit = false;
+    bool has_dot = false;
+    for (; pos < token.size(); pos++) {
+        unsigned char ch = static_cast<unsigned char>(token[pos]);
+        if (std::isdigit(ch)) {
+            has_digit = true;
+            continue;
+        }
+        if (token[pos] == '.' && !has_dot) {
+            has_dot = true;
+            continue;
+        }
+        return false;
+    }
+    return has_digit;
+}
+
+static bool is_sql_value_token(const std::string &token) {
+    if (token.size() >= 2 && token.front() == '\'' && token.back() == '\'') {
+        return true;
+    }
+    std::string lower = to_lower(token);
+    return is_sql_number_token(token) || lower == "true" || lower == "false";
+}
+
+static std::vector<std::string> normalize_condition_tokens(std::vector<std::string> tokens) {
+    std::vector<std::string> normalized;
+    std::vector<std::string> term;
+
+    auto flush_term = [&]() {
+        if (term.size() == 3 && is_sql_value_token(term[0]) && is_sql_comp_token(term[1]) &&
+            !is_sql_value_token(term[2])) {
+            normalized.push_back(term[2]);
+            normalized.push_back(swap_sql_comp_token(term[1]));
+            normalized.push_back(term[0]);
+        } else {
+            normalized.insert(normalized.end(), term.begin(), term.end());
+        }
+        term.clear();
+    };
+
+    for (auto &token : tokens) {
+        if (to_lower(token) == "and") {
+            flush_term();
+            normalized.push_back(token);
+        } else {
+            term.push_back(token);
+        }
+    }
+    flush_term();
+    return normalized;
+}
+
 static SqlRewriteResult rewrite_sql_for_parser(const std::string &original_sql) {
     SqlRewriteResult result;
     result.is_select_star = false;
@@ -89,6 +164,7 @@ static SqlRewriteResult rewrite_sql_for_parser(const std::string &original_sql) 
     bool has_join = ol_normalized.find(" join ") != std::string::npos;
     bool has_implicit_join = false;
     bool has_single_table_alias = false;
+    bool has_condition_parens = false;
     {
         size_t from_pos_check = ol_normalized.find(" from ");
         if (from_pos_check != std::string::npos) {
@@ -121,12 +197,21 @@ static SqlRewriteResult rewrite_sql_for_parser(const std::string &original_sql) 
                 has_single_table_alias = token_count > 1;
             }
         }
+        size_t where_pos_check = ol_normalized.find(" where ");
+        if (where_pos_check != std::string::npos) {
+            bool in_string = false;
+            for (size_t i = where_pos_check + 7; i < parser_sql.size(); i++) {
+                if (parser_sql[i] == '\'') {
+                    in_string = !in_string;
+                    continue;
+                }
+                if (!in_string && (parser_sql[i] == '(' || parser_sql[i] == ')')) {
+                    has_condition_parens = true;
+                    break;
+                }
+            }
+        }
     }
-    if (!has_join && !has_implicit_join && !has_single_table_alias) {
-        result.sql = parser_sql;
-        return result;
-    }
-
     // 按token分割，保留双字符比较操作符
     std::vector<std::string> tokens;
     {
@@ -167,6 +252,21 @@ static SqlRewriteResult rewrite_sql_for_parser(const std::string &original_sql) 
             } else cur += c;
         }
         if (!cur.empty()) tokens.push_back(cur);
+    }
+
+    bool has_value_left_condition = false;
+    for (size_t ti = 0; ti + 2 < tokens.size(); ti++) {
+        if (is_sql_value_token(tokens[ti]) && is_sql_comp_token(tokens[ti + 1]) &&
+            !is_sql_value_token(tokens[ti + 2])) {
+            has_value_left_condition = true;
+            break;
+        }
+    }
+
+    if (!has_join && !has_implicit_join && !has_single_table_alias &&
+        !has_condition_parens && !has_value_left_condition) {
+        result.sql = parser_sql;
+        return result;
     }
 
     auto join_tokens = [](const std::vector<std::string> &ts) {
@@ -316,6 +416,7 @@ static SqlRewriteResult rewrite_sql_for_parser(const std::string &original_sql) 
         }
     }
     if (!cond_tokens.empty()) {
+        cond_tokens = normalize_condition_tokens(std::move(cond_tokens));
         result.sql += " WHERE " + join_tokens(cond_tokens);
     }
     if (!suffix_tokens.empty()) {

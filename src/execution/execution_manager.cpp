@@ -1725,11 +1725,25 @@ static std::vector<std::string> split_explain_attr_list(const std::string &conte
     return items;
 }
 
+static size_t find_explain_attr_end(const std::string &output, size_t start) {
+    bool in_string = false;
+    for (size_t i = start; i < output.size(); i++) {
+        if (output[i] == '\'') {
+            in_string = !in_string;
+            continue;
+        }
+        if (output[i] == ']' && !in_string) {
+            return i;
+        }
+    }
+    return std::string::npos;
+}
+
 static void sort_explain_attr_lists(std::string &output, const std::string &attr) {
     size_t pos = 0;
     while ((pos = output.find(attr, pos)) != std::string::npos) {
         size_t start = pos + attr.length();
-        size_t end = output.find(']', start);
+        size_t end = find_explain_attr_end(output, start);
         if (end == std::string::npos) {
             break;
         }
