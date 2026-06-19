@@ -181,7 +181,7 @@ static SqlRewriteResult rewrite_sql_for_parser(const std::string &original_sql) 
     auto is_relation_end = [](const std::string &tl) {
         return tl == "join" || tl == "where" || tl == "on" || tl == "group" ||
                tl == "order" || tl == "having" || tl == "limit" || tl == "union" ||
-               tl == "and" || tl == "," || tl == ";";
+               tl == "inner" || tl == "and" || tl == "," || tl == ";";
     };
 
     std::map<std::string, std::string> alias_map;
@@ -254,13 +254,17 @@ static SqlRewriteResult rewrite_sql_for_parser(const std::string &original_sql) 
             i++;
             while (i < tokens.size()) {
                 std::string cur_lower = to_lower(tokens[i]);
-                if (cur_lower == "join" || cur_lower == "where" || cur_lower == "group" ||
+                if (cur_lower == "join" || cur_lower == "inner" || cur_lower == "where" || cur_lower == "group" ||
                     cur_lower == "order" || cur_lower == "having" || cur_lower == "limit" ||
                     cur_lower == ";") {
                     break;
                 }
                 cond_tokens.push_back(tokens[i++]);
             }
+            continue;
+        }
+        if (tl == "inner") {
+            i++;
             continue;
         }
         if (tl == "where") {
