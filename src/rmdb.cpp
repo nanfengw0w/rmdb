@@ -299,6 +299,7 @@ void *client_handler(void *sock_fd) {
                 }
                 return col_names;
             });
+        processed_sql = strip_select_aliases_for_parser(processed_sql);
 
         // 用于判断是否已经调用了yy_delete_buffer来删除buf
         bool finish_analyze = false;

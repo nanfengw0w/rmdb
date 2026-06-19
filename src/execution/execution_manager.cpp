@@ -1871,6 +1871,7 @@ void QlManager::handle_explain_analyze(const std::string &sql, Context *context)
             }
             return col_names;
         });
+    inner_sql = strip_select_aliases_for_parser(inner_sql);
 
     ast::parse_tree = nullptr;
     std::string sql_semi = inner_sql;
