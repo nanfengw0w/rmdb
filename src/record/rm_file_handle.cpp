@@ -203,14 +203,15 @@ RmPageHandle RmFileHandle::create_new_page_handle() {
 
     file_hdr_.num_pages++;
 
-    // Flush file header to buffer pool and disk to ensure num_pages is persisted
-    // This is critical for crash recovery - without this, recovery can't find newly allocated pages
+    // Update buffer pool's header page with new file header AND flush to disk.
+    // This is critical for crash recovery - without this, recovery can't find newly allocated pages.
     PageId hdr_page_id{fd_, RM_FILE_HDR_PAGE};
     Page* hdr_page = buffer_pool_manager_->fetch_page(hdr_page_id);
     if (hdr_page) {
         memcpy(hdr_page->get_data(), &file_hdr_, sizeof(file_hdr_));
-        buffer_pool_manager_->unpin_page(hdr_page_id, true);
+        // Flush first (writes to disk, marks clean), then unpin
         buffer_pool_manager_->flush_page(hdr_page_id);
+        buffer_pool_manager_->unpin_page(hdr_page_id, false);
     }
 
     BufferPoolManager::mark_dirty(page);
@@ -233,7 +234,7 @@ void RmFileHandle::release_page_handle(RmPageHandle& page_handle) {
     Page* hdr_page = buffer_pool_manager_->fetch_page(hdr_page_id);
     if (hdr_page) {
         memcpy(hdr_page->get_data(), &file_hdr_, sizeof(file_hdr_));
-        buffer_pool_manager_->unpin_page(hdr_page_id, true);
         buffer_pool_manager_->flush_page(hdr_page_id);
+        buffer_pool_manager_->unpin_page(hdr_page_id, false);
     }
 }
