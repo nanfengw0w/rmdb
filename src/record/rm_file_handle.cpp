@@ -12,7 +12,6 @@ See the Mulan PSL v2 for more details. */
 #include "transaction/version_manager.h"
 #include "transaction/transaction_manager.h"
 
-// 外部全局变量
 extern TransactionManager* g_txn_manager;
 
 std::unique_ptr<RmRecord> RmFileHandle::get_record(const Rid& rid, Context* context) const {
@@ -25,16 +24,17 @@ std::unique_ptr<RmRecord> RmFileHandle::get_record(const Rid& rid, Context* cont
         IsolationLevel level = context->txn_->get_isolation_level();
         if (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE) {
             auto& vm = VersionManager::instance();
+            bool found = false;
             bool is_deleted = false;
-            RmRecord* visible_data = vm.get_visible_version(fd_, rid, context->txn_, rec.get(), is_deleted);
+            RmRecord* visible = vm.get_visible_version(fd_, rid, context->txn_, found, is_deleted);
 
-            if (is_deleted) {
-                return nullptr;  // 记录已被删除
+            if (found) {
+                if (is_deleted) {
+                    return nullptr;  // 记录已被删除
+                }
+                return std::make_unique<RmRecord>(*visible);
             }
-            if (visible_data != nullptr) {
-                return std::make_unique<RmRecord>(*visible_data);
-            }
-            // 没有可见版本，返回磁盘数据
+            // 没有可见版本，使用磁盘数据
         }
     }
 
@@ -68,8 +68,8 @@ Rid RmFileHandle::insert_record(char* buf, Context* context) {
         IsolationLevel level = context->txn_->get_isolation_level();
         if (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE) {
             auto& vm = VersionManager::instance();
-            // 插入操作：保存一个空的旧版本（表示之前不存在）
-            vm.save_old_version(fd_, rid, context->txn_, nullptr, true);
+            RmRecord new_rec(file_hdr_.record_size, buf);
+            vm.record_write(fd_, rid, context->txn_, &new_rec, false);
         }
     }
 
@@ -104,16 +104,13 @@ void RmFileHandle::delete_record(const Rid& rid, Context* context) {
         if (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE) {
             auto& vm = VersionManager::instance();
 
-            // 检查写写冲突
             if (!vm.check_write_conflict(fd_, rid, context->txn_)) {
                 buffer_pool_manager_->unpin_page(PageId{fd_, rid.page_no}, false);
                 throw TransactionAbortException(context->txn_->get_transaction_id(),
                     AbortReason::DEADLOCK_PREVENTION);
             }
 
-            // 保存旧版本
-            RmRecord old_data(file_hdr_.record_size, page_handle.get_slot(rid.slot_no));
-            vm.save_old_version(fd_, rid, context->txn_, &old_data, false);
+            vm.record_write(fd_, rid, context->txn_, nullptr, true);
         }
     }
 
@@ -142,16 +139,14 @@ void RmFileHandle::update_record(const Rid& rid, char* buf, Context* context) {
         if (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE) {
             auto& vm = VersionManager::instance();
 
-            // 检查写写冲突
             if (!vm.check_write_conflict(fd_, rid, context->txn_)) {
                 buffer_pool_manager_->unpin_page(PageId{fd_, rid.page_no}, false);
                 throw TransactionAbortException(context->txn_->get_transaction_id(),
                     AbortReason::DEADLOCK_PREVENTION);
             }
 
-            // 保存旧版本
-            RmRecord old_data(file_hdr_.record_size, page_handle.get_slot(rid.slot_no));
-            vm.save_old_version(fd_, rid, context->txn_, &old_data, false);
+            RmRecord new_rec(file_hdr_.record_size, buf);
+            vm.record_write(fd_, rid, context->txn_, &new_rec, false);
         }
     }
 
