@@ -9,6 +9,7 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #pragma once
+#include <cstring>
 #include <utility>
 
 #include "execution_defs.h"
@@ -30,6 +31,58 @@ class UpdateExecutor : public AbstractExecutor {
     std::vector<SetClause> set_clauses_;
     SmManager *sm_manager_;
     size_t cur_idx_;
+
+    Value value_from_record(const ColMeta &col, const char *record_data) const {
+        Value value;
+        if (col.type == TYPE_INT) {
+            value.set_int(*reinterpret_cast<const int *>(record_data + col.offset));
+        } else if (col.type == TYPE_FLOAT) {
+            value.set_float(*reinterpret_cast<const float *>(record_data + col.offset));
+        } else if (col.type == TYPE_STRING) {
+            std::string str(record_data + col.offset, col.len);
+            str.resize(strlen(str.c_str()));
+            value.set_str(str);
+        }
+        return value;
+    }
+
+    Value eval_set_value(const SetClause &set_clause, const ColMeta &col, const char *record_data) const {
+        if (set_clause.op == ArithOp::NO_OP) {
+            return set_clause.rhs;
+        }
+        if (col.type != TYPE_INT && col.type != TYPE_FLOAT) {
+            throw IncompatibleTypeError(coltype2str(col.type), "numeric");
+        }
+
+        Value lhs = value_from_record(col, record_data);
+        double lhs_num = lhs.type == TYPE_INT ? lhs.int_val : lhs.float_val;
+        double rhs_num = set_clause.rhs.type == TYPE_INT ? set_clause.rhs.int_val : set_clause.rhs.float_val;
+        double result = lhs_num;
+        switch (set_clause.op) {
+            case ArithOp::ADD:
+                result = lhs_num + rhs_num;
+                break;
+            case ArithOp::SUB:
+                result = lhs_num - rhs_num;
+                break;
+            case ArithOp::MUL:
+                result = lhs_num * rhs_num;
+                break;
+            case ArithOp::DIV:
+                result = lhs_num / rhs_num;
+                break;
+            case ArithOp::NO_OP:
+                break;
+        }
+
+        Value out;
+        if (col.type == TYPE_INT) {
+            out.set_int(static_cast<int>(result));
+        } else {
+            out.set_float(static_cast<float>(result));
+        }
+        return out;
+    }
 
    public:
     UpdateExecutor(SmManager *sm_manager, const std::string &tab_name, std::vector<SetClause> set_clauses,
@@ -69,7 +122,7 @@ class UpdateExecutor : public AbstractExecutor {
 
             for (auto set_clause : set_clauses_) {
                 auto col = tab_.get_col(set_clause.lhs.col_name);
-                Value rhs = set_clause.rhs;
+                Value rhs = eval_set_value(set_clause, *col, pending.new_record->data);
                 if (col->type != rhs.type) {
                     if (col->type == TYPE_FLOAT && rhs.type == TYPE_INT) {
                         rhs.set_float(static_cast<float>(rhs.int_val));
@@ -96,6 +149,9 @@ class UpdateExecutor : public AbstractExecutor {
                                                          pending.new_keys[index_no].data(), pending.rid,
                                                          context_);
             }
+            index_maintenance::check_logical_key_write_conflict(sm_manager_, tab_, tab_name_,
+                                                                pending.new_record->data, pending.rid,
+                                                                context_);
         }
 
         for (size_t index_no = 0; index_no < tab_.indexes.size(); ++index_no) {

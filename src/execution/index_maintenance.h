@@ -80,6 +80,49 @@ inline bool visible_record_matches_key(const IndexMeta &index, const RmRecord *r
     return memcmp(actual_key.data(), key, index.col_tot_len) == 0;
 }
 
+inline bool record_matches_col_key(const ColMeta &col, const RmRecord *record, const char *key) {
+    return record != nullptr && memcmp(record->data + col.offset, key, col.len) == 0;
+}
+
+inline void check_logical_key_write_conflict(SmManager *sm_manager, const TabMeta &tab,
+                                             const std::string &tab_name, const char *record_data,
+                                             std::optional<Rid> self, Context *context) {
+    if (!is_mvcc_txn(context) || tab.cols.empty()) {
+        return;
+    }
+
+    const auto &key_col = tab.cols.front();
+    const char *key = record_data + key_col.offset;
+    auto fh = sm_manager->get_table_fh(tab_name);
+    auto &vm = VersionManager::instance();
+
+    RmScan scan(fh);
+    while (!scan.is_end()) {
+        Rid rid = scan.rid();
+        scan.next();
+
+        if (self.has_value() && same_rid(rid, *self)) {
+            continue;
+        }
+
+        auto physical = fh->get_record(rid, nullptr);
+        if (physical == nullptr) {
+            continue;
+        }
+
+        auto visible = fh->get_record(rid, context);
+        if (!record_matches_col_key(key_col, physical.get(), key) &&
+            !record_matches_col_key(key_col, visible.get(), key)) {
+            continue;
+        }
+
+        if (!vm.check_write_conflict(fh->GetFd(), rid, context->txn_)) {
+            throw TransactionAbortException(context->txn_->get_transaction_id(),
+                AbortReason::DEADLOCK_PREVENTION);
+        }
+    }
+}
+
 inline void check_unique_conflict_by_scan(SmManager *sm_manager, const std::string &tab_name,
                                           const IndexMeta &index, const char *key,
                                           std::optional<Rid> self, Context *context) {

@@ -70,6 +70,8 @@ class InsertExecutor : public AbstractExecutor {
                                                      std::nullopt, context_);
             index_keys.emplace_back(std::move(key));
         }
+        index_maintenance::check_logical_key_write_conflict(sm_manager_, tab_, tab_name_,
+                                                            rec.data, std::nullopt, context_);
 
         // Insert into record file
         rid_ = fh_->insert_record(rec.data, context_);

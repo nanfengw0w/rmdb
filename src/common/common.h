@@ -83,6 +83,8 @@ struct Value {
 
 enum CompOp { OP_EQ, OP_NE, OP_LT, OP_GT, OP_LE, OP_GE };
 
+enum class ArithOp { NO_OP, ADD, SUB, MUL, DIV };
+
 struct Condition {
     TabCol lhs_col;   // left-hand side column
     CompOp op;        // comparison operator
@@ -94,4 +96,5 @@ struct Condition {
 struct SetClause {
     TabCol lhs;
     Value rhs;
+    ArithOp op{ArithOp::NO_OP};
 };

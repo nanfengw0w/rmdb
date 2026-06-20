@@ -14,7 +14,9 @@ See the Mulan PSL v2 for more details. */
 #include <unistd.h>
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <memory>
+#include <sstream>
 
 #include "errors.h"
 #include "common/sql_rewrite.h"
@@ -69,6 +71,194 @@ static std::string strip_sql_line_comments(const std::string &sql) {
 
 static bool is_blank_sql(const std::string &sql) {
     return sql.find_first_not_of(" \t\r\n;") == std::string::npos;
+}
+
+static std::string trim_local(std::string s) {
+    size_t start = s.find_first_not_of(" \t\r\n");
+    if (start == std::string::npos) {
+        return "";
+    }
+    size_t end = s.find_last_not_of(" \t\r\n");
+    return s.substr(start, end - start + 1);
+}
+
+static std::string lower_local(std::string s) {
+    for (auto &c : s) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return s;
+}
+
+static size_t find_keyword_local(const std::string &lower_sql, const std::string &keyword, size_t start = 0) {
+    bool in_string = false;
+    for (size_t i = start; i + keyword.size() <= lower_sql.size(); ++i) {
+        if (lower_sql[i] == '\'') {
+            in_string = !in_string;
+            continue;
+        }
+        if (!in_string && lower_sql.compare(i, keyword.size(), keyword) == 0) {
+            return i;
+        }
+    }
+    return std::string::npos;
+}
+
+static std::vector<std::string> split_commas_local(const std::string &text) {
+    std::vector<std::string> parts;
+    bool in_string = false;
+    size_t start = 0;
+    for (size_t i = 0; i < text.size(); ++i) {
+        if (text[i] == '\'') {
+            in_string = !in_string;
+        } else if (!in_string && text[i] == ',') {
+            parts.push_back(trim_local(text.substr(start, i - start)));
+            start = i + 1;
+        }
+    }
+    parts.push_back(trim_local(text.substr(start)));
+    return parts;
+}
+
+static size_t find_eq_local(const std::string &text) {
+    bool in_string = false;
+    for (size_t i = 0; i < text.size(); ++i) {
+        if (text[i] == '\'') {
+            in_string = !in_string;
+        } else if (!in_string && text[i] == '=') {
+            return i;
+        }
+    }
+    return std::string::npos;
+}
+
+static bool parse_literal_local(const std::string &text, Value &value) {
+    std::string s = trim_local(text);
+    if (s.size() >= 2 && s.front() == '\'' && s.back() == '\'') {
+        value.set_str(s.substr(1, s.size() - 2));
+        return true;
+    }
+    try {
+        if (s.find('.') != std::string::npos) {
+            value.set_float(std::stof(s));
+        } else {
+            value.set_int(std::stoi(s));
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+static std::string value_to_update_sql_local(const Value &value) {
+    if (value.type == TYPE_STRING) {
+        return "'" + value.str_val + "'";
+    }
+    if (value.type == TYPE_FLOAT) {
+        std::ostringstream oss;
+        oss << value.float_val;
+        return oss.str();
+    }
+    return std::to_string(value.int_val);
+}
+
+static bool try_parse_arithmetic_update(const std::string &sql, std::string &dummy_sql,
+                                        std::vector<SetClause> &set_clauses) {
+    std::string raw = trim_local(sql);
+    while (!raw.empty() && raw.back() == ';') {
+        raw.pop_back();
+        raw = trim_local(raw);
+    }
+    std::string lower = lower_local(raw);
+    if (lower.rfind("update ", 0) != 0) {
+        return false;
+    }
+
+    size_t set_pos = find_keyword_local(lower, " set ", 0);
+    if (set_pos == std::string::npos) {
+        return false;
+    }
+    size_t where_pos = find_keyword_local(lower, " where ", set_pos + 5);
+    std::string tab_name = trim_local(raw.substr(7, set_pos - 7));
+    std::string set_part = where_pos == std::string::npos
+        ? trim_local(raw.substr(set_pos + 5))
+        : trim_local(raw.substr(set_pos + 5, where_pos - (set_pos + 5)));
+    std::string where_part = where_pos == std::string::npos ? "" : raw.substr(where_pos);
+    if (tab_name.empty() || set_part.empty()) {
+        return false;
+    }
+
+    bool has_arith = false;
+    std::vector<std::string> dummy_assigns;
+    std::vector<SetClause> parsed;
+    for (const auto &assignment : split_commas_local(set_part)) {
+        size_t eq_pos = find_eq_local(assignment);
+        if (eq_pos == std::string::npos) {
+            return false;
+        }
+        std::string lhs = trim_local(assignment.substr(0, eq_pos));
+        std::string rhs = trim_local(assignment.substr(eq_pos + 1));
+        if (lhs.empty() || rhs.empty()) {
+            return false;
+        }
+
+        SetClause clause;
+        clause.lhs = {.tab_name = tab_name, .col_name = lhs};
+        clause.op = ArithOp::NO_OP;
+
+        std::string rhs_lower = lower_local(rhs);
+        std::string lhs_lower = lower_local(lhs);
+        size_t pos = 0;
+        while (pos < rhs_lower.size() && std::isspace(static_cast<unsigned char>(rhs_lower[pos]))) {
+            pos++;
+        }
+        bool parsed_arith = false;
+        if (rhs_lower.compare(pos, lhs_lower.size(), lhs_lower) == 0) {
+            size_t op_pos = pos + lhs_lower.size();
+            while (op_pos < rhs_lower.size() && std::isspace(static_cast<unsigned char>(rhs_lower[op_pos]))) {
+                op_pos++;
+            }
+            if (op_pos < rhs_lower.size()) {
+                char op = rhs_lower[op_pos];
+                if (op == '+' || op == '-' || op == '*' || op == '/') {
+                    std::string val_text = trim_local(rhs.substr(op_pos + 1));
+                    if (parse_literal_local(val_text, clause.rhs)) {
+                        if (clause.rhs.type != TYPE_INT && clause.rhs.type != TYPE_FLOAT) {
+                            return false;
+                        }
+                        clause.op = op == '+' ? ArithOp::ADD :
+                                    op == '-' ? ArithOp::SUB :
+                                    op == '*' ? ArithOp::MUL : ArithOp::DIV;
+                        has_arith = true;
+                        parsed_arith = true;
+                    }
+                }
+            }
+        }
+
+        if (!parsed_arith) {
+            if (!parse_literal_local(rhs, clause.rhs)) {
+                return false;
+            }
+        }
+        parsed.push_back(clause);
+        dummy_assigns.push_back(lhs + "=" + (parsed_arith ? "0" : value_to_update_sql_local(clause.rhs)));
+    }
+
+    if (!has_arith) {
+        return false;
+    }
+
+    dummy_sql = "update " + tab_name + " set ";
+    for (size_t i = 0; i < dummy_assigns.size(); ++i) {
+        if (i > 0) {
+            dummy_sql += ", ";
+        }
+        dummy_sql += dummy_assigns[i];
+    }
+    dummy_sql += where_part;
+    dummy_sql += ";";
+    set_clauses = std::move(parsed);
+    return true;
 }
 
 // 构建全局所需的管理器对象
@@ -307,6 +497,82 @@ void *client_handler(void *sock_fd) {
         // 开启事务，初始化系统所需的上下文信息（包括事务对象指针、锁管理器指针、日志管理器指针、存放结果的buffer、记录结果长度的变量）
         auto context = std::make_unique<Context>(lock_manager.get(), log_manager.get(), nullptr, data_send, &offset);
         SetTransaction(&txn_id, context.get());
+
+        std::string arithmetic_dummy_sql;
+        std::vector<SetClause> arithmetic_set_clauses;
+        if (try_parse_arithmetic_update(std::string(data_recv), arithmetic_dummy_sql, arithmetic_set_clauses)) {
+            bool finish_analyze = false;
+            pthread_mutex_lock(buffer_mutex);
+            ast::parse_tree = nullptr;
+            YY_BUFFER_STATE buf = yy_scan_string(arithmetic_dummy_sql.c_str());
+            if (yyparse() == 0 && ast::parse_tree != nullptr) {
+                try {
+                    std::shared_ptr<Query> query = analyze->do_analyze(ast::parse_tree);
+                    query->set_clauses = arithmetic_set_clauses;
+                    yy_delete_buffer(buf);
+                    finish_analyze = true;
+                    pthread_mutex_unlock(buffer_mutex);
+
+                    std::shared_ptr<Plan> plan = optimizer->plan_query(query, context.get());
+                    std::shared_ptr<PortalStmt> portalStmt = portal->start(plan, context.get());
+                    portal->run(portalStmt, ql_manager.get(), &txn_id, context.get());
+                    portal->drop();
+                } catch (TransactionAbortException &e) {
+                    set_response(data_send, &offset, "abort\n");
+                    txn_manager->abort(context->txn_, log_manager.get());
+                    std::cout << e.GetInfo() << std::endl;
+
+                    std::fstream outfile;
+                    outfile.open("output.txt", std::ios::out | std::ios::app);
+                    outfile << "abort\n";
+                    outfile.close();
+                } catch (RMDBError &e) {
+                    std::cerr << e.what() << std::endl;
+                    set_response(data_send, &offset, std::string(e.what()) + "\n");
+
+                    std::fstream outfile;
+                    outfile.open("output.txt", std::ios::out | std::ios::app);
+                    outfile << "failure\n";
+                    outfile.close();
+                } catch (std::exception &e) {
+                    std::cerr << "Standard exception: " << e.what() << std::endl;
+                    set_response(data_send, &offset, std::string("Error: ") + e.what() + "\n");
+                    std::fstream outfile;
+                    outfile.open("output.txt", std::ios::out | std::ios::app);
+                    outfile << "failure\n";
+                    outfile.close();
+                } catch (...) {
+                    std::cerr << "Unknown exception caught" << std::endl;
+                    set_response(data_send, &offset, "Error: Unknown error\n");
+                    std::fstream outfile;
+                    outfile.open("output.txt", std::ios::out | std::ios::app);
+                    outfile << "failure\n";
+                    outfile.close();
+                }
+            } else {
+                set_response(data_send, &offset, "Error: parse failed\n");
+            }
+            if (finish_analyze == false) {
+                yy_delete_buffer(buf);
+                pthread_mutex_unlock(buffer_mutex);
+            }
+            if (write(fd, data_send, offset + 1) == -1) {
+                break;
+            }
+            if(context->txn_ != nullptr && context->txn_->get_txn_mode() == false &&
+               context->txn_->get_state() != TransactionState::COMMITTED &&
+               context->txn_->get_state() != TransactionState::ABORTED)
+            {
+                try {
+                    txn_manager->commit(context->txn_, context->log_mgr_);
+                } catch (std::exception &e) {
+                    std::cerr << "Auto commit failed: " << e.what() << std::endl;
+                } catch (...) {
+                    std::cerr << "Auto commit failed: unknown error" << std::endl;
+                }
+            }
+            continue;
+        }
 
         // SQL预处理：去别名、ON转WHERE
         auto rewrite_result = rewrite_sql_for_parser(std::string(data_recv));
