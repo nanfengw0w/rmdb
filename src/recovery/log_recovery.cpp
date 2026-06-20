@@ -235,8 +235,10 @@ void RecoveryManager::redo() {
                 RmFileHdr file_hdr = fh->get_file_hdr();
                 Rid rid = insert_rec->rid_;
 
-                // Check if page exists
-                if (rid.page_no >= file_hdr.num_pages) break;
+                // Extend file if needed (num_pages on disk may be stale)
+                if (rid.page_no >= file_hdr.num_pages) {
+                    fh->get_file_hdr_ref().num_pages = rid.page_no + 1;
+                }
 
                 PageId page_id{fd, rid.page_no};
                 Page* page = buffer_pool_manager_->fetch_page(page_id);
@@ -277,7 +279,9 @@ void RecoveryManager::redo() {
                 RmFileHdr file_hdr = fh->get_file_hdr();
                 Rid rid = update_rec->rid_;
 
-                if (rid.page_no >= file_hdr.num_pages) break;
+                if (rid.page_no >= file_hdr.num_pages) {
+                    fh->get_file_hdr_ref().num_pages = rid.page_no + 1;
+                }
 
                 PageId page_id{fd, rid.page_no};
                 Page* page = buffer_pool_manager_->fetch_page(page_id);
@@ -311,7 +315,9 @@ void RecoveryManager::redo() {
                 RmFileHdr file_hdr = fh->get_file_hdr();
                 Rid rid = delete_rec->rid_;
 
-                if (rid.page_no >= file_hdr.num_pages) break;
+                if (rid.page_no >= file_hdr.num_pages) {
+                    fh->get_file_hdr_ref().num_pages = rid.page_no + 1;
+                }
 
                 PageId page_id{fd, rid.page_no};
                 Page* page = buffer_pool_manager_->fetch_page(page_id);
@@ -336,6 +342,13 @@ void RecoveryManager::redo() {
             default:
                 break;
         }
+    }
+
+    // Flush updated file headers to disk (num_pages may have been extended)
+    for (auto& entry : sm_manager_->fhs_) {
+        RmFileHandle* fh = entry.second.get();
+        disk_manager_->write_page(fh->GetFd(), RM_FILE_HDR_PAGE,
+                                  (const char *)&fh->get_file_hdr_ref(), sizeof(RmFileHdr));
     }
 }
 

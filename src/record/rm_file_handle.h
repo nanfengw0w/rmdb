@@ -63,6 +63,7 @@ class RmFileHandle {
     }
 
     RmFileHdr get_file_hdr() { return file_hdr_; }
+    RmFileHdr& get_file_hdr_ref() { return file_hdr_; }
     int GetFd() { return fd_; }
 
     /* 判断指定位置上是否已经存在一条记录，通过Bitmap来判断 */

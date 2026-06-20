@@ -77,12 +77,11 @@ class InsertExecutor : public AbstractExecutor {
         // Insert into record file
         rid_ = fh_->insert_record(rec.data, context_);
 
-        // WAL: Write insert log record and flush (WAL: log must be on disk before data)
+        // WAL: Write insert log record to buffer (flushed at commit or when buffer is full)
         if (context_ != nullptr && context_->txn_ != nullptr && context_->log_mgr_ != nullptr) {
             InsertLogRecord insert_log(context_->txn_->get_transaction_id(), rec, rid_, tab_name_);
             lsn_t lsn = context_->log_mgr_->add_log_to_buffer(&insert_log);
             context_->txn_->set_prev_lsn(lsn);
-            context_->log_mgr_->flush_log_to_disk();
         }
 
         // Record write operation for transaction abort

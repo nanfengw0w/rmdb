@@ -184,13 +184,12 @@ class UpdateExecutor : public AbstractExecutor {
 
             fh_->update_record(pending.rid, pending.new_record->data, context_);
 
-            // WAL: Write update log record and flush
+            // WAL: Write update log record to buffer (flushed at commit or when buffer is full)
             if (txn != nullptr && context_->log_mgr_ != nullptr) {
                 UpdateLogRecord update_log(txn->get_transaction_id(), *pending.old_record,
                                            *pending.new_record, pending.rid, tab_name_);
                 lsn_t lsn = context_->log_mgr_->add_log_to_buffer(&update_log);
                 txn->set_prev_lsn(lsn);
-                context_->log_mgr_->flush_log_to_disk();
             }
 
             if (txn != nullptr) {
