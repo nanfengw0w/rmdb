@@ -21,6 +21,8 @@ See the Mulan PSL v2 for more details. */
 #include "index/ix.h"
 #include "system/sm.h"
 
+extern TransactionManager* g_txn_manager;
+
 class IndexScanExecutor : public AbstractExecutor {
    private:
     std::string tab_name_;
@@ -92,6 +94,7 @@ class IndexScanExecutor : public AbstractExecutor {
         matched_rids_.clear();
         matched_pos_ = 0;
         is_end_ = true;
+        track_predicate_read();
 
         if (ih_ == nullptr) {
             return;
@@ -102,7 +105,8 @@ class IndexScanExecutor : public AbstractExecutor {
             if (ih_->get_value(runtime_eq_key_->data(), &result, nullptr)) {
                 for (auto &candidate_rid : result) {
                     auto record = fh_->get_record(candidate_rid, context_);
-                    if (eval_conds(record.get(), fed_conds_)) {
+                    if (record != nullptr && eval_conds(record.get(), fed_conds_)) {
+                        track_record_read(candidate_rid);
                         matched_rids_.push_back(candidate_rid);
                     }
                 }
@@ -123,7 +127,8 @@ class IndexScanExecutor : public AbstractExecutor {
             if (ih_->get_value(exact_key->data(), &result, nullptr)) {
                 for (auto &candidate_rid : result) {
                     auto record = fh_->get_record(candidate_rid, context_);
-                    if (eval_conds(record.get(), fed_conds_)) {
+                    if (record != nullptr && eval_conds(record.get(), fed_conds_)) {
+                        track_record_read(candidate_rid);
                         matched_rids_.push_back(candidate_rid);
                     }
                 }
@@ -236,10 +241,47 @@ class IndexScanExecutor : public AbstractExecutor {
             }
             auto candidate_rid = index_scan.rid();
             auto record = fh_->get_record(candidate_rid, context_);
-            if (eval_conds(record.get(), fed_conds_)) {
+            if (record != nullptr && eval_conds(record.get(), fed_conds_)) {
+                track_record_read(candidate_rid);
                 matched_rids_.push_back(candidate_rid);
             }
             index_scan.next();
+        }
+    }
+
+    void track_predicate_read() {
+        if (context_ == nullptr || context_->txn_ == nullptr || g_txn_manager == nullptr ||
+            context_->txn_->get_isolation_level() != IsolationLevel::SERIALIZABLE) {
+            return;
+        }
+        PredicateRead pred;
+        pred.tab_name = tab_name_;
+        pred.is_empty_result = false;
+        pred.conds = fed_conds_;
+        pred.cols = cols_;
+        g_txn_manager->record_predicate_read(context_->txn_, pred);
+
+        auto deps = g_txn_manager->check_rw_on_predicate_read(context_->txn_, tab_name_, pred);
+        for (auto& [from, to] : deps) {
+            if (g_txn_manager->add_rw_dependency_and_check(from, to)) {
+                throw TransactionAbortException(context_->txn_->get_transaction_id(),
+                    AbortReason::DEADLOCK_PREVENTION);
+            }
+        }
+    }
+
+    void track_record_read(const Rid& rid) {
+        if (context_ == nullptr || context_->txn_ == nullptr || g_txn_manager == nullptr ||
+            context_->txn_->get_isolation_level() != IsolationLevel::SERIALIZABLE) {
+            return;
+        }
+        g_txn_manager->record_read(context_->txn_, tab_name_, rid);
+        auto deps = g_txn_manager->check_rw_on_read(context_->txn_, tab_name_, rid);
+        for (auto& [from, to] : deps) {
+            if (g_txn_manager->add_rw_dependency_and_check(from, to)) {
+                throw TransactionAbortException(context_->txn_->get_transaction_id(),
+                    AbortReason::DEADLOCK_PREVENTION);
+            }
         }
     }
 

@@ -52,6 +52,7 @@ class SeqScanExecutor : public AbstractExecutor {
     void beginTuple() override {
         scan_ = std::make_unique<RmScan>(fh_);
         is_end_ = false;
+        track_predicate_read();
         // Skip to the first record that satisfies conditions
         while (!scan_->is_end()) {
             rid_ = scan_->rid();
@@ -66,7 +67,8 @@ class SeqScanExecutor : public AbstractExecutor {
                         auto deps = txn_mgr->check_rw_on_read(context_->txn_, tab_name_, rid_);
                         for (auto& [from, to] : deps) {
                             if (txn_mgr->add_rw_dependency_and_check(from, to)) {
-                                throw TransactionAbortException(from, AbortReason::DEADLOCK_PREVENTION);
+                                throw TransactionAbortException(context_->txn_->get_transaction_id(),
+                                    AbortReason::DEADLOCK_PREVENTION);
                             }
                         }
                     }
@@ -93,7 +95,8 @@ class SeqScanExecutor : public AbstractExecutor {
                         auto deps = txn_mgr->check_rw_on_read(context_->txn_, tab_name_, rid_);
                         for (auto& [from, to] : deps) {
                             if (txn_mgr->add_rw_dependency_and_check(from, to)) {
-                                throw TransactionAbortException(from, AbortReason::DEADLOCK_PREVENTION);
+                                throw TransactionAbortException(context_->txn_->get_transaction_id(),
+                                    AbortReason::DEADLOCK_PREVENTION);
                             }
                         }
                     }
@@ -135,6 +138,32 @@ class SeqScanExecutor : public AbstractExecutor {
             }
         }
         return true;
+    }
+
+    void track_predicate_read() {
+        if (context_ == nullptr || context_->txn_ == nullptr) {
+            return;
+        }
+        auto* txn_mgr = get_txn_manager();
+        if (txn_mgr == nullptr ||
+            context_->txn_->get_isolation_level() != IsolationLevel::SERIALIZABLE) {
+            return;
+        }
+
+        PredicateRead pred;
+        pred.tab_name = tab_name_;
+        pred.is_empty_result = false;
+        pred.conds = conds_;
+        pred.cols = cols_;
+        txn_mgr->record_predicate_read(context_->txn_, pred);
+
+        auto deps = txn_mgr->check_rw_on_predicate_read(context_->txn_, tab_name_, pred);
+        for (auto& [from, to] : deps) {
+            if (txn_mgr->add_rw_dependency_and_check(from, to)) {
+                throw TransactionAbortException(context_->txn_->get_transaction_id(),
+                    AbortReason::DEADLOCK_PREVENTION);
+            }
+        }
     }
 
     ColMeta& find_col_meta(const std::vector<ColMeta> &cols, const TabCol &target) {

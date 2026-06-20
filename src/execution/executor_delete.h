@@ -46,30 +46,38 @@ class DeleteExecutor : public AbstractExecutor {
             // Get the record before deletion
             auto record = fh_->get_record(rids_[cur_idx_], context_);
 
-            // Record write operation for transaction abort (save old value)
-            if (context_ != nullptr && context_->txn_ != nullptr) {
-                context_->txn_->append_write_record(new WriteRecord(WType::DELETE_TUPLE, tab_name_, rids_[cur_idx_], *record));
-            }
-
             // SSI: 检查 rw 依赖
             Transaction *txn = context_ == nullptr ? nullptr : context_->txn_;
             if (txn != nullptr && g_txn_manager != nullptr) {
-                auto deps = g_txn_manager->check_rw_on_write(txn, tab_name_, rids_[cur_idx_]);
+                auto deps = g_txn_manager->check_rw_on_write(txn, tab_name_, rids_[cur_idx_],
+                                                             record.get(), nullptr);
                 for (auto& [from, to] : deps) {
                     if (g_txn_manager->add_rw_dependency_and_check(from, to)) {
-                        throw TransactionAbortException(from, AbortReason::DEADLOCK_PREVENTION);
+                        throw TransactionAbortException(txn->get_transaction_id(),
+                            AbortReason::DEADLOCK_PREVENTION);
                     }
                 }
             }
 
-            // Delete index entries first
+            fh_->delete_record(rids_[cur_idx_], context_);
+
+            // Record write operation for transaction abort (save old value)
+            if (context_ != nullptr && context_->txn_ != nullptr) {
+                context_->txn_->append_write_record(new WriteRecord(WType::DELETE_TUPLE, tab_name_, rids_[cur_idx_], *record));
+                if (g_txn_manager != nullptr) {
+                    g_txn_manager->record_write(context_->txn_, tab_name_, rids_[cur_idx_],
+                                                WType::DELETE_TUPLE, record.get(), nullptr,
+                                                false, true);
+                }
+            }
+
+            // Delete index entries after the MVCC write-conflict check succeeds.
             for (size_t i = 0; i < tab_.indexes.size(); ++i) {
                 auto& index = tab_.indexes[i];
                 auto ih = index_maintenance::get_index_handle(sm_manager_, tab_name_, index);
                 auto key = index_maintenance::build_key(index, record->data);
                 ih->delete_entry(key.data(), txn);
             }
-            fh_->delete_record(rids_[cur_idx_], context_);
             cur_idx_++;
         }
         return nullptr;

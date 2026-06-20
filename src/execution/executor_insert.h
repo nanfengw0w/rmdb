@@ -78,22 +78,25 @@ class InsertExecutor : public AbstractExecutor {
             context_->txn_->append_write_record(new WriteRecord(WType::INSERT_TUPLE, tab_name_, rid_));
         }
 
-        // Insert into index
         Transaction *txn = context_ == nullptr ? nullptr : context_->txn_;
+        // SSI: 检查 rw 依赖
+        if (txn != nullptr && g_txn_manager != nullptr) {
+            g_txn_manager->record_write(txn, tab_name_, rid_, WType::INSERT_TUPLE,
+                                         nullptr, &rec, true, false);
+            auto deps = g_txn_manager->check_rw_on_write(txn, tab_name_, rid_, nullptr, &rec);
+            for (auto& [from, to] : deps) {
+                if (g_txn_manager->add_rw_dependency_and_check(from, to)) {
+                    throw TransactionAbortException(txn->get_transaction_id(),
+                        AbortReason::DEADLOCK_PREVENTION);
+                }
+            }
+        }
+
+        // Insert into index after all aborting checks that can run before index mutation.
         for(size_t i = 0; i < tab_.indexes.size(); ++i) {
             auto& index = tab_.indexes[i];
             auto ih = index_maintenance::get_index_handle(sm_manager_, tab_name_, index);
             ih->insert_entry(index_keys[i].data(), rid_, txn);
-        }
-
-        // SSI: 检查 rw 依赖
-        if (txn != nullptr && g_txn_manager != nullptr) {
-            auto deps = g_txn_manager->check_rw_on_write(txn, tab_name_, rid_);
-            for (auto& [from, to] : deps) {
-                if (g_txn_manager->add_rw_dependency_and_check(from, to)) {
-                    throw TransactionAbortException(from, AbortReason::DEADLOCK_PREVENTION);
-                }
-            }
         }
 
         done_ = true;

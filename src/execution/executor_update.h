@@ -110,17 +110,26 @@ class UpdateExecutor : public AbstractExecutor {
 
         Transaction *txn = context_ == nullptr ? nullptr : context_->txn_;
         for (auto &pending : pending_updates) {
-            if (txn != nullptr) {
-                txn->append_write_record(new WriteRecord(WType::UPDATE_TUPLE, tab_name_, pending.rid, *pending.old_record));
-            }
-
             // SSI: 检查 rw 依赖
             if (txn != nullptr && g_txn_manager != nullptr) {
-                auto deps = g_txn_manager->check_rw_on_write(txn, tab_name_, pending.rid);
+                auto deps = g_txn_manager->check_rw_on_write(txn, tab_name_, pending.rid,
+                                                             pending.old_record.get(),
+                                                             pending.new_record.get());
                 for (auto& [from, to] : deps) {
                     if (g_txn_manager->add_rw_dependency_and_check(from, to)) {
-                        throw TransactionAbortException(from, AbortReason::DEADLOCK_PREVENTION);
+                        throw TransactionAbortException(txn->get_transaction_id(),
+                            AbortReason::DEADLOCK_PREVENTION);
                     }
+                }
+            }
+
+            fh_->update_record(pending.rid, pending.new_record->data, context_);
+            if (txn != nullptr) {
+                txn->append_write_record(new WriteRecord(WType::UPDATE_TUPLE, tab_name_, pending.rid, *pending.old_record));
+                if (g_txn_manager != nullptr) {
+                    g_txn_manager->record_write(txn, tab_name_, pending.rid, WType::UPDATE_TUPLE,
+                                                pending.old_record.get(), pending.new_record.get(),
+                                                false, false);
                 }
             }
 
@@ -132,7 +141,6 @@ class UpdateExecutor : public AbstractExecutor {
                 ih->delete_entry(pending.old_keys[index_no].data(), txn);
                 ih->insert_entry(pending.new_keys[index_no].data(), pending.rid, txn);
             }
-            fh_->update_record(pending.rid, pending.new_record->data, context_);
         }
 
         cur_idx_ = rids_.size();

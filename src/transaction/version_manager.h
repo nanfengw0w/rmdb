@@ -37,6 +37,7 @@ struct VersionEntry {
     txn_id_t txn_id_{INVALID_TXN_ID};  // 执行此写操作的事务ID
     timestamp_t commit_ts_{0};          // 提交时间戳（0表示未提交）
     bool is_deleted_{false};            // 写操作前该记录是否已删除
+    bool new_deleted_{false};           // 写操作后该记录是否被删除
     std::shared_ptr<RmRecord> old_data_;// 写操作前的旧数据
 };
 
@@ -108,7 +109,8 @@ public:
      * @param was_deleted 写操作前记录是否已删除
      */
     void save_old_data(int fd, const Rid& rid, Transaction* txn,
-                       const RmRecord* old_data, bool was_deleted) {
+                       const RmRecord* old_data, bool was_deleted,
+                       bool new_deleted = false) {
         VersionKey key{fd, rid.page_no, rid.slot_no};
         std::lock_guard<std::mutex> lock(mutex_);
 
@@ -118,6 +120,7 @@ public:
         entry.txn_id_ = txn->get_transaction_id();
         entry.commit_ts_ = 0;  // 未提交
         entry.is_deleted_ = was_deleted;
+        entry.new_deleted_ = new_deleted;
         if (old_data && !was_deleted) {
             entry.old_data_ = std::make_shared<RmRecord>(*old_data);
         }
@@ -199,51 +202,74 @@ public:
 
         auto& chain = it->second;
 
-        // 从最新版本开始查找
+        bool has_invisible_before_image = false;
+        bool invisible_before_deleted = false;
+        RmRecord* invisible_before_data = nullptr;
+
+        // 从最新版本开始查找。磁盘保存最新物理值，版本链保存每次写入前的旧值；
+        // 如果快照看不到多个较新的写入，需要一直回退到最早的不可见写入前。
         for (auto rit = chain.rbegin(); rit != chain.rend(); ++rit) {
             auto& entry = *rit;
 
-            // 跳过自己事务的版本（自己的写操作对自己可见，从磁盘读取最新数据）
             if (entry.txn_id_ == txn->get_transaction_id()) {
+                if (entry.new_deleted_) {
+                    is_deleted = true;
+                    result = nullptr;
+                    return 0;
+                }
+                is_deleted = false;
+                result = nullptr;
+                return -1;
+            }
+
+            bool invisible = (entry.commit_ts_ == 0 || entry.commit_ts_ > txn->get_start_ts());
+            if (invisible) {
+                has_invisible_before_image = true;
+                invisible_before_deleted = entry.is_deleted_;
+                invisible_before_data = entry.old_data_.get();
                 continue;
             }
 
-            // 如果有其他未提交事务的版本
-            if (entry.commit_ts_ == 0) {
-                // 如果是INSERT（之前记录不存在），返回记录不存在
-                if (entry.is_deleted_) {
-                    is_deleted = true;
-                    result = nullptr;
-                    return 0;  // 记录不存在
-                }
-                // 如果是UPDATE/DELETE，返回旧数据
-                is_deleted = false;
-                result = entry.old_data_.get();
-                return 1;  // 从old_data读取
+            // commit_ts <= start_ts，这个写入在快照中可见。若它是删除，
+            // 且没有更晚的不可见写入需要回退，则该记录对本事务不存在。
+            if (!has_invisible_before_image && entry.new_deleted_) {
+                is_deleted = true;
+                result = nullptr;
+                return 0;
             }
-
-            // 如果有其他事务在本事务开始之后提交的版本
-            if (entry.commit_ts_ > txn->get_start_ts()) {
-                // 如果是INSERT（之前记录不存在），返回记录不存在
-                if (entry.is_deleted_) {
-                    is_deleted = true;
-                    result = nullptr;
-                    return 0;  // 记录不存在
-                }
-                // 如果是UPDATE/DELETE，返回旧数据
-                is_deleted = false;
-                result = entry.old_data_.get();
-                return 1;  // 从old_data读取
-            }
-
-            // commit_ts <= start_ts，这个版本在快照中可见，从磁盘读取
             break;
         }
 
-        // 没有需要回退的版本，从磁盘读取最新数据
+        if (has_invisible_before_image) {
+            if (invisible_before_deleted) {
+                is_deleted = true;
+                result = nullptr;
+                return 0;
+            }
+            is_deleted = false;
+            result = invisible_before_data;
+            return 1;
+        }
+
         is_deleted = false;
         result = nullptr;
         return -1;  // 从磁盘读取
+    }
+
+    bool latest_is_deleted_for_txn(int fd, const Rid& rid, txn_id_t txn_id) {
+        VersionKey key{fd, rid.page_no, rid.slot_no};
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        auto it = version_chains_.find(key);
+        if (it == version_chains_.end() || it->second.empty()) {
+            return false;
+        }
+        for (auto rit = it->second.rbegin(); rit != it->second.rend(); ++rit) {
+            if (rit->txn_id_ == txn_id) {
+                return rit->new_deleted_;
+            }
+        }
+        return false;
     }
 
 private:

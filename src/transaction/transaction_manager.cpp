@@ -45,6 +45,10 @@ Transaction * TransactionManager::begin(Transaction* txn, LogManager* log_manage
  */
 void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     if (txn == nullptr) return;
+    if (txn->get_state() == TransactionState::ABORTED ||
+        txn->get_state() == TransactionState::COMMITTED) {
+        return;
+    }
 
     IsolationLevel level = txn->get_isolation_level();
     if (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE) {
@@ -93,7 +97,7 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
                     break;
                 }
                 case WType::DELETE_TUPLE: {
-                    fh->insert_record(rid, wr->GetRecord().data);
+                    fh->update_record(rid, wr->GetRecord().data, nullptr);
                     break;
                 }
                 case WType::UPDATE_TUPLE: {
@@ -135,8 +139,10 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
     }
 
     // 清理 SSI 状态
+    clear_ssi_state(txn->get_transaction_id());
     txn->read_set_.clear();
     txn->predicate_reads_.clear();
+    txn->ssi_writes_.clear();
     txn->rw_deps_.clear();
 
     txn->set_state(TransactionState::ABORTED);

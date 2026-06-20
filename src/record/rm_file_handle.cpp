@@ -101,10 +101,12 @@ void RmFileHandle::delete_record(const Rid& rid, Context* context) {
         throw RecordNotFoundError(rid.page_no, rid.slot_no);
     }
 
+    bool mvcc_delete = false;
     // MVCC: 检查写写冲突并保存旧数据
     if (context != nullptr && context->txn_ != nullptr) {
         IsolationLevel level = context->txn_->get_isolation_level();
         if (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE) {
+            mvcc_delete = true;
             auto& vm = VersionManager::instance();
 
             if (!vm.check_write_conflict(fd_, rid, context->txn_)) {
@@ -115,8 +117,16 @@ void RmFileHandle::delete_record(const Rid& rid, Context* context) {
 
             // 保存旧数据
             RmRecord old_data(file_hdr_.record_size, page_handle.get_slot(rid.slot_no));
-            vm.save_old_data(fd_, rid, context->txn_, &old_data, false);
+            vm.save_old_data(fd_, rid, context->txn_, &old_data, false, true);
         }
+    }
+
+    if (mvcc_delete) {
+        // MVCC 下不能清 bitmap，否则早于删除提交的快照扫描不到旧版本。
+        // 记录的“写后删除”状态保存在版本链中。
+        BufferPoolManager::mark_dirty(page_handle.page);
+        buffer_pool_manager_->unpin_page(PageId{fd_, rid.page_no}, true);
+        return;
     }
 
     Bitmap::reset(page_handle.bitmap, rid.slot_no);

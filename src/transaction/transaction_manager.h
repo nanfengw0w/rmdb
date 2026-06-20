@@ -11,10 +11,13 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include <atomic>
+#include <algorithm>
 #include <unordered_map>
 #include <optional>
 #include <functional>
 #include <shared_mutex>
+#include <cstring>
+#include <limits>
 
 #include "transaction.h"
 #include "watermark.h"
@@ -121,6 +124,42 @@ public:
         }
     }
 
+    void record_scan_predicate(Transaction* txn, const std::string& tab_name,
+                               const std::vector<Condition>& conds,
+                               const std::vector<ColMeta>& cols) {
+        if (txn == nullptr || txn->get_isolation_level() != IsolationLevel::SERIALIZABLE) {
+            return;
+        }
+        PredicateRead pred;
+        pred.tab_name = tab_name;
+        pred.is_empty_result = false;
+        pred.conds = conds;
+        pred.cols = cols;
+        record_predicate_read(txn, pred);
+    }
+
+    void record_write(Transaction* txn, const std::string& tab_name, const Rid& rid,
+                      WType type, const RmRecord* before, const RmRecord* after,
+                      bool before_deleted, bool after_deleted) {
+        if (txn == nullptr || txn->get_isolation_level() != IsolationLevel::SERIALIZABLE) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(ssi_mutex_);
+        TxnWriteInfo info;
+        info.tab_name = tab_name;
+        info.rid = rid;
+        info.type = type;
+        info.before_deleted = before_deleted;
+        info.after_deleted = after_deleted;
+        if (before != nullptr && !before_deleted) {
+            info.before = std::make_shared<RmRecord>(*before);
+        }
+        if (after != nullptr && !after_deleted) {
+            info.after = std::make_shared<RmRecord>(*after);
+        }
+        txn->ssi_writes_.push_back(std::move(info));
+    }
+
     // SSI: 检查写操作是否与读集合冲突，返回需要创建的 rw 依赖
     std::vector<std::pair<txn_id_t, txn_id_t>> check_rw_on_write(
         Transaction* writer, const std::string& tab_name, const Rid& rid) {
@@ -140,6 +179,42 @@ public:
             if (reader->read_set_.count({tab_name, rid})) {
                 // reader 读过这条记录，writer 要修改它
                 // 形成 reader ->rw writer 依赖
+                new_deps.push_back({reader->get_transaction_id(), writer->get_transaction_id()});
+            }
+        }
+
+        return new_deps;
+    }
+
+    std::vector<std::pair<txn_id_t, txn_id_t>> check_rw_on_write(
+        Transaction* writer, const std::string& tab_name, const Rid& rid,
+        const RmRecord* before, const RmRecord* after) {
+
+        std::vector<std::pair<txn_id_t, txn_id_t>> new_deps;
+        if (writer == nullptr || writer->get_isolation_level() != IsolationLevel::SERIALIZABLE) {
+            return new_deps;
+        }
+
+        std::lock_guard<std::mutex> lock(ssi_mutex_);
+
+        for (auto& [id, reader] : txn_map) {
+            if (reader == nullptr || reader == writer) continue;
+            if (reader->get_state() == TransactionState::ABORTED) continue;
+            if (reader->get_isolation_level() != IsolationLevel::SERIALIZABLE) continue;
+            if (!write_invisible_to_reader_locked(reader, writer)) continue;
+
+            bool conflicts = reader->read_set_.count({tab_name, rid}) > 0;
+            if (!conflicts) {
+                for (auto& pred : reader->predicate_reads_) {
+                    if (pred.tab_name != tab_name) continue;
+                    if (record_matches_predicate_locked(before, pred) ||
+                        record_matches_predicate_locked(after, pred)) {
+                        conflicts = true;
+                        break;
+                    }
+                }
+            }
+            if (conflicts) {
                 new_deps.push_back({reader->get_transaction_id(), writer->get_transaction_id()});
             }
         }
@@ -177,6 +252,35 @@ public:
         return new_deps;
     }
 
+    std::vector<std::pair<txn_id_t, txn_id_t>> check_rw_on_predicate_read(
+        Transaction* reader, const std::string& tab_name, const PredicateRead& pred) {
+
+        std::vector<std::pair<txn_id_t, txn_id_t>> new_deps;
+        if (reader == nullptr || reader->get_isolation_level() != IsolationLevel::SERIALIZABLE) {
+            return new_deps;
+        }
+
+        std::lock_guard<std::mutex> lock(ssi_mutex_);
+
+        for (auto& [id, writer] : txn_map) {
+            if (writer == nullptr || writer == reader) continue;
+            if (writer->get_state() == TransactionState::ABORTED) continue;
+            if (writer->get_isolation_level() != IsolationLevel::SERIALIZABLE) continue;
+            if (!write_invisible_to_reader_locked(reader, writer)) continue;
+
+            for (auto& write : writer->ssi_writes_) {
+                if (write.tab_name != tab_name) continue;
+                if (record_matches_predicate_locked(write.before.get(), pred) ||
+                    record_matches_predicate_locked(write.after.get(), pred)) {
+                    new_deps.push_back({reader->get_transaction_id(), writer->get_transaction_id()});
+                    break;
+                }
+            }
+        }
+
+        return new_deps;
+    }
+
     // SSI: 添加 rw 依赖并检查危险结构
     bool add_rw_dependency_and_check(txn_id_t from, txn_id_t to) {
         std::lock_guard<std::mutex> lock(ssi_mutex_);
@@ -185,25 +289,70 @@ public:
         Transaction* to_txn = get_transaction(to, false);
 
         if (from_txn == nullptr || to_txn == nullptr) return false;
+        if (from_txn->get_state() == TransactionState::ABORTED ||
+            to_txn->get_state() == TransactionState::ABORTED ||
+            from == to) {
+            return false;
+        }
 
         // 检查依赖是否已存在
-        for (auto& [f, t] : from_txn->rw_deps_) {
+        for (auto& [f, t] : rw_edges_) {
             if (f == from && t == to) return false;  // 已存在
         }
 
         // 添加依赖
+        rw_edges_.push_back({from, to});
         from_txn->rw_deps_.push_back({from, to});
 
-        // 检查危险结构
-        // 检查是否存在 to ->rw from 的依赖
-        for (auto& [tin, tout] : to_txn->rw_deps_) {
-            if (tin == to && tout == from) {
-                // 形成危险结构
-                return true;
+        auto dangerous = [&](txn_id_t tin, txn_id_t tpivot, txn_id_t tout) -> bool {
+            Transaction* tin_txn = get_transaction(tin, false);
+            Transaction* tpivot_txn = get_transaction(tpivot, false);
+            Transaction* tout_txn = get_transaction(tout, false);
+            if (tin_txn == nullptr || tpivot_txn == nullptr || tout_txn == nullptr) return false;
+            if (tin_txn->get_state() == TransactionState::ABORTED ||
+                tpivot_txn->get_state() == TransactionState::ABORTED ||
+                tout_txn->get_state() == TransactionState::ABORTED) {
+                return false;
             }
+            if (tin == tout) return true;
+            if (tout_txn->get_state() == TransactionState::COMMITTED) {
+                if (tin_txn->get_state() == TransactionState::COMMITTED) {
+                    return tout_txn->commit_order_ >= 0 &&
+                           tin_txn->commit_order_ >= 0 &&
+                           tout_txn->commit_order_ < tin_txn->commit_order_;
+                }
+                return tout_txn->commit_order_ >= 0;
+            }
+            return false;
+        };
+
+        for (auto& [f, t] : rw_edges_) {
+            if (f == to && dangerous(from, to, t)) return true;
+            if (t == from && dangerous(f, from, to)) return true;
         }
 
         return false;
+    }
+
+    void clear_ssi_state(txn_id_t txn_id) {
+        std::lock_guard<std::mutex> lock(ssi_mutex_);
+        rw_edges_.erase(
+            std::remove_if(rw_edges_.begin(), rw_edges_.end(),
+                [txn_id](const std::pair<txn_id_t, txn_id_t>& edge) {
+                    return edge.first == txn_id || edge.second == txn_id;
+                }),
+            rw_edges_.end());
+
+        for (auto& [id, txn] : txn_map) {
+            if (txn == nullptr) continue;
+            auto& deps = txn->rw_deps_;
+            deps.erase(
+                std::remove_if(deps.begin(), deps.end(),
+                    [txn_id](const std::pair<txn_id_t, txn_id_t>& edge) {
+                        return edge.first == txn_id || edge.second == txn_id;
+                    }),
+                deps.end());
+        }
     }
 
     // 辅助函数：从表名获取文件描述符
@@ -215,6 +364,7 @@ public:
     std::mutex mvcc_mutex_;
     // SSI 互斥锁
     std::mutex ssi_mutex_;
+    std::vector<std::pair<txn_id_t, txn_id_t>> rw_edges_;
 
     /**
      * @description: 获取事务ID为txn_id的事务对象
@@ -304,4 +454,93 @@ private:
 
     std::atomic<timestamp_t> last_commit_ts_{0};    // 最后提交的时间戳,仅用于MVCC
     Watermark running_txns_{0};             // 存储所有正在运行事务的读取时间戳，以便于垃圾回收，仅用于MVCC
+
+    bool write_invisible_to_reader_locked(Transaction* reader, Transaction* writer) {
+        if (reader == nullptr || writer == nullptr || reader == writer) return false;
+        if (writer->get_state() == TransactionState::ABORTED) return false;
+        if (!transactions_overlap_locked(reader, writer)) return false;
+        if (writer->get_state() == TransactionState::GROWING) return true;
+        if (writer->get_commit_ts() == INVALID_TS) return true;
+        return writer->get_commit_ts() > reader->get_start_ts();
+    }
+
+    bool transactions_overlap_locked(Transaction* lhs, Transaction* rhs) {
+        if (lhs == nullptr || rhs == nullptr) return false;
+        if (lhs->get_state() == TransactionState::ABORTED ||
+            rhs->get_state() == TransactionState::ABORTED) {
+            return false;
+        }
+        timestamp_t lhs_end = lhs->get_state() == TransactionState::COMMITTED
+                                  ? lhs->get_commit_ts()
+                                  : std::numeric_limits<timestamp_t>::max();
+        timestamp_t rhs_end = rhs->get_state() == TransactionState::COMMITTED
+                                  ? rhs->get_commit_ts()
+                                  : std::numeric_limits<timestamp_t>::max();
+        return lhs->get_start_ts() < rhs_end && rhs->get_start_ts() < lhs_end;
+    }
+
+    bool record_matches_predicate_locked(const RmRecord* record, const PredicateRead& pred) {
+        if (record == nullptr) return false;
+        for (auto& cond : pred.conds) {
+            const ColMeta* lhs = find_col_locked(pred.cols, cond.lhs_col);
+            if (lhs == nullptr) continue;
+            const char* lhs_buf = record->data + lhs->offset;
+            const char* rhs_buf = nullptr;
+            ColType rhs_type = lhs->type;
+            int rhs_len = lhs->len;
+            if (cond.is_rhs_val) {
+                if (cond.rhs_val.raw == nullptr) continue;
+                rhs_buf = cond.rhs_val.raw->data;
+            } else {
+                const ColMeta* rhs = find_col_locked(pred.cols, cond.rhs_col);
+                if (rhs == nullptr) continue;
+                rhs_buf = record->data + rhs->offset;
+                rhs_type = rhs->type;
+                rhs_len = rhs->len;
+            }
+            (void)rhs_type;
+            (void)rhs_len;
+            int cmp = compare_value_locked(lhs_buf, rhs_buf, lhs->type, lhs->len);
+            if (!eval_cmp_locked(cmp, cond.op)) return false;
+        }
+        return true;
+    }
+
+    const ColMeta* find_col_locked(const std::vector<ColMeta>& cols, const TabCol& target) {
+        for (auto& col : cols) {
+            if (col.tab_name == target.tab_name && col.name == target.col_name) {
+                return &col;
+            }
+        }
+        return nullptr;
+    }
+
+    int compare_value_locked(const char *a, const char *b, ColType type, int len) {
+        if (type == TYPE_INT) {
+            int va = *(int *)a;
+            int vb = *(int *)b;
+            return (va > vb) ? 1 : ((va < vb) ? -1 : 0);
+        }
+        if (type == TYPE_FLOAT) {
+            float va = *(float *)a;
+            float vb = *(float *)b;
+            return (va > vb) ? 1 : ((va < vb) ? -1 : 0);
+        }
+        if (type == TYPE_STRING) {
+            return memcmp(a, b, len);
+        }
+        return 0;
+    }
+
+    bool eval_cmp_locked(int cmp, CompOp op) {
+        switch (op) {
+            case OP_EQ: return cmp == 0;
+            case OP_NE: return cmp != 0;
+            case OP_LT: return cmp < 0;
+            case OP_GT: return cmp > 0;
+            case OP_LE: return cmp <= 0;
+            case OP_GE: return cmp >= 0;
+            default: return false;
+        }
+    }
 };

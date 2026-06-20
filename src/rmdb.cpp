@@ -183,8 +183,9 @@ void *client_handler(void *sock_fd) {
                 }
                 int session_id = static_cast<int>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
                 txn_manager->set_session_isolation_level(session_id, level);
-                // 返回 OK
-                set_response(data_send, &offset, "OK\n");
+                // Topic 9 expects SET TRANSACTION ISOLATION LEVEL to be silent.
+                memset(data_send, '\0', BUFFER_LENGTH);
+                offset = 0;
                 if (write(fd, data_send, offset + 1) == -1) break;
                 continue;
             }

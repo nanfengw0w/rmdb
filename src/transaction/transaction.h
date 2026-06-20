@@ -22,6 +22,7 @@ See the Mulan PSL v2 for more details. */
 #include "common/common.h"
 #include "transaction/txn_defs.h"
 #include "record/rm_defs.h"
+#include "system/sm_meta.h"
 
 /** 表示此tuple的前一个版本的链接 */
 struct UndoLink {
@@ -46,6 +47,18 @@ struct PredicateRead {
     std::vector<std::pair<TabCol, Value>> point_reads;  // 点读：(列, 值) 对
     bool is_empty_result;  // 是否为空结果读
     std::vector<std::pair<TabCol, std::pair<CompOp, Value>>> range_conds;  // 范围条件
+    std::vector<Condition> conds;
+    std::vector<ColMeta> cols;
+};
+
+struct TxnWriteInfo {
+    std::string tab_name;
+    Rid rid;
+    WType type;
+    std::shared_ptr<RmRecord> before;
+    std::shared_ptr<RmRecord> after;
+    bool before_deleted{false};
+    bool after_deleted{false};
 };
 
 struct UndoLog {
@@ -140,6 +153,8 @@ class Transaction {
     std::set<std::pair<std::string, Rid>> read_set_;
     // SSI: 谓词读集合 - 记录事务的范围读/条件读
     std::vector<PredicateRead> predicate_reads_;
+    // SSI: 写集合的前后镜像，用于谓词读/幻读依赖检测
+    std::vector<TxnWriteInfo> ssi_writes_;
     // SSI: rw 反依赖 - (依赖者txn_id, 被依赖者txn_id)
     std::vector<std::pair<txn_id_t, txn_id_t>> rw_deps_;
     // 提交顺序（用于 SSI 危险结构检测）
