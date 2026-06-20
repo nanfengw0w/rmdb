@@ -10,6 +10,8 @@ See the Mulan PSL v2 for more details. */
 
 #include "log_recovery.h"
 #include "record/bitmap.h"
+#include "record/rm_scan.h"
+#include "index/ix.h"
 #include <fstream>
 #include <cstring>
 
@@ -464,6 +466,64 @@ void RecoveryManager::undo() {
     for (auto& entry : sm_manager_->fhs_) {
         int fd = entry.second->GetFd();
         buffer_pool_manager_->flush_all_pages(fd);
+    }
+
+    // Rebuild indexes to be consistent with recovered record data
+    for (auto& fh_entry : sm_manager_->fhs_) {
+        auto& tab_name = fh_entry.first;
+        if (!sm_manager_->db_.is_table(tab_name)) continue;
+        TabMeta& tab = sm_manager_->db_.get_table(tab_name);
+        if (tab.indexes.empty()) continue;
+
+        // Collect index info before destroying
+        std::vector<IndexMeta> indexes = tab.indexes;
+        std::vector<std::vector<std::string>> index_col_names;
+        for (auto& index : indexes) {
+            std::vector<std::string> cols;
+            for (auto& col : index.cols) {
+                cols.push_back(col.name);
+            }
+            index_col_names.push_back(cols);
+        }
+
+        // Destroy and recreate each index
+        for (size_t i = 0; i < indexes.size(); i++) {
+            try {
+                // Destroy old index
+                std::string ix_name = sm_manager_->get_ix_manager()->get_index_name(tab_name, index_col_names[i]);
+                if (sm_manager_->ihs_.count(ix_name)) {
+                    sm_manager_->get_ix_manager()->close_index(sm_manager_->ihs_.at(ix_name).get());
+                    sm_manager_->ihs_.erase(ix_name);
+                }
+                sm_manager_->get_ix_manager()->destroy_index(tab_name, indexes[i].cols);
+
+                // Recreate index
+                sm_manager_->get_ix_manager()->create_index(tab_name, indexes[i].cols);
+                auto ih = sm_manager_->get_ix_manager()->open_index(tab_name, indexes[i].cols);
+
+                // Scan all records and insert into index
+                auto fh = sm_manager_->fhs_.at(tab_name).get();
+                RmScan scan(fh);
+                while (!scan.is_end()) {
+                    auto rid = scan.rid();
+                    auto record = fh->get_record(rid, nullptr);
+                    if (record != nullptr) {
+                        std::vector<char> key(indexes[i].col_tot_len);
+                        int offset = 0;
+                        for (auto& col : indexes[i].cols) {
+                            memcpy(key.data() + offset, record->data + col.offset, col.len);
+                            offset += col.len;
+                        }
+                        ih->insert_entry(key.data(), rid, nullptr);
+                    }
+                    scan.next();
+                }
+                sm_manager_->ihs_.emplace(ix_name, std::move(ih));
+            } catch (std::exception& e) {
+                // Index rebuild failed, continue with other indexes
+                std::cerr << "[Recovery] Index rebuild failed for " << tab_name << ": " << e.what() << std::endl;
+            }
+        }
     }
 
     // Clean up log records
