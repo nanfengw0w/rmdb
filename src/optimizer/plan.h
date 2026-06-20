@@ -43,7 +43,8 @@ typedef enum PlanTag{
     T_NestLoop,
     T_SortMerge,    // sort merge join
     T_Sort,
-    T_Projection
+    T_Projection,
+    T_SetIsolationLevel
 } PlanTag;
 
 // 查询执行计划
@@ -197,6 +198,17 @@ class SetKnobPlan : public Plan
         }
     ast::SetKnobType set_knob_type_;
     bool bool_value_;
+};
+
+// Set Isolation Level Plan
+class SetIsolationLevelPlan : public Plan
+{
+    public:
+        SetIsolationLevelPlan(int level) {
+            Plan::tag = T_SetIsolationLevel;
+            isolation_level_ = level;  // 0 = SNAPSHOT ISOLATION, 1 = SERIALIZABLE
+        }
+    int isolation_level_;
 };
 
 class plannerInfo{

@@ -16,6 +16,8 @@ See the Mulan PSL v2 for more details. */
 #include "index/ix.h"
 #include "system/sm.h"
 
+extern TransactionManager* g_txn_manager;
+
 class InsertExecutor : public AbstractExecutor {
    private:
     TabMeta tab_;                   // 表的元数据
@@ -83,6 +85,17 @@ class InsertExecutor : public AbstractExecutor {
             auto ih = index_maintenance::get_index_handle(sm_manager_, tab_name_, index);
             ih->insert_entry(index_keys[i].data(), rid_, txn);
         }
+
+        // SSI: 检查 rw 依赖
+        if (txn != nullptr && g_txn_manager != nullptr) {
+            auto deps = g_txn_manager->check_rw_on_write(txn, tab_name_, rid_);
+            for (auto& [from, to] : deps) {
+                if (g_txn_manager->add_rw_dependency_and_check(from, to)) {
+                    throw TransactionAbortException(from, AbortReason::DEADLOCK_PREVENTION);
+                }
+            }
+        }
+
         done_ = true;
         return nullptr;
     }

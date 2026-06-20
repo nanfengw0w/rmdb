@@ -172,6 +172,13 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t *txn_id, Co
             break;
         }
         }
+    } else if(auto x = std::dynamic_pointer_cast<SetIsolationLevelPlan>(plan)) {
+        // 设置会话的隔离级别（使用线程ID作为会话标识）
+        IsolationLevel level = (x->isolation_level_ == 0) ?
+            IsolationLevel::SNAPSHOT_ISOLATION : IsolationLevel::SERIALIZABLE;
+        // 使用线程ID作为会话标识
+        int session_id = static_cast<int>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+        txn_mgr_->set_session_isolation_level(session_id, level);
     }
 }
 

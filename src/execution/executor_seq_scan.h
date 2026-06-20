@@ -16,6 +16,9 @@ See the Mulan PSL v2 for more details. */
 #include "index/ix.h"
 #include "system/sm.h"
 
+// 前向声明
+extern TransactionManager* g_txn_manager;
+
 class SeqScanExecutor : public AbstractExecutor {
    private:
     std::string tab_name_;
@@ -30,6 +33,8 @@ class SeqScanExecutor : public AbstractExecutor {
     bool is_end_;
 
     SmManager *sm_manager_;
+
+    TransactionManager* get_txn_manager() { return g_txn_manager; }
 
    public:
     SeqScanExecutor(SmManager *sm_manager, std::string tab_name, std::vector<Condition> conds, Context *context) {
@@ -51,7 +56,21 @@ class SeqScanExecutor : public AbstractExecutor {
         while (!scan_->is_end()) {
             rid_ = scan_->rid();
             auto record = fh_->get_record(rid_, context_);
-            if (eval_conds(record.get(), conds_)) {
+            if (record != nullptr && eval_conds(record.get(), conds_)) {
+                // SSI: 记录读操作
+                if (context_ != nullptr && context_->txn_ != nullptr) {
+                    auto* txn_mgr = get_txn_manager();
+                    if (txn_mgr != nullptr) {
+                        txn_mgr->record_read(context_->txn_, tab_name_, rid_);
+                        // 检查 rw 依赖
+                        auto deps = txn_mgr->check_rw_on_read(context_->txn_, tab_name_, rid_);
+                        for (auto& [from, to] : deps) {
+                            if (txn_mgr->add_rw_dependency_and_check(from, to)) {
+                                throw TransactionAbortException(from, AbortReason::DEADLOCK_PREVENTION);
+                            }
+                        }
+                    }
+                }
                 return;
             }
             scan_->next();
@@ -64,7 +83,21 @@ class SeqScanExecutor : public AbstractExecutor {
         while (!scan_->is_end()) {
             rid_ = scan_->rid();
             auto record = fh_->get_record(rid_, context_);
-            if (eval_conds(record.get(), conds_)) {
+            if (record != nullptr && eval_conds(record.get(), conds_)) {
+                // SSI: 记录读操作
+                if (context_ != nullptr && context_->txn_ != nullptr) {
+                    auto* txn_mgr = get_txn_manager();
+                    if (txn_mgr != nullptr) {
+                        txn_mgr->record_read(context_->txn_, tab_name_, rid_);
+                        // 检查 rw 依赖
+                        auto deps = txn_mgr->check_rw_on_read(context_->txn_, tab_name_, rid_);
+                        for (auto& [from, to] : deps) {
+                            if (txn_mgr->add_rw_dependency_and_check(from, to)) {
+                                throw TransactionAbortException(from, AbortReason::DEADLOCK_PREVENTION);
+                            }
+                        }
+                    }
+                }
                 return;
             }
             scan_->next();

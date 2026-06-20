@@ -245,8 +245,15 @@ struct SetStmt : public TreeNode {
     SetKnobType set_knob_type_;
     bool bool_val_;
 
-    SetStmt(SetKnobType &type, bool bool_value) : 
+    SetStmt(SetKnobType &type, bool bool_value) :
         set_knob_type_(type), bool_val_(bool_value) { }
+};
+
+// set transaction isolation level
+struct SetIsolationLevel : public TreeNode {
+    int level_;  // 0 = SNAPSHOT ISOLATION, 1 = SERIALIZABLE
+
+    SetIsolationLevel(int level) : level_(level) {}
 };
 
 // Semantic value

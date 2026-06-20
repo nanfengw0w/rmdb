@@ -37,6 +37,11 @@ struct Rid {
     }
 
     friend bool operator!=(const Rid &x, const Rid &y) { return !(x == y); }
+
+    friend bool operator<(const Rid &x, const Rid &y) {
+        if (x.page_no != y.page_no) return x.page_no < y.page_no;
+        return x.slot_no < y.slot_no;
+    }
 };
 
 enum ColType {

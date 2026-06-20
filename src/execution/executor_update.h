@@ -18,6 +18,8 @@ See the Mulan PSL v2 for more details. */
 #include "index/ix.h"
 #include "system/sm.h"
 
+extern TransactionManager* g_txn_manager;
+
 class UpdateExecutor : public AbstractExecutor {
    private:
     TabMeta tab_;
@@ -110,6 +112,16 @@ class UpdateExecutor : public AbstractExecutor {
         for (auto &pending : pending_updates) {
             if (txn != nullptr) {
                 txn->append_write_record(new WriteRecord(WType::UPDATE_TUPLE, tab_name_, pending.rid, *pending.old_record));
+            }
+
+            // SSI: 检查 rw 依赖
+            if (txn != nullptr && g_txn_manager != nullptr) {
+                auto deps = g_txn_manager->check_rw_on_write(txn, tab_name_, pending.rid);
+                for (auto& [from, to] : deps) {
+                    if (g_txn_manager->add_rw_dependency_and_check(from, to)) {
+                        throw TransactionAbortException(from, AbortReason::DEADLOCK_PREVENTION);
+                    }
+                }
             }
 
             for (size_t index_no = 0; index_no < tab_.indexes.size(); ++index_no) {

@@ -16,6 +16,8 @@ See the Mulan PSL v2 for more details. */
 #include "index/ix.h"
 #include "system/sm.h"
 
+extern TransactionManager* g_txn_manager;
+
 class DeleteExecutor : public AbstractExecutor {
    private:
     TabMeta tab_;
@@ -49,8 +51,18 @@ class DeleteExecutor : public AbstractExecutor {
                 context_->txn_->append_write_record(new WriteRecord(WType::DELETE_TUPLE, tab_name_, rids_[cur_idx_], *record));
             }
 
-            // Delete index entries first
+            // SSI: 检查 rw 依赖
             Transaction *txn = context_ == nullptr ? nullptr : context_->txn_;
+            if (txn != nullptr && g_txn_manager != nullptr) {
+                auto deps = g_txn_manager->check_rw_on_write(txn, tab_name_, rids_[cur_idx_]);
+                for (auto& [from, to] : deps) {
+                    if (g_txn_manager->add_rw_dependency_and_check(from, to)) {
+                        throw TransactionAbortException(from, AbortReason::DEADLOCK_PREVENTION);
+                    }
+                }
+            }
+
+            // Delete index entries first
             for (size_t i = 0; i < tab_.indexes.size(); ++i) {
                 auto& index = tab_.indexes[i];
                 auto ih = index_maintenance::get_index_handle(sm_manager_, tab_name_, index);

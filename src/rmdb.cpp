@@ -79,6 +79,7 @@ auto ix_manager = std::make_unique<IxManager>(disk_manager.get(), buffer_pool_ma
 auto sm_manager = std::make_unique<SmManager>(disk_manager.get(), buffer_pool_manager.get(), rm_manager.get(), ix_manager.get());
 auto lock_manager = std::make_unique<LockManager>();
 auto txn_manager = std::make_unique<TransactionManager>(lock_manager.get(), sm_manager.get());
+TransactionManager* g_txn_manager = txn_manager.get();
 auto planner = std::make_unique<Planner>(sm_manager.get());
 auto optimizer = std::make_unique<Optimizer>(sm_manager.get(), planner.get());
 auto ql_manager = std::make_unique<QlManager>(sm_manager.get(), txn_manager.get(), planner.get());
@@ -282,6 +283,25 @@ void *client_handler(void *sock_fd) {
 
         memset(data_send, '\0', BUFFER_LENGTH);
         offset = 0;
+
+        // 检查是否是 SET TRANSACTION ISOLATION LEVEL 命令
+        std::string sql_lower_check(data_recv);
+        for (auto &c : sql_lower_check) c = tolower(c);
+        bool is_set_isolation = false;
+        if (sql_lower_check.find("set transaction isolation level") != std::string::npos) {
+            is_set_isolation = true;
+            // 直接设置会话隔离级别，不创建事务
+            IsolationLevel level = IsolationLevel::SERIALIZABLE;
+            if (sql_lower_check.find("snapshot isolation") != std::string::npos) {
+                level = IsolationLevel::SNAPSHOT_ISOLATION;
+            }
+            int session_id = static_cast<int>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+            txn_manager->set_session_isolation_level(session_id, level);
+            // 返回 OK
+            set_response(data_send, &offset, "OK\n");
+            if (write(fd, data_send, offset + 1) == -1) break;
+            continue;
+        }
 
         // 开启事务，初始化系统所需的上下文信息（包括事务对象指针、锁管理器指针、日志管理器指针、存放结果的buffer、记录结果长度的变量）
         auto context = std::make_unique<Context>(lock_manager.get(), log_manager.get(), nullptr, data_send, &offset);

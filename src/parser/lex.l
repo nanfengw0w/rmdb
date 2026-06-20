@@ -88,6 +88,11 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."
 "ASC" { return ASC; }
 "ENABLE_NESTLOOP" { return ENABLE_NESTLOOP; }
 "ENABLE_SORTMERGE" { return ENABLE_SORTMERGE; }
+"TRANSACTION" { return TRANSACTION; }
+"ISOLATION" { return ISOLATION; }
+"LEVEL" { return LEVEL; }
+"SNAPSHOT" { return SNAPSHOT; }
+"SERIALIZABLE" { return SERIALIZABLE; }
 "TRUE" { 
     yylval->sv_bool = true;
     return VALUE_BOOL; 
@@ -109,6 +114,21 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."
     }
     if (strcasecmp(yytext, "enable_sortmerge") == 0) {
         return ENABLE_SORTMERGE;
+    }
+    if (strcasecmp(yytext, "transaction") == 0) {
+        return TRANSACTION;
+    }
+    if (strcasecmp(yytext, "isolation") == 0) {
+        return ISOLATION;
+    }
+    if (strcasecmp(yytext, "level") == 0) {
+        return LEVEL;
+    }
+    if (strcasecmp(yytext, "snapshot") == 0) {
+        return SNAPSHOT;
+    }
+    if (strcasecmp(yytext, "serializable") == 0) {
+        return SERIALIZABLE;
     }
     if (strcasecmp(yytext, "true") == 0) {
         yylval->sv_bool = true;

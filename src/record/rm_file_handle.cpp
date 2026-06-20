@@ -1,4 +1,4 @@
-﻿/* Copyright (c) 2023 Renmin University of China
+/* Copyright (c) 2023 Renmin University of China
 RMDB is licensed under Mulan PSL v2.
 You can use this software according to the terms and conditions of the Mulan PSL v2.
 You may obtain a copy of Mulan PSL v2 at:
@@ -9,11 +9,36 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #include "rm_file_handle.h"
+#include "transaction/version_manager.h"
+#include "transaction/transaction_manager.h"
+
+// 外部全局变量
+extern TransactionManager* g_txn_manager;
 
 std::unique_ptr<RmRecord> RmFileHandle::get_record(const Rid& rid, Context* context) const {
     RmPageHandle page_handle = fetch_page_handle(rid.page_no);
     auto rec = std::make_unique<RmRecord>(file_hdr_.record_size, page_handle.get_slot(rid.slot_no));
     buffer_pool_manager_->unpin_page(PageId{fd_, rid.page_no}, false);
+
+    // MVCC: 检查版本可见性
+    if (context != nullptr && context->txn_ != nullptr) {
+        IsolationLevel level = context->txn_->get_isolation_level();
+        if (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE) {
+            auto& vm = VersionManager::instance();
+            bool is_deleted = false;
+            RmRecord* visible_data = vm.get_visible_version(fd_, rid, context->txn_, is_deleted);
+
+            if (visible_data != nullptr) {
+                // 有可见版本
+                if (is_deleted) {
+                    return nullptr;  // 记录已被删除
+                }
+                return std::make_unique<RmRecord>(*visible_data);
+            }
+            // 没有可见版本，返回原始数据
+        }
+    }
+
     return rec;
 }
 
@@ -37,7 +62,19 @@ Rid RmFileHandle::insert_record(char* buf, Context* context) {
     int page_no = page_handle.page->get_page_id().page_no;
     buffer_pool_manager_->unpin_page(PageId{fd_, page_no}, true);
 
-    return Rid{page_no, slot_no};
+    Rid rid{page_no, slot_no};
+
+    // MVCC: 记录插入操作
+    if (context != nullptr && context->txn_ != nullptr) {
+        IsolationLevel level = context->txn_->get_isolation_level();
+        if (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE) {
+            auto& vm = VersionManager::instance();
+            RmRecord new_rec(file_hdr_.record_size, buf);
+            vm.record_write(fd_, rid, context->txn_, &new_rec, false);
+        }
+    }
+
+    return rid;
 }
 
 void RmFileHandle::insert_record(const Rid& rid, char* buf) {
@@ -62,6 +99,27 @@ void RmFileHandle::delete_record(const Rid& rid, Context* context) {
         throw RecordNotFoundError(rid.page_no, rid.slot_no);
     }
 
+    // MVCC: 检查写写冲突并记录删除操作
+    if (context != nullptr && context->txn_ != nullptr) {
+        IsolationLevel level = context->txn_->get_isolation_level();
+        if (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE) {
+            auto& vm = VersionManager::instance();
+
+            // 检查写写冲突
+            RmRecord* old_data = nullptr;
+            if (!vm.check_write_conflict(fd_, rid, context->txn_, old_data)) {
+                buffer_pool_manager_->unpin_page(PageId{fd_, rid.page_no}, false);
+                // 写写冲突，抛出异常
+                throw TransactionAbortException(context->txn_->get_transaction_id(),
+                    AbortReason::DEADLOCK_PREVENTION);
+            }
+
+            // 记录删除操作
+            RmRecord current_data(file_hdr_.record_size, page_handle.get_slot(rid.slot_no));
+            vm.record_write(fd_, rid, context->txn_, &current_data, true);
+        }
+    }
+
     Bitmap::reset(page_handle.bitmap, rid.slot_no);
 
     page_handle.page_hdr->num_records--;
@@ -79,6 +137,27 @@ void RmFileHandle::update_record(const Rid& rid, char* buf, Context* context) {
 
     if (!Bitmap::is_set(page_handle.bitmap, rid.slot_no)) {
         throw RecordNotFoundError(rid.page_no, rid.slot_no);
+    }
+
+    // MVCC: 检查写写冲突并记录更新操作
+    if (context != nullptr && context->txn_ != nullptr) {
+        IsolationLevel level = context->txn_->get_isolation_level();
+        if (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE) {
+            auto& vm = VersionManager::instance();
+
+            // 检查写写冲突
+            RmRecord* old_data = nullptr;
+            if (!vm.check_write_conflict(fd_, rid, context->txn_, old_data)) {
+                buffer_pool_manager_->unpin_page(PageId{fd_, rid.page_no}, false);
+                // 写写冲突，抛出异常
+                throw TransactionAbortException(context->txn_->get_transaction_id(),
+                    AbortReason::DEADLOCK_PREVENTION);
+            }
+
+            // 记录更新操作（保存新数据）
+            RmRecord new_rec(file_hdr_.record_size, buf);
+            vm.record_write(fd_, rid, context->txn_, &new_rec, false);
+        }
     }
 
     memcpy(page_handle.get_slot(rid.slot_no), buf, file_hdr_.record_size);

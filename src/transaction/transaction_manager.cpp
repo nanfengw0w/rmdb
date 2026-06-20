@@ -9,34 +9,57 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #include "transaction_manager.h"
+#include "transaction/version_manager.h"
 #include "record/rm_file_handle.h"
 #include "system/sm_manager.h"
 
 std::unordered_map<txn_id_t, Transaction *> TransactionManager::txn_map = {};
 
 /**
- * @description: äºå¡çå¼å§æ¹æ³
- * @return {Transaction*} å¼å§äºå¡çæé
- * @param {Transaction*} txn äºå¡æéï¼ç©ºæéä»£è¡¨éè¦åå»ºæ°äºå¡ï¼å¦åå¼å§å·²æäºå¡
- * @param {LogManager*} log_manager æ¥å¿ç®¡çå¨æé
+ * @description: 事务的开始方法
  */
 Transaction * TransactionManager::begin(Transaction* txn, LogManager* log_manager) {
     if (txn == nullptr) {
         txn = new Transaction(next_txn_id_++);
     }
+
+    // 使用会话的隔离级别
+    int session_id = static_cast<int>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+    IsolationLevel session_level = get_session_isolation_level(session_id);
+    txn->set_isolation_level(session_level);
+
     txn->set_state(TransactionState::GROWING);
+
+    // MVCC: 分配开始时间戳
+    IsolationLevel level = txn->get_isolation_level();
+    if (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE) {
+        txn->set_start_ts(get_next_timestamp());
+    }
+
     txn_map[txn->get_transaction_id()] = txn;
     return txn;
 }
 
 /**
- * @description: äºå¡çæäº¤æ¹æ³
- * @param {Transaction*} txn éè¦æäº¤çäºå¡
- * @param {LogManager*} log_manager æ¥å¿ç®¡çå¨æé
+ * @description: 事务的提交方法
  */
 void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     if (txn == nullptr) return;
+
+    IsolationLevel level = txn->get_isolation_level();
+    if (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE) {
+        // MVCC: 分配提交时间戳和提交顺序
+        timestamp_t commit_ts = get_next_timestamp();
+        txn->set_commit_ts(commit_ts);
+        txn->commit_order_ = global_commit_order_++;
+
+        // 提交版本管理器中的所有写操作
+        auto& vm = VersionManager::instance();
+        vm.commit_transaction(txn->get_transaction_id(), commit_ts);
+    }
+
     txn->set_state(TransactionState::COMMITTED);
+
     // Release all locks held by this transaction
     auto lock_set = txn->get_lock_set();
     for (auto &lock_data_id : *lock_set) {
@@ -45,36 +68,38 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
 }
 
 /**
- * @description: äºå¡çç»æ­¢ï¼åæ»ï¼æ¹æ³
- * @param {Transaction *} txn éè¦åæ»çäºå¡
- * @param {LogManager} *log_manager æ¥å¿ç®¡çå¨æé
+ * @description: 事务的终止（回滚）方法
  */
 void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
     if (txn == nullptr) return;
 
-    // Undo all write operations in reverse order
-    auto write_set = txn->get_write_set();
-    for (auto it = write_set->rbegin(); it != write_set->rend(); ++it) {
-        WriteRecord *wr = *it;
-        auto &tab_name = wr->GetTableName();
-        auto &rid = wr->GetRid();
-        auto fh = sm_manager_->fhs_.at(tab_name).get();
+    IsolationLevel level = txn->get_isolation_level();
+    if (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE) {
+        // MVCC: 回滚版本管理器中的所有写操作
+        auto& vm = VersionManager::instance();
+        vm.abort_transaction(txn->get_transaction_id());
+    } else {
+        // 非MVCC模式：Undo all write operations in reverse order
+        auto write_set = txn->get_write_set();
+        for (auto it = write_set->rbegin(); it != write_set->rend(); ++it) {
+            WriteRecord *wr = *it;
+            auto &tab_name = wr->GetTableName();
+            auto &rid = wr->GetRid();
+            auto fh = sm_manager_->fhs_.at(tab_name).get();
 
-        switch (wr->GetWriteType()) {
-            case WType::INSERT_TUPLE: {
-                // Undo insert -> delete the record
-                fh->delete_record(rid, nullptr);
-                break;
-            }
-            case WType::DELETE_TUPLE: {
-                // Undo delete -> re-insert the record
-                fh->insert_record(rid, wr->GetRecord().data);
-                break;
-            }
-            case WType::UPDATE_TUPLE: {
-                // Undo update -> restore old record
-                fh->update_record(rid, wr->GetRecord().data, nullptr);
-                break;
+            switch (wr->GetWriteType()) {
+                case WType::INSERT_TUPLE: {
+                    fh->delete_record(rid, nullptr);
+                    break;
+                }
+                case WType::DELETE_TUPLE: {
+                    fh->insert_record(rid, wr->GetRecord().data);
+                    break;
+                }
+                case WType::UPDATE_TUPLE: {
+                    fh->update_record(rid, wr->GetRecord().data, nullptr);
+                    break;
+                }
             }
         }
     }
@@ -85,5 +110,42 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
         lock_manager_->unlock(txn, lock_data_id);
     }
 
+    // 清理 SSI 状态
+    txn->read_set_.clear();
+    txn->predicate_reads_.clear();
+    txn->rw_deps_.clear();
+
     txn->set_state(TransactionState::ABORTED);
+}
+
+/**
+ * @brief SSI: 检查危险结构
+ */
+bool TransactionManager::check_dangerous_structure(Transaction* txn) {
+    // 检查是否存在两个事务互相有 rw 依赖
+    for (auto& [tin_id, tout_id] : txn->rw_deps_) {
+        // txn ->rw tout_id
+        if (tin_id != txn->get_transaction_id()) continue;
+
+        Transaction* tout = get_transaction(tout_id);
+        if (tout == nullptr || tout->get_state() != TransactionState::GROWING) continue;
+
+        // 检查 tout 是否也有依赖到 txn
+        for (auto& [tin2_id, tout2_id] : tout->rw_deps_) {
+            if (tin2_id == tout_id && tout2_id == txn->get_transaction_id()) {
+                return true;  // 危险结构
+            }
+        }
+    }
+
+    return false;
+}
+
+// 辅助函数：从表名获取文件描述符
+int TransactionManager::fd_from_tab_name(const std::string& tab_name) {
+    auto it = sm_manager_->fhs_.find(tab_name);
+    if (it != sm_manager_->fhs_.end()) {
+        return it->second->GetFd();
+    }
+    return -1;
 }

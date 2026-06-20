@@ -13,6 +13,7 @@ See the Mulan PSL v2 for more details. */
 #include <atomic>
 #include <deque>
 #include <memory>
+#include <set>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -37,6 +38,14 @@ struct UndoLink {
 
   /* Checks if the undo link points to something. */
   bool IsValid() { return prev_txn_ != INVALID_TXN_ID; }
+};
+
+// SSI: 记录读信息（用于谓词读跟踪）
+struct PredicateRead {
+    std::string tab_name;
+    std::vector<std::pair<TabCol, Value>> point_reads;  // 点读：(列, 值) 对
+    bool is_empty_result;  // 是否为空结果读
+    std::vector<std::pair<TabCol, std::pair<CompOp, Value>>> range_conds;  // 范围条件
 };
 
 struct UndoLog {
@@ -79,6 +88,7 @@ class Transaction {
     inline timestamp_t get_start_ts() { return start_ts_; }
 
     inline IsolationLevel get_isolation_level() { return isolation_level_; }
+    inline void set_isolation_level(IsolationLevel level) { isolation_level_ = level; }
 
     inline TransactionState get_state() { return state_; }
     inline void set_state(TransactionState state) { state_ = state; }
@@ -99,6 +109,7 @@ class Transaction {
 
     inline timestamp_t get_read_ts() const { return read_ts_; }
     inline timestamp_t get_commit_ts() const { return commit_ts_; }
+    inline void set_commit_ts(timestamp_t ts) { commit_ts_ = ts; }
 
     /** 修改现有的撤销日志 */
     inline auto ModifyUndoLog(int log_idx, UndoLog new_log) {
@@ -123,6 +134,18 @@ class Transaction {
         return undo_logs_.size();
       }
 
+
+   public:
+    // SSI: 读集合 - 记录事务读过的记录标识 (table_name, rid)
+    std::set<std::pair<std::string, Rid>> read_set_;
+    // SSI: 谓词读集合 - 记录事务的范围读/条件读
+    std::vector<PredicateRead> predicate_reads_;
+    // SSI: rw 反依赖 - (依赖者txn_id, 被依赖者txn_id)
+    std::vector<std::pair<txn_id_t, txn_id_t>> rw_deps_;
+    // 提交顺序（用于 SSI 危险结构检测）
+    int64_t commit_order_{-1};
+    // 会话 ID（用于区分不同会话）
+    int session_id_{-1};
 
    private:
     bool txn_mode_;                   // 用于标识当前事务为显式事务还是单条SQL语句的隐式事务
