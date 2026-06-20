@@ -24,17 +24,17 @@ std::unique_ptr<RmRecord> RmFileHandle::get_record(const Rid& rid, Context* cont
         IsolationLevel level = context->txn_->get_isolation_level();
         if (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE) {
             auto& vm = VersionManager::instance();
-            bool found = false;
             bool is_deleted = false;
-            RmRecord* visible = vm.get_visible_version(fd_, rid, context->txn_, found, is_deleted);
+            RmRecord* old_data = vm.get_visible_data(fd_, rid, context->txn_, is_deleted);
 
-            if (found) {
+            if (old_data != nullptr) {
+                // 有需要回退的版本（其他事务的未提交写操作或快照不可见的写操作）
                 if (is_deleted) {
-                    return nullptr;  // 记录已被删除
+                    return nullptr;  // 记录在那个版本中被删除
                 }
-                return std::make_unique<RmRecord>(*visible);
+                return std::make_unique<RmRecord>(*old_data);
             }
-            // 没有可见版本，使用磁盘数据
+            // 没有需要回退的版本，从磁盘读取最新数据
         }
     }
 
@@ -63,13 +63,12 @@ Rid RmFileHandle::insert_record(char* buf, Context* context) {
 
     Rid rid{page_no, slot_no};
 
-    // MVCC: 记录插入操作
+    // MVCC: 记录插入操作（旧数据为空，表示之前记录不存在）
     if (context != nullptr && context->txn_ != nullptr) {
         IsolationLevel level = context->txn_->get_isolation_level();
         if (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE) {
             auto& vm = VersionManager::instance();
-            RmRecord new_rec(file_hdr_.record_size, buf);
-            vm.record_write(fd_, rid, context->txn_, &new_rec, false);
+            vm.save_old_data(fd_, rid, context->txn_, nullptr, true);  // 之前不存在
         }
     }
 
@@ -98,7 +97,7 @@ void RmFileHandle::delete_record(const Rid& rid, Context* context) {
         throw RecordNotFoundError(rid.page_no, rid.slot_no);
     }
 
-    // MVCC: 检查写写冲突并记录删除操作
+    // MVCC: 检查写写冲突并保存旧数据
     if (context != nullptr && context->txn_ != nullptr) {
         IsolationLevel level = context->txn_->get_isolation_level();
         if (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE) {
@@ -110,7 +109,9 @@ void RmFileHandle::delete_record(const Rid& rid, Context* context) {
                     AbortReason::DEADLOCK_PREVENTION);
             }
 
-            vm.record_write(fd_, rid, context->txn_, nullptr, true);
+            // 保存旧数据
+            RmRecord old_data(file_hdr_.record_size, page_handle.get_slot(rid.slot_no));
+            vm.save_old_data(fd_, rid, context->txn_, &old_data, false);
         }
     }
 
@@ -133,7 +134,7 @@ void RmFileHandle::update_record(const Rid& rid, char* buf, Context* context) {
         throw RecordNotFoundError(rid.page_no, rid.slot_no);
     }
 
-    // MVCC: 检查写写冲突并记录更新操作
+    // MVCC: 检查写写冲突并保存旧数据
     if (context != nullptr && context->txn_ != nullptr) {
         IsolationLevel level = context->txn_->get_isolation_level();
         if (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE) {
@@ -145,8 +146,9 @@ void RmFileHandle::update_record(const Rid& rid, char* buf, Context* context) {
                     AbortReason::DEADLOCK_PREVENTION);
             }
 
-            RmRecord new_rec(file_hdr_.record_size, buf);
-            vm.record_write(fd_, rid, context->txn_, &new_rec, false);
+            // 保存旧数据
+            RmRecord old_data(file_hdr_.record_size, page_handle.get_slot(rid.slot_no));
+            vm.save_old_data(fd_, rid, context->txn_, &old_data, false);
         }
     }
 

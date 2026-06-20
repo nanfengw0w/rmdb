@@ -78,6 +78,30 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
         // MVCC: 回滚版本管理器中的所有写操作
         auto& vm = VersionManager::instance();
         vm.abort_transaction(txn->get_transaction_id());
+
+        // 使用write_set恢复旧数据到磁盘（与非MVCC模式相同）
+        auto write_set = txn->get_write_set();
+        for (auto it = write_set->rbegin(); it != write_set->rend(); ++it) {
+            WriteRecord *wr = *it;
+            auto &tab_name = wr->GetTableName();
+            auto &rid = wr->GetRid();
+            auto fh = sm_manager_->fhs_.at(tab_name).get();
+
+            switch (wr->GetWriteType()) {
+                case WType::INSERT_TUPLE: {
+                    fh->delete_record(rid, nullptr);
+                    break;
+                }
+                case WType::DELETE_TUPLE: {
+                    fh->insert_record(rid, wr->GetRecord().data);
+                    break;
+                }
+                case WType::UPDATE_TUPLE: {
+                    fh->update_record(rid, wr->GetRecord().data, nullptr);
+                    break;
+                }
+            }
+        }
     } else {
         // 非MVCC模式：Undo all write operations in reverse order
         auto write_set = txn->get_write_set();
