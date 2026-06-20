@@ -17,12 +17,30 @@ See the Mulan PSL v2 for more details. */
  * @return {lsn_t} 返回该日志的日志记录号
  */
 lsn_t LogManager::add_log_to_buffer(LogRecord* log_record) {
-  
+    std::lock_guard<std::mutex> lock(latch_);
+
+    lsn_t lsn = global_lsn_++;
+    log_record->lsn_ = lsn;
+
+    int size = log_record->log_tot_len_;
+    if (log_buffer_.is_full(size)) {
+        flush_log_to_disk();
+    }
+
+    log_record->serialize(log_buffer_.buffer_ + log_buffer_.offset_);
+    log_buffer_.offset_ += size;
+
+    return lsn;
 }
 
 /**
  * @description: 把日志缓冲区的内容刷到磁盘中，由于目前只设置了一个缓冲区，因此需要阻塞其他日志操作
  */
 void LogManager::flush_log_to_disk() {
-
+    if (log_buffer_.offset_ > 0) {
+        disk_manager_->write_log(log_buffer_.buffer_, log_buffer_.offset_);
+        persist_lsn_ = global_lsn_ - 1;
+        log_buffer_.offset_ = 0;
+        memset(log_buffer_.buffer_, 0, LOG_BUFFER_SIZE);
+    }
 }

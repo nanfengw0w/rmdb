@@ -37,6 +37,16 @@ Transaction * TransactionManager::begin(Transaction* txn, LogManager* log_manage
     }
 
     txn_map[txn->get_transaction_id()] = txn;
+
+    // WAL: Write begin log record and flush
+    if (log_manager != nullptr) {
+        BeginLogRecord begin_log(txn->get_transaction_id());
+        lsn_t lsn = log_manager->add_log_to_buffer(&begin_log);
+        txn->set_prev_lsn(lsn);
+        log_manager->flush_log_to_disk();
+        log_manager->add_active_txn(txn->get_transaction_id());
+    }
+
     return txn;
 }
 
@@ -63,6 +73,15 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     }
 
     txn->set_state(TransactionState::COMMITTED);
+
+    // WAL: Write commit log record and flush
+    if (log_manager != nullptr) {
+        CommitLogRecord commit_log(txn->get_transaction_id(), txn->get_prev_lsn());
+        lsn_t lsn = log_manager->add_log_to_buffer(&commit_log);
+        txn->set_prev_lsn(lsn);
+        log_manager->flush_log_to_disk();
+        log_manager->remove_active_txn(txn->get_transaction_id());
+    }
 
     // Release all locks held by this transaction
     auto lock_set = txn->get_lock_set();
@@ -144,6 +163,15 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
     txn->predicate_reads_.clear();
     txn->ssi_writes_.clear();
     txn->rw_deps_.clear();
+
+    // WAL: Write abort log record
+    if (log_manager != nullptr) {
+        AbortLogRecord abort_log(txn->get_transaction_id(), txn->get_prev_lsn());
+        lsn_t lsn = log_manager->add_log_to_buffer(&abort_log);
+        txn->set_prev_lsn(lsn);
+        log_manager->flush_log_to_disk();
+        log_manager->remove_active_txn(txn->get_transaction_id());
+    }
 
     txn->set_state(TransactionState::ABORTED);
 }

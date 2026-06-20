@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 
 #include <map>
 #include <unordered_map>
+#include <set>
 #include "log_manager.h"
 #include "storage/disk_manager.h"
 #include "system/sm_manager.h"
@@ -39,4 +40,13 @@ private:
     DiskManager* disk_manager_;                                     // 用来读写文件
     BufferPoolManager* buffer_pool_manager_;                        // 对页面进行读写
     SmManager* sm_manager_;                                         // 访问数据库元数据
+
+    // Recovery state
+    std::vector<LogRecord*> log_records_;                           // 从磁盘读取的所有日志记录
+    lsn_t checkpoint_lsn_;                                          // 检查点LSN
+    std::set<txn_id_t> undo_txns_;                                  // 需要undo的事务集合
+    std::set<txn_id_t> redo_txns_;                                  // 需要redo的事务集合（已提交）
+    // txn_id -> list of (log_record_index) for undo operations
+    std::unordered_map<txn_id_t, std::vector<int>> txn_ops_;        // 每个事务的操作列表
+    lsn_t min_rec_lsn_;                                             // 需要redo的最小LSN
 };

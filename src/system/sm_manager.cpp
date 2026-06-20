@@ -128,6 +128,16 @@ void SmManager::open_db(const std::string& db_name) {
     }
     ifs >> db_;
     ifs.close();
+
+    // Open log file for WAL
+    try {
+        disk_manager_->create_file(LOG_FILE_NAME);
+    } catch (FileExistsError &) {
+        // log file already exists, that's expected
+    }
+    int log_fd = disk_manager_->open_file(LOG_FILE_NAME);
+    disk_manager_->SetLogFd(log_fd);
+
     for (auto &entry : db_.tabs_) {
         auto &tab_name = entry.first;
         fhs_.emplace(tab_name, rm_manager_->open_file(tab_name));

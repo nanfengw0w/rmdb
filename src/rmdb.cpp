@@ -359,6 +359,50 @@ void *client_handler(void *sock_fd) {
             continue;
         }
 
+        // Handle create static_checkpoint
+        {
+            std::string cmd_check(data_recv);
+            // Trim whitespace
+            size_t s = cmd_check.find_first_not_of(" \t\r\n");
+            if (s != std::string::npos) cmd_check = cmd_check.substr(s);
+            while (!cmd_check.empty() && (cmd_check.back() == ';' || cmd_check.back() == ' ' || cmd_check.back() == '\n' || cmd_check.back() == '\r'))
+                cmd_check.pop_back();
+            std::string cmd_lower_ck = cmd_check;
+            for (auto &c : cmd_lower_ck) c = tolower(c);
+            if (cmd_lower_ck == "create static_checkpoint") {
+                try {
+                    // (1) Flush log buffer to disk
+                    log_manager->flush_log_to_disk();
+
+                    // (2) Write checkpoint record to log
+                    auto active_txns = log_manager->get_active_txns();
+                    lsn_t current_lsn = 0; // will be assigned by add_log_to_buffer
+                    {
+                        CheckpointLogRecord ckpt(current_lsn, active_txns);
+                        current_lsn = log_manager->add_log_to_buffer(&ckpt);
+                    }
+                    log_manager->flush_log_to_disk();
+
+                    // (3) Flush all dirty pages to disk
+                    for (auto &entry : sm_manager->fhs_) {
+                        int fd_table = entry.second->GetFd();
+                        buffer_pool_manager->flush_all_pages(fd_table);
+                    }
+
+                    // (4) Write checkpoint LSN to restart file
+                    std::ofstream ofs("checkpoint.lsn", std::ios::trunc);
+                    ofs << current_lsn;
+                    ofs.close();
+
+                    set_response(data_send, &offset, "OK\n");
+                } catch (std::exception &e) {
+                    set_response(data_send, &offset, std::string("Error: ") + e.what() + "\n");
+                }
+                if (write(fd, data_send, offset + 1) == -1) break;
+                continue;
+            }
+        }
+
         std::cout << "Read from client " << fd << ": " << data_recv << std::endl;
 
         // 检查是否是 SET TRANSACTION ISOLATION LEVEL 命令（必须在aggregate处理之前）

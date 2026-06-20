@@ -15,6 +15,7 @@ See the Mulan PSL v2 for more details. */
 #include "executor_abstract.h"
 #include "index/ix.h"
 #include "system/sm.h"
+#include "recovery/log_manager.h"
 
 extern TransactionManager* g_txn_manager;
 
@@ -60,6 +61,15 @@ class DeleteExecutor : public AbstractExecutor {
             }
 
             fh_->delete_record(rids_[cur_idx_], context_);
+
+            // WAL: Write delete log record and flush
+            if (context_ != nullptr && context_->txn_ != nullptr && context_->log_mgr_ != nullptr) {
+                DeleteLogRecord delete_log(context_->txn_->get_transaction_id(), *record,
+                                           rids_[cur_idx_], tab_name_);
+                lsn_t lsn = context_->log_mgr_->add_log_to_buffer(&delete_log);
+                context_->txn_->set_prev_lsn(lsn);
+                context_->log_mgr_->flush_log_to_disk();
+            }
 
             // Record write operation for transaction abort (save old value)
             if (context_ != nullptr && context_->txn_ != nullptr) {

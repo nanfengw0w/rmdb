@@ -18,6 +18,7 @@ See the Mulan PSL v2 for more details. */
 #include "executor_abstract.h"
 #include "index/ix.h"
 #include "system/sm.h"
+#include "recovery/log_manager.h"
 
 extern TransactionManager* g_txn_manager;
 
@@ -182,6 +183,16 @@ class UpdateExecutor : public AbstractExecutor {
             }
 
             fh_->update_record(pending.rid, pending.new_record->data, context_);
+
+            // WAL: Write update log record and flush
+            if (txn != nullptr && context_->log_mgr_ != nullptr) {
+                UpdateLogRecord update_log(txn->get_transaction_id(), *pending.old_record,
+                                           *pending.new_record, pending.rid, tab_name_);
+                lsn_t lsn = context_->log_mgr_->add_log_to_buffer(&update_log);
+                txn->set_prev_lsn(lsn);
+                context_->log_mgr_->flush_log_to_disk();
+            }
+
             if (txn != nullptr) {
                 txn->append_write_record(new WriteRecord(WType::UPDATE_TUPLE, tab_name_, pending.rid, *pending.old_record));
                 if (g_txn_manager != nullptr) {
