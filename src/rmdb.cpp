@@ -171,6 +171,25 @@ void *client_handler(void *sock_fd) {
 
         std::cout << "Read from client " << fd << ": " << data_recv << std::endl;
 
+        // 检查是否是 SET TRANSACTION ISOLATION LEVEL 命令（必须在aggregate处理之前）
+        {
+            std::string sql_lower_check(data_recv);
+            for (auto &c : sql_lower_check) c = tolower(c);
+            if (sql_lower_check.find("set transaction isolation level") != std::string::npos) {
+                // 直接设置会话隔离级别，不创建事务
+                IsolationLevel level = IsolationLevel::SERIALIZABLE;
+                if (sql_lower_check.find("snapshot isolation") != std::string::npos) {
+                    level = IsolationLevel::SNAPSHOT_ISOLATION;
+                }
+                int session_id = static_cast<int>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+                txn_manager->set_session_isolation_level(session_id, level);
+                // 返回 OK
+                set_response(data_send, &offset, "OK\n");
+                if (write(fd, data_send, offset + 1) == -1) break;
+                continue;
+            }
+        }
+
         // Handle aggregate queries (GROUP BY, HAVING, LIMIT, aggregate functions, multi-col ORDER BY)
         {
             std::string sql_raw(data_recv);
@@ -283,25 +302,6 @@ void *client_handler(void *sock_fd) {
 
         memset(data_send, '\0', BUFFER_LENGTH);
         offset = 0;
-
-        // 检查是否是 SET TRANSACTION ISOLATION LEVEL 命令
-        std::string sql_lower_check(data_recv);
-        for (auto &c : sql_lower_check) c = tolower(c);
-        bool is_set_isolation = false;
-        if (sql_lower_check.find("set transaction isolation level") != std::string::npos) {
-            is_set_isolation = true;
-            // 直接设置会话隔离级别，不创建事务
-            IsolationLevel level = IsolationLevel::SERIALIZABLE;
-            if (sql_lower_check.find("snapshot isolation") != std::string::npos) {
-                level = IsolationLevel::SNAPSHOT_ISOLATION;
-            }
-            int session_id = static_cast<int>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
-            txn_manager->set_session_isolation_level(session_id, level);
-            // 返回 OK
-            set_response(data_send, &offset, "OK\n");
-            if (write(fd, data_send, offset + 1) == -1) break;
-            continue;
-        }
 
         // 开启事务，初始化系统所需的上下文信息（包括事务对象指针、锁管理器指针、日志管理器指针、存放结果的buffer、记录结果长度的变量）
         auto context = std::make_unique<Context>(lock_manager.get(), log_manager.get(), nullptr, data_send, &offset);
