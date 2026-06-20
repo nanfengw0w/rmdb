@@ -23,22 +23,23 @@ See the Mulan PSL v2 for more details. */
 class Transaction;
 
 /**
- * @brief 版本信息 - 存储每个记录版本的元数据
+ * @brief 版本条目 - 存储每个记录版本的元数据
  */
 struct VersionEntry {
     txn_id_t txn_id_{INVALID_TXN_ID};  // 创建此版本的事务ID
     timestamp_t commit_ts_{0};          // 提交时间戳（0表示未提交）
     bool is_deleted_{false};            // 是否为删除标记
-    std::shared_ptr<RmRecord> data_;    // 此版本的数据
+    std::shared_ptr<RmRecord> data_;    // 此版本的数据（旧版本）
 };
 
 /**
  * @brief 版本管理器 - 管理所有记录的版本链
  *
  * 核心设计：
- * 1. 每条记录有一个版本链，存储该记录的所有历史版本
- * 2. 写操作前检查写写冲突
- * 3. 读操作时沿版本链找到可见版本
+ * 1. 版本链存储的是旧版本数据
+ * 2. 磁盘上存储的是最新数据
+ * 3. 写操作时，将旧数据保存到版本链，然后写入新数据
+ * 4. 读操作时，先检查版本链找到可见版本，如果没有则读磁盘
  */
 class VersionManager {
 public:
@@ -73,89 +74,63 @@ public:
      * 规则：
      * 1. 如果记录被另一个未提交事务修改，返回 false（写写冲突）
      * 2. 如果记录在本事务开始后被其他事务提交修改，返回 false（first-updater-wins）
-     *
-     * @param fd 文件描述符
-     * @param rid 记录ID
-     * @param txn 当前事务
-     * @param old_data 输出参数：如果可以写，返回当前可见版本的数据（用于保存旧版本）
-     * @return true 如果可以写，false 如果有冲突
      */
-    bool check_write_conflict(int fd, const Rid& rid, Transaction* txn, RmRecord*& old_data) {
+    bool check_write_conflict(int fd, const Rid& rid, Transaction* txn) {
         VersionKey key{fd, rid.page_no, rid.slot_no};
         std::lock_guard<std::mutex> lock(mutex_);
 
-        auto& chain = version_chains_[key];
-
-        // 找到对当前事务可见的最新版本
-        VersionEntry* visible_version = nullptr;
-        for (auto& entry : chain) {
-            // 自己写的数据总是可见
-            if (entry.txn_id_ == txn->get_transaction_id()) {
-                visible_version = &entry;
-                break;
-            }
-            // 未提交的数据不可见
-            if (entry.commit_ts_ == 0) {
-                continue;
-            }
-            // 已提交的数据，检查时间戳
-            if (entry.commit_ts_ <= txn->get_start_ts()) {
-                visible_version = &entry;
-                break;
-            }
+        auto it = version_chains_.find(key);
+        if (it == version_chains_.end()) {
+            return true;  // 没有版本信息，可以写
         }
 
-        // 检查是否有其他未提交事务正在修改此记录
-        if (!chain.empty()) {
-            auto& latest = chain.front();
-            if (latest.txn_id_ != txn->get_transaction_id() && latest.commit_ts_ == 0) {
-                // 另一个事务正在修改此记录，写写冲突
-                return false;
-            }
+        auto& chain = it->second;
+        if (chain.empty()) {
+            return true;
         }
 
-        // 检查是否有其他事务在本事务开始后提交了修改
-        if (!chain.empty()) {
-            auto& latest = chain.front();
-            if (latest.txn_id_ != txn->get_transaction_id() &&
-                latest.commit_ts_ > 0 &&
-                latest.commit_ts_ > txn->get_start_ts()) {
-                // 此记录已被其他事务在本事务开始后提交修改
-                return false;
-            }
+        // 检查最新版本
+        auto& latest = chain.back();
+
+        // 如果最新版本是自己创建的，可以写
+        if (latest.txn_id_ == txn->get_transaction_id()) {
+            return true;
         }
 
-        // 返回可见版本的数据
-        if (visible_version && !visible_version->is_deleted_) {
-            old_data = visible_version->data_.get();
-        } else {
-            old_data = nullptr;
+        // 如果最新版本未提交，写写冲突
+        if (latest.commit_ts_ == 0) {
+            return false;
+        }
+
+        // 如果最新版本在本事务开始后提交，写写冲突（first-updater-wins）
+        if (latest.commit_ts_ > txn->get_start_ts()) {
+            return false;
         }
 
         return true;
     }
 
     /**
-     * @brief 记录写操作（在写操作成功后调用）
+     * @brief 保存旧版本（在写操作前调用）
+     * @param old_data 当前磁盘上的数据
      */
-    void record_write(int fd, const Rid& rid, Transaction* txn,
-                      const RmRecord* new_data, bool is_delete) {
+    void save_old_version(int fd, const Rid& rid, Transaction* txn,
+                          const RmRecord* old_data, bool was_deleted) {
         VersionKey key{fd, rid.page_no, rid.slot_no};
         std::lock_guard<std::mutex> lock(mutex_);
 
         auto& chain = version_chains_[key];
 
-        // 创建新版本
-        VersionEntry new_entry;
-        new_entry.txn_id_ = txn->get_transaction_id();
-        new_entry.commit_ts_ = 0;  // 未提交
-        new_entry.is_deleted_ = is_delete;
-        if (new_data && !is_delete) {
-            new_entry.data_ = std::make_shared<RmRecord>(*new_data);
+        // 保存旧版本
+        VersionEntry entry;
+        entry.txn_id_ = txn->get_transaction_id();
+        entry.commit_ts_ = 0;  // 未提交
+        entry.is_deleted_ = was_deleted;
+        if (old_data && !was_deleted) {
+            entry.data_ = std::make_shared<RmRecord>(*old_data);
         }
 
-        // 插入到版本链头部
-        chain.insert(chain.begin(), std::move(new_entry));
+        chain.push_back(std::move(entry));
     }
 
     /**
@@ -204,32 +179,39 @@ public:
      * @param fd 文件描述符
      * @param rid 记录ID
      * @param txn 当前事务
-     * @param[out] is_deleted 如果可见版本是删除标记，设置为 true
-     * @return 可见版本的数据，如果记录不存在返回 nullptr
+     * @param disk_data 磁盘上的当前数据
+     * @param[out] is_deleted 如果记录被删除，设置为 true
+     * @return 可见版本的数据，如果使用磁盘数据返回 nullptr
      */
-    RmRecord* get_visible_version(int fd, const Rid& rid, Transaction* txn, bool& is_deleted) {
+    RmRecord* get_visible_version(int fd, const Rid& rid, Transaction* txn,
+                                  const RmRecord* disk_data, bool& is_deleted) {
         VersionKey key{fd, rid.page_no, rid.slot_no};
         std::lock_guard<std::mutex> lock(mutex_);
 
         auto it = version_chains_.find(key);
         if (it == version_chains_.end()) {
+            // 没有版本信息，使用磁盘数据
             is_deleted = false;
-            return nullptr;  // 没有版本信息，使用原始数据
+            return nullptr;
         }
 
         auto& chain = it->second;
 
-        // 沿版本链找到可见版本
-        for (auto& entry : chain) {
+        // 从最新版本开始查找
+        for (auto rit = chain.rbegin(); rit != chain.rend(); ++rit) {
+            auto& entry = *rit;
+
             // 自己写的数据总是可见
             if (entry.txn_id_ == txn->get_transaction_id()) {
                 is_deleted = entry.is_deleted_;
                 return entry.data_.get();
             }
+
             // 未提交的数据不可见
             if (entry.commit_ts_ == 0) {
                 continue;
             }
+
             // 已提交的数据，检查时间戳
             if (entry.commit_ts_ <= txn->get_start_ts()) {
                 is_deleted = entry.is_deleted_;
@@ -237,43 +219,36 @@ public:
             }
         }
 
+        // 没有找到可见版本，使用磁盘数据
         is_deleted = false;
-        return nullptr;  // 没有可见版本，使用原始数据
+        return nullptr;
     }
 
     /**
-     * @brief 检查记录是否有可见版本
+     * @brief 检查是否有未提交的版本（用于判断记录是否被锁定）
      */
-    bool has_visible_version(int fd, const Rid& rid, Transaction* txn) {
+    bool has_uncommitted_version(int fd, const Rid& rid, txn_id_t exclude_txn) {
         VersionKey key{fd, rid.page_no, rid.slot_no};
         std::lock_guard<std::mutex> lock(mutex_);
 
         auto it = version_chains_.find(key);
         if (it == version_chains_.end()) {
-            return false;  // 没有版本信息
+            return false;
         }
 
         auto& chain = it->second;
-
-        for (auto& entry : chain) {
-            if (entry.txn_id_ == txn->get_transaction_id()) {
-                return true;
-            }
-            if (entry.commit_ts_ == 0) {
-                continue;
-            }
-            if (entry.commit_ts_ <= txn->get_start_ts()) {
-                return true;
-            }
+        if (chain.empty()) {
+            return false;
         }
 
-        return false;
+        auto& latest = chain.back();
+        return latest.txn_id_ != exclude_txn && latest.commit_ts_ == 0;
     }
 
 private:
     VersionManager() = default;
 
     std::mutex mutex_;
-    // 版本链：每个记录有一个版本列表，按时间从新到旧排列
+    // 版本链：每个记录有一个版本列表，按时间从旧到新排列
     std::unordered_map<VersionKey, std::vector<VersionEntry>, VersionKeyHash> version_chains_;
 };
