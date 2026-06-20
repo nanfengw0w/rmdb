@@ -182,20 +182,19 @@ public:
     }
 
     /**
-     * @brief 获取记录的可见版本数据
+     * @brief 检查记录是否对事务可见
      *
-     * 对于MVCC读：
-     * - 如果有其他未提交事务的版本，返回旧数据（避免脏读）
-     * - 如果没有未提交版本，返回nullptr（从磁盘读取最新数据）
+     * @return -1: 从磁盘读取, 0: 记录不存在, 1: 从old_data读取
      */
-    RmRecord* get_visible_data(int fd, const Rid& rid, Transaction* txn, bool& is_deleted) {
+    int get_visible_data(int fd, const Rid& rid, Transaction* txn, RmRecord*& result, bool& is_deleted) {
         VersionKey key{fd, rid.page_no, rid.slot_no};
         std::lock_guard<std::mutex> lock(mutex_);
 
         auto it = version_chains_.find(key);
         if (it == version_chains_.end() || it->second.empty()) {
             is_deleted = false;
-            return nullptr;  // 没有版本信息，从磁盘读取
+            result = nullptr;
+            return -1;  // 没有版本信息，从磁盘读取
         }
 
         auto& chain = it->second;
@@ -209,17 +208,32 @@ public:
                 continue;
             }
 
-            // 如果有其他未提交事务的版本，返回旧数据（避免脏读）
+            // 如果有其他未提交事务的版本
             if (entry.commit_ts_ == 0) {
-                is_deleted = entry.is_deleted_;
-                return entry.old_data_.get();
+                // 如果是INSERT（之前记录不存在），返回记录不存在
+                if (entry.is_deleted_) {
+                    is_deleted = true;
+                    result = nullptr;
+                    return 0;  // 记录不存在
+                }
+                // 如果是UPDATE/DELETE，返回旧数据
+                is_deleted = false;
+                result = entry.old_data_.get();
+                return 1;  // 从old_data读取
             }
 
             // 如果有其他事务在本事务开始之后提交的版本
             if (entry.commit_ts_ > txn->get_start_ts()) {
-                // 这个版本在快照中不可见，返回旧数据
-                is_deleted = entry.is_deleted_;
-                return entry.old_data_.get();
+                // 如果是INSERT（之前记录不存在），返回记录不存在
+                if (entry.is_deleted_) {
+                    is_deleted = true;
+                    result = nullptr;
+                    return 0;  // 记录不存在
+                }
+                // 如果是UPDATE/DELETE，返回旧数据
+                is_deleted = false;
+                result = entry.old_data_.get();
+                return 1;  // 从old_data读取
             }
 
             // commit_ts <= start_ts，这个版本在快照中可见，从磁盘读取
@@ -228,7 +242,8 @@ public:
 
         // 没有需要回退的版本，从磁盘读取最新数据
         is_deleted = false;
-        return nullptr;
+        result = nullptr;
+        return -1;  // 从磁盘读取
     }
 
 private:

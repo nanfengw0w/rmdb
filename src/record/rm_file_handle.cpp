@@ -25,16 +25,20 @@ std::unique_ptr<RmRecord> RmFileHandle::get_record(const Rid& rid, Context* cont
         if (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE) {
             auto& vm = VersionManager::instance();
             bool is_deleted = false;
-            RmRecord* old_data = vm.get_visible_data(fd_, rid, context->txn_, is_deleted);
+            RmRecord* result = nullptr;
+            int vis = vm.get_visible_data(fd_, rid, context->txn_, result, is_deleted);
 
-            if (old_data != nullptr) {
-                // 有需要回退的版本（其他事务的未提交写操作或快照不可见的写操作）
+            if (vis == 0) {
+                // 记录不存在（被未提交的INSERT或快照不可见的INSERT影响）
+                return nullptr;
+            } else if (vis == 1) {
+                // 从old_data读取（被未提交的UPDATE/DELETE或快照不可见的UPDATE/DELETE影响）
                 if (is_deleted) {
-                    return nullptr;  // 记录在那个版本中被删除
+                    return nullptr;
                 }
-                return std::make_unique<RmRecord>(*old_data);
+                return std::make_unique<RmRecord>(*result);
             }
-            // 没有需要回退的版本，从磁盘读取最新数据
+            // vis == -1，从磁盘读取最新数据
         }
     }
 
