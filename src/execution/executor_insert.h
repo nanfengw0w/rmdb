@@ -66,7 +66,8 @@ class InsertExecutor : public AbstractExecutor {
         index_keys.reserve(tab_.indexes.size());
         for (auto &index : tab_.indexes) {
             auto key = index_maintenance::build_key(index, rec.data);
-            index_maintenance::check_unique_conflict(sm_manager_, tab_name_, index, key.data());
+            index_maintenance::check_unique_conflict(sm_manager_, tab_name_, index, key.data(),
+                                                     std::nullopt, context_);
             index_keys.emplace_back(std::move(key));
         }
 

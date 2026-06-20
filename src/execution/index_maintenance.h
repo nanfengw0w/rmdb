@@ -18,6 +18,7 @@ See the Mulan PSL v2 for more details. */
 #include "errors.h"
 #include "index/ix.h"
 #include "system/sm.h"
+#include "transaction/version_manager.h"
 
 namespace index_maintenance {
 
@@ -56,17 +57,67 @@ inline IxIndexHandle *get_index_handle(SmManager *sm_manager, const std::string 
     return sm_manager->ihs_.at(ix_name).get();
 }
 
+inline bool is_mvcc_txn(Context *context) {
+    if (context == nullptr || context->txn_ == nullptr) {
+        return false;
+    }
+    auto level = context->txn_->get_isolation_level();
+    return level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE;
+}
+
+inline bool visible_record_matches_key(const IndexMeta &index, const RmRecord *record, const char *key) {
+    if (record == nullptr) {
+        return false;
+    }
+    auto actual_key = build_key(index, record->data);
+    return memcmp(actual_key.data(), key, index.col_tot_len) == 0;
+}
+
 inline void check_unique_conflict(SmManager *sm_manager, const std::string &tab_name, const IndexMeta &index,
-                                  const char *key, std::optional<Rid> self = std::nullopt) {
+                                  const char *key, std::optional<Rid> self = std::nullopt,
+                                  Context *context = nullptr) {
     auto ih = get_index_handle(sm_manager, tab_name, index);
     std::vector<Rid> existing;
     if (!ih->get_value(key, &existing, nullptr)) {
         return;
     }
+
+    RmFileHandle *fh = nullptr;
+    bool mvcc = is_mvcc_txn(context);
+    if (mvcc) {
+        fh = sm_manager->get_table_fh(tab_name);
+    }
+
     for (const auto &rid : existing) {
-        if (!self.has_value() || !same_rid(rid, *self)) {
+        if (self.has_value() && same_rid(rid, *self)) {
+            continue;
+        }
+
+        if (!mvcc) {
             throw UniqueIndexConflictError(tab_name, index_col_names(index));
         }
+
+        auto &vm = VersionManager::instance();
+        bool write_conflict = !vm.check_write_conflict(fh->GetFd(), rid, context->txn_);
+        auto record = fh->get_record(rid, context);
+
+        if (record == nullptr) {
+            if (write_conflict) {
+                throw TransactionAbortException(context->txn_->get_transaction_id(),
+                    AbortReason::DEADLOCK_PREVENTION);
+            }
+            continue;
+        }
+
+        if (!visible_record_matches_key(index, record.get(), key)) {
+            continue;
+        }
+
+        if (write_conflict) {
+            throw TransactionAbortException(context->txn_->get_transaction_id(),
+                AbortReason::DEADLOCK_PREVENTION);
+        }
+        throw UniqueIndexConflictError(tab_name, index_col_names(index));
     }
 }
 

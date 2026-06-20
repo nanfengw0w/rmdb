@@ -329,6 +329,10 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
         while (!scan.is_end()) {
             auto rid = scan.rid();
             auto record = fh->get_record(rid, context);
+            if (record == nullptr) {
+                scan.next();
+                continue;
+            }
             auto key = build_index_key(index_meta, record->data);
 
             std::vector<Rid> existing;

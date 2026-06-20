@@ -93,7 +93,8 @@ class UpdateExecutor : public AbstractExecutor {
         for (auto &pending : pending_updates) {
             for (size_t index_no = 0; index_no < tab_.indexes.size(); ++index_no) {
                 index_maintenance::check_unique_conflict(sm_manager_, tab_name_, tab_.indexes[index_no],
-                                                         pending.new_keys[index_no].data(), pending.rid);
+                                                         pending.new_keys[index_no].data(), pending.rid,
+                                                         context_);
             }
         }
 
@@ -109,6 +110,7 @@ class UpdateExecutor : public AbstractExecutor {
         }
 
         Transaction *txn = context_ == nullptr ? nullptr : context_->txn_;
+        bool mvcc_txn = index_maintenance::is_mvcc_txn(context_);
         for (auto &pending : pending_updates) {
             // SSI: 检查 rw 依赖
             if (txn != nullptr && g_txn_manager != nullptr) {
@@ -138,7 +140,9 @@ class UpdateExecutor : public AbstractExecutor {
                     continue;
                 }
                 auto ih = index_maintenance::get_index_handle(sm_manager_, tab_name_, tab_.indexes[index_no]);
-                ih->delete_entry(pending.old_keys[index_no].data(), txn);
+                if (!mvcc_txn) {
+                    ih->delete_entry(pending.old_keys[index_no].data(), txn);
+                }
                 ih->insert_entry(pending.new_keys[index_no].data(), pending.rid, txn);
             }
         }

@@ -71,12 +71,14 @@ class DeleteExecutor : public AbstractExecutor {
                 }
             }
 
-            // Delete index entries after the MVCC write-conflict check succeeds.
-            for (size_t i = 0; i < tab_.indexes.size(); ++i) {
-                auto& index = tab_.indexes[i];
-                auto ih = index_maintenance::get_index_handle(sm_manager_, tab_name_, index);
-                auto key = index_maintenance::build_key(index, record->data);
-                ih->delete_entry(key.data(), txn);
+            // MVCC keeps old index entries as visibility-filtered candidates for older snapshots.
+            if (!index_maintenance::is_mvcc_txn(context_)) {
+                for (size_t i = 0; i < tab_.indexes.size(); ++i) {
+                    auto& index = tab_.indexes[i];
+                    auto ih = index_maintenance::get_index_handle(sm_manager_, tab_name_, index);
+                    auto key = index_maintenance::build_key(index, record->data);
+                    ih->delete_entry(key.data(), txn);
+                }
             }
             cur_idx_++;
         }
