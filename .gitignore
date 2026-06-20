@@ -3,3 +3,15 @@
 *.log
 BufferPoolManagerTest_db/
 tmp_*
+
+# Test databases
+test_db*/
+test_debug*/
+test_simple*/
+test_star*/
+debug_idx_filter_db/
+manual_probe_db/
+spec1_db/
+t3_reorder/
+test_bracket*/
+test_t4a*/
