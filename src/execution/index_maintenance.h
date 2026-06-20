@@ -15,8 +15,10 @@ See the Mulan PSL v2 for more details. */
 #include <string>
 #include <vector>
 
+#include "common/context.h"
 #include "errors.h"
 #include "index/ix.h"
+#include "record/rm_scan.h"
 #include "system/sm.h"
 #include "transaction/version_manager.h"
 
@@ -65,6 +67,11 @@ inline bool is_mvcc_txn(Context *context) {
     return level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE;
 }
 
+inline bool is_snapshot_txn(Context *context) {
+    return context != nullptr && context->txn_ != nullptr &&
+           context->txn_->get_isolation_level() == IsolationLevel::SNAPSHOT_ISOLATION;
+}
+
 inline bool visible_record_matches_key(const IndexMeta &index, const RmRecord *record, const char *key) {
     if (record == nullptr) {
         return false;
@@ -73,9 +80,53 @@ inline bool visible_record_matches_key(const IndexMeta &index, const RmRecord *r
     return memcmp(actual_key.data(), key, index.col_tot_len) == 0;
 }
 
+inline void check_unique_conflict_by_scan(SmManager *sm_manager, const std::string &tab_name,
+                                          const IndexMeta &index, const char *key,
+                                          std::optional<Rid> self, Context *context) {
+    auto fh = sm_manager->get_table_fh(tab_name);
+    auto &vm = VersionManager::instance();
+    RmScan scan(fh);
+    while (!scan.is_end()) {
+        Rid rid = scan.rid();
+        scan.next();
+
+        if (self.has_value() && same_rid(rid, *self)) {
+            continue;
+        }
+
+        auto physical = fh->get_record(rid, nullptr);
+        if (physical == nullptr) {
+            continue;
+        }
+
+        auto visible = fh->get_record(rid, context);
+        bool physical_matches = visible_record_matches_key(index, physical.get(), key);
+        bool visible_matches = visible_record_matches_key(index, visible.get(), key);
+        bool write_conflict = !vm.check_write_conflict(fh->GetFd(), rid, context->txn_);
+
+        if (visible_matches) {
+            if (write_conflict) {
+                throw TransactionAbortException(context->txn_->get_transaction_id(),
+                    AbortReason::DEADLOCK_PREVENTION);
+            }
+            throw UniqueIndexConflictError(tab_name, index_col_names(index));
+        }
+
+        if (physical_matches && write_conflict) {
+            throw TransactionAbortException(context->txn_->get_transaction_id(),
+                AbortReason::DEADLOCK_PREVENTION);
+        }
+    }
+}
+
 inline void check_unique_conflict(SmManager *sm_manager, const std::string &tab_name, const IndexMeta &index,
                                   const char *key, std::optional<Rid> self = std::nullopt,
                                   Context *context = nullptr) {
+    if (is_snapshot_txn(context)) {
+        check_unique_conflict_by_scan(sm_manager, tab_name, index, key, self, context);
+        return;
+    }
+
     auto ih = get_index_handle(sm_manager, tab_name, index);
     std::vector<Rid> existing;
     if (!ih->get_value(key, &existing, nullptr)) {
