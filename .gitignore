@@ -15,3 +15,4 @@ spec1_db/
 t3_reorder/
 test_bracket*/
 test_t4a*/
+test_*_db/
