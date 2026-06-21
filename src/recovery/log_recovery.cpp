@@ -184,7 +184,7 @@ void RecoveryManager::analyze() {
                 break;
             case LogType::CHECKPOINT: {
                 // Add checkpoint's active transactions to undo list
-                CheckpointLogRecord* ckpt = dynamic_cast<CheckpointLogRecord*>(log_records_[i]);
+                CheckpointLogRecord* ckpt = static_cast<CheckpointLogRecord*>(log_records_[i]);
                 if (ckpt) {
                     for (auto active_txn : ckpt->active_txns_) {
                         undo_txns_.insert(active_txn);
@@ -223,7 +223,7 @@ void RecoveryManager::redo() {
 
         switch (record->log_type_) {
             case LogType::INSERT: {
-                InsertLogRecord* insert_rec = dynamic_cast<InsertLogRecord*>(record);
+                InsertLogRecord* insert_rec = static_cast<InsertLogRecord*>(record);
                 if (!insert_rec) break;
 
                 std::string table_name(insert_rec->table_name_, insert_rec->table_name_size_);
@@ -267,7 +267,7 @@ void RecoveryManager::redo() {
                 break;
             }
             case LogType::UPDATE: {
-                UpdateLogRecord* update_rec = dynamic_cast<UpdateLogRecord*>(record);
+                UpdateLogRecord* update_rec = static_cast<UpdateLogRecord*>(record);
                 if (!update_rec) break;
 
                 std::string table_name(update_rec->table_name_, update_rec->table_name_size_);
@@ -303,7 +303,7 @@ void RecoveryManager::redo() {
                 break;
             }
             case LogType::DELETE: {
-                DeleteLogRecord* delete_rec = dynamic_cast<DeleteLogRecord*>(record);
+                DeleteLogRecord* delete_rec = static_cast<DeleteLogRecord*>(record);
                 if (!delete_rec) break;
 
                 std::string table_name(delete_rec->table_name_, delete_rec->table_name_size_);
@@ -377,7 +377,7 @@ void RecoveryManager::undo() {
 
             switch (record->log_type_) {
                 case LogType::INSERT: {
-                    InsertLogRecord* insert_rec = dynamic_cast<InsertLogRecord*>(record);
+                    InsertLogRecord* insert_rec = static_cast<InsertLogRecord*>(record);
                     if (!insert_rec) break;
 
                     std::string table_name(insert_rec->table_name_, insert_rec->table_name_size_);
@@ -407,7 +407,7 @@ void RecoveryManager::undo() {
                     break;
                 }
                 case LogType::UPDATE: {
-                    UpdateLogRecord* update_rec = dynamic_cast<UpdateLogRecord*>(record);
+                    UpdateLogRecord* update_rec = static_cast<UpdateLogRecord*>(record);
                     if (!update_rec) break;
 
                     std::string table_name(update_rec->table_name_, update_rec->table_name_size_);
@@ -436,7 +436,7 @@ void RecoveryManager::undo() {
                     break;
                 }
                 case LogType::DELETE: {
-                    DeleteLogRecord* delete_rec = dynamic_cast<DeleteLogRecord*>(record);
+                    DeleteLogRecord* delete_rec = static_cast<DeleteLogRecord*>(record);
                     if (!delete_rec) break;
 
                     std::string table_name(delete_rec->table_name_, delete_rec->table_name_size_);

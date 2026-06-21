@@ -62,7 +62,7 @@ class RmFileHandle {
         disk_manager_->set_fd2pageno(fd, file_hdr_.num_pages);
     }
 
-    RmFileHdr get_file_hdr() { return file_hdr_; }
+    RmFileHdr get_file_hdr() const { return file_hdr_; }
     RmFileHdr& get_file_hdr_ref() { return file_hdr_; }
     int GetFd() { return fd_; }
 
