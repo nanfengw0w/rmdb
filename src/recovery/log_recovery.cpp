@@ -124,16 +124,30 @@ void RecoveryManager::analyze() {
     min_rec_lsn_ = INVALID_LSN;
     checkpoint_lsn_ = INVALID_LSN;
 
-    // Read checkpoint LSN from restart file
+    // Read checkpoint byte offset from restart file. Older builds stored the
+    // checkpoint LSN here, so keep a fallback LSN scan for compatibility.
     int start_offset = 0;
     std::ifstream ifs("checkpoint.lsn");
     if (ifs.is_open()) {
-        ifs >> checkpoint_lsn_;
+        long long restart_value = 0;
+        ifs >> restart_value;
         ifs.close();
 
-        // Find the byte offset of the checkpoint record in the log file
         int file_size = disk_manager_->get_file_size(LOG_FILE_NAME);
-        if (file_size > 0) {
+        if (file_size > 0 && restart_value >= 0 && restart_value < file_size) {
+            char header_buf[LOG_HEADER_SIZE];
+            int bytes_read = disk_manager_->read_log(header_buf, LOG_HEADER_SIZE, static_cast<int>(restart_value));
+            if (bytes_read == LOG_HEADER_SIZE) {
+                LogType log_type = *reinterpret_cast<const LogType*>(header_buf);
+                if (log_type == LogType::CHECKPOINT) {
+                    start_offset = static_cast<int>(restart_value);
+                    checkpoint_lsn_ = *reinterpret_cast<const lsn_t*>(header_buf + OFFSET_LSN);
+                }
+            }
+        }
+
+        if (start_offset == 0 && file_size > 0) {
+            checkpoint_lsn_ = static_cast<lsn_t>(restart_value);
             int offset = 0;
             while (offset < file_size) {
                 char header_buf[LOG_HEADER_SIZE];

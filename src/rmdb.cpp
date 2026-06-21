@@ -317,7 +317,6 @@ void *client_handler(void *sock_fd) {
     std::cout << output;
 
     while (true) {
-        std::cout << "Waiting for request..." << std::endl;
         memset(data_recv, 0, BUFFER_LENGTH);
 
         i_recvBytes = read(fd, data_recv, BUFFER_LENGTH);
@@ -331,8 +330,6 @@ void *client_handler(void *sock_fd) {
             break;
         }
         
-        printf("i_recvBytes: %d \n ", i_recvBytes);
-
         std::string sanitized_sql = strip_sql_line_comments(std::string(data_recv));
         if (is_blank_sql(sanitized_sql)) {
             memset(data_send, '\0', BUFFER_LENGTH);
@@ -346,17 +343,23 @@ void *client_handler(void *sock_fd) {
         size_t sanitized_len = std::min(sanitized_sql.size(), static_cast<size_t>(BUFFER_LENGTH - 1));
         memcpy(data_recv, sanitized_sql.data(), sanitized_len);
 
-        if (strcmp(data_recv, "exit") == 0) {
+        std::string control_cmd(data_recv);
+        size_t ctrl_start = control_cmd.find_first_not_of(" \t\r\n");
+        if (ctrl_start != std::string::npos) control_cmd = control_cmd.substr(ctrl_start);
+        while (!control_cmd.empty() &&
+               (control_cmd.back() == ';' || control_cmd.back() == ' ' ||
+                control_cmd.back() == '\n' || control_cmd.back() == '\r' || control_cmd.back() == '\t')) {
+            control_cmd.pop_back();
+        }
+        for (auto &c : control_cmd) c = static_cast<char>(tolower(c));
+
+        if (control_cmd == "exit") {
             std::cout << "Client exit." << std::endl;
             break;
         }
-        if (strcmp(data_recv, "crash") == 0) {
-            std::cout << "Ignore crash command from client." << std::endl;
-            set_response(data_send, &offset, "Error: unsupported command\n");
-            if (write(fd, data_send, offset + 1) == -1) {
-                break;
-            }
-            continue;
+        if (control_cmd == "crash") {
+            std::cout << "Crash command received. Simulating process failure." << std::endl;
+            _exit(1);
         }
 
         // Handle create static_checkpoint
@@ -373,6 +376,10 @@ void *client_handler(void *sock_fd) {
                 try {
                     // (1) Flush log buffer to disk
                     log_manager->flush_log_to_disk();
+                    int checkpoint_offset = disk_manager->get_file_size(LOG_FILE_NAME);
+                    if (checkpoint_offset < 0) {
+                        checkpoint_offset = 0;
+                    }
 
                     // (2) Write checkpoint record to log
                     auto active_txns = log_manager->get_active_txns();
@@ -389,9 +396,9 @@ void *client_handler(void *sock_fd) {
                         buffer_pool_manager->flush_all_pages(fd_table);
                     }
 
-                    // (4) Write checkpoint LSN to restart file
+                    // (4) Write checkpoint byte offset to restart file
                     std::ofstream ofs("checkpoint.lsn", std::ios::trunc);
-                    ofs << current_lsn;
+                    ofs << checkpoint_offset;
                     ofs.close();
 
                     set_response(data_send, &offset, "OK\n");
@@ -402,8 +409,6 @@ void *client_handler(void *sock_fd) {
                 continue;
             }
         }
-
-        std::cout << "Read from client " << fd << ": " << data_recv << std::endl;
 
         // 检查是否是 SET TRANSACTION ISOLATION LEVEL 命令（必须在aggregate处理之前）
         {
