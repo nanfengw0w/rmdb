@@ -299,19 +299,6 @@ void SetTransaction(txn_id_t *txn_id, Context *context) {
     }
 }
 
-static void SetFastInsertTransaction(txn_id_t *txn_id, Context *context) {
-    context->txn_ = txn_manager->get_transaction(*txn_id);
-    if (context->txn_ == nullptr || context->txn_->get_state() == TransactionState::COMMITTED ||
-        context->txn_->get_state() == TransactionState::ABORTED) {
-        context->txn_ = txn_manager->begin(nullptr, nullptr);
-        *txn_id = context->txn_->get_transaction_id();
-        context->txn_->set_txn_mode(false);
-        if (context->log_mgr_ != nullptr) {
-            context->log_mgr_->add_active_txn(*txn_id);
-        }
-    }
-}
-
 static bool parse_insert_literal_local(const std::string &text, Value &value) {
     std::string s = trim_local(text);
     if (s.size() >= 2 && s.front() == '\'' && s.back() == '\'') {
@@ -482,7 +469,7 @@ static bool try_handle_fast_insert(const std::string &sql, txn_id_t *txn_id,
     memset(data_send, '\0', BUFFER_LENGTH);
     *offset = 0;
     auto context = std::make_unique<Context>(lock_manager.get(), log_manager.get(), nullptr, data_send, offset);
-    SetFastInsertTransaction(txn_id, context.get());
+    SetTransaction(txn_id, context.get());
 
     try {
         execute_fast_insert_direct(tab_name, values, context.get());
