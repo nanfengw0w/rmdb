@@ -238,6 +238,7 @@ void RecoveryManager::redo() {
                 // Extend file if needed (num_pages on disk may be stale)
                 if (rid.page_no >= file_hdr.num_pages) {
                     fh->get_file_hdr_ref().num_pages = rid.page_no + 1;
+                    disk_manager_->write_page(fd, RM_FILE_HDR_PAGE, (const char *)&fh->get_file_hdr_ref(), sizeof(RmFileHdr));
                 }
 
                 PageId page_id{fd, rid.page_no};
@@ -281,6 +282,7 @@ void RecoveryManager::redo() {
 
                 if (rid.page_no >= file_hdr.num_pages) {
                     fh->get_file_hdr_ref().num_pages = rid.page_no + 1;
+                    disk_manager_->write_page(fd, RM_FILE_HDR_PAGE, (const char *)&fh->get_file_hdr_ref(), sizeof(RmFileHdr));
                 }
 
                 PageId page_id{fd, rid.page_no};
@@ -317,6 +319,7 @@ void RecoveryManager::redo() {
 
                 if (rid.page_no >= file_hdr.num_pages) {
                     fh->get_file_hdr_ref().num_pages = rid.page_no + 1;
+                    disk_manager_->write_page(fd, RM_FILE_HDR_PAGE, (const char *)&fh->get_file_hdr_ref(), sizeof(RmFileHdr));
                 }
 
                 PageId page_id{fd, rid.page_no};
