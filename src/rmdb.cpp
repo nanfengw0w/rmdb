@@ -299,6 +299,238 @@ void SetTransaction(txn_id_t *txn_id, Context *context) {
     }
 }
 
+static void SetFastInsertTransaction(txn_id_t *txn_id, Context *context) {
+    context->txn_ = txn_manager->get_transaction(*txn_id);
+    if (context->txn_ == nullptr || context->txn_->get_state() == TransactionState::COMMITTED ||
+        context->txn_->get_state() == TransactionState::ABORTED) {
+        context->txn_ = txn_manager->begin(nullptr, nullptr);
+        *txn_id = context->txn_->get_transaction_id();
+        context->txn_->set_txn_mode(false);
+        if (context->log_mgr_ != nullptr) {
+            context->log_mgr_->add_active_txn(*txn_id);
+        }
+    }
+}
+
+static bool parse_insert_literal_local(const std::string &text, Value &value) {
+    std::string s = trim_local(text);
+    if (s.size() >= 2 && s.front() == '\'' && s.back() == '\'') {
+        value.set_str(s.substr(1, s.size() - 2));
+        return true;
+    }
+
+    try {
+        size_t consumed = 0;
+        if (s.find('.') != std::string::npos || s.find('e') != std::string::npos || s.find('E') != std::string::npos) {
+            float v = std::stof(s, &consumed);
+            if (consumed != s.size()) {
+                return false;
+            }
+            value.set_float(v);
+        } else {
+            int v = std::stoi(s, &consumed);
+            if (consumed != s.size()) {
+                return false;
+            }
+            value.set_int(v);
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+static bool try_parse_simple_insert_local(const std::string &sql, std::string &tab_name,
+                                          std::vector<Value> &values) {
+    std::string raw = trim_local(sql);
+    while (!raw.empty() && raw.back() == ';') {
+        raw.pop_back();
+        raw = trim_local(raw);
+    }
+    std::string lower = lower_local(raw);
+    const std::string prefix = "insert into ";
+    if (lower.rfind(prefix, 0) != 0) {
+        return false;
+    }
+
+    size_t values_pos = find_keyword_local(lower, " values", prefix.size());
+    if (values_pos == std::string::npos) {
+        return false;
+    }
+
+    tab_name = trim_local(raw.substr(prefix.size(), values_pos - prefix.size()));
+    std::string value_part = trim_local(raw.substr(values_pos + 7));
+    if (tab_name.empty() || value_part.size() < 2 || value_part.front() != '(' || value_part.back() != ')') {
+        return false;
+    }
+
+    std::vector<std::string> tokens = split_commas_local(value_part.substr(1, value_part.size() - 2));
+    values.clear();
+    values.reserve(tokens.size());
+    for (const auto &token : tokens) {
+        Value value;
+        if (!parse_insert_literal_local(token, value)) {
+            return false;
+        }
+        values.push_back(std::move(value));
+    }
+    return true;
+}
+
+static void execute_fast_insert_direct(const std::string &tab_name, std::vector<Value> &values, Context *context) {
+    TabMeta &tab = sm_manager->db_.get_table(tab_name);
+    if (values.size() != tab.cols.size()) {
+        throw InvalidValueCountError();
+    }
+
+    RmFileHandle *fh = sm_manager->fhs_.at(tab_name).get();
+    RmRecord rec(fh->get_file_hdr().record_size);
+    for (size_t i = 0; i < values.size(); i++) {
+        auto &col = tab.cols[i];
+        auto &val = values[i];
+        char *dst = rec.data + col.offset;
+        if (col.type == TYPE_INT) {
+            if (val.type != TYPE_INT) {
+                throw IncompatibleTypeError(coltype2str(col.type), coltype2str(val.type));
+            }
+            *reinterpret_cast<int *>(dst) = val.int_val;
+        } else if (col.type == TYPE_FLOAT) {
+            if (val.type == TYPE_INT) {
+                *reinterpret_cast<float *>(dst) = static_cast<float>(val.int_val);
+            } else if (val.type == TYPE_FLOAT) {
+                *reinterpret_cast<float *>(dst) = val.float_val;
+            } else {
+                throw IncompatibleTypeError(coltype2str(col.type), coltype2str(val.type));
+            }
+        } else if (col.type == TYPE_STRING) {
+            if (val.type != TYPE_STRING) {
+                throw IncompatibleTypeError(coltype2str(col.type), coltype2str(val.type));
+            }
+            if (col.len < static_cast<int>(val.str_val.size())) {
+                throw StringOverflowError();
+            }
+            memset(dst, 0, col.len);
+            memcpy(dst, val.str_val.c_str(), val.str_val.size());
+        }
+    }
+
+    std::vector<std::vector<char>> index_keys;
+    index_keys.reserve(tab.indexes.size());
+    for (auto &index : tab.indexes) {
+        auto key = index_maintenance::build_key(index, rec.data);
+        index_maintenance::check_unique_conflict(sm_manager.get(), tab_name, index, key.data(),
+                                                 std::nullopt, context);
+        index_keys.emplace_back(std::move(key));
+    }
+    index_maintenance::check_logical_key_write_conflict(sm_manager.get(), tab, tab_name,
+                                                        rec.data, std::nullopt, context);
+
+    Rid rid = fh->insert_record(rec.data, context);
+
+    if (context != nullptr && context->txn_ != nullptr && context->log_mgr_ != nullptr) {
+        InsertLogRecord insert_log(context->txn_->get_transaction_id(), rec, rid, tab_name);
+        lsn_t lsn = context->log_mgr_->add_log_to_buffer(&insert_log);
+        context->txn_->set_prev_lsn(lsn);
+    }
+
+    if (context != nullptr && context->txn_ != nullptr) {
+        context->txn_->append_write_record(new WriteRecord(WType::INSERT_TUPLE, tab_name, rid));
+    }
+
+    Transaction *txn = context == nullptr ? nullptr : context->txn_;
+    if (txn != nullptr && g_txn_manager != nullptr) {
+        g_txn_manager->record_write(txn, tab_name, rid, WType::INSERT_TUPLE,
+                                    nullptr, &rec, true, false);
+        auto deps = g_txn_manager->check_rw_on_write(txn, tab_name, rid, nullptr, &rec);
+        for (auto& [from, to] : deps) {
+            if (g_txn_manager->add_rw_dependency_and_check(from, to)) {
+                throw TransactionAbortException(txn->get_transaction_id(),
+                    AbortReason::DEADLOCK_PREVENTION);
+            }
+        }
+    }
+
+    for (size_t i = 0; i < tab.indexes.size(); ++i) {
+        auto &index = tab.indexes[i];
+        auto ih = index_maintenance::get_index_handle(sm_manager.get(), tab_name, index);
+        ih->insert_entry(index_keys[i].data(), rid, txn);
+    }
+}
+
+static void clear_fast_autocommit_state(Transaction *txn) {
+    if (txn == nullptr || txn->get_txn_mode() ||
+        txn->get_state() != TransactionState::COMMITTED ||
+        txn->get_isolation_level() != IsolationLevel::READ_COMMITTED) {
+        return;
+    }
+
+    auto write_set = txn->get_write_set();
+    for (auto *wr : *write_set) {
+        delete wr;
+    }
+    write_set->clear();
+}
+
+static bool try_handle_fast_insert(const std::string &sql, txn_id_t *txn_id,
+                                   char *data_send, int *offset, int fd) {
+    std::string tab_name;
+    std::vector<Value> values;
+    if (!try_parse_simple_insert_local(sql, tab_name, values)) {
+        return false;
+    }
+
+    memset(data_send, '\0', BUFFER_LENGTH);
+    *offset = 0;
+    auto context = std::make_unique<Context>(lock_manager.get(), log_manager.get(), nullptr, data_send, offset);
+    SetFastInsertTransaction(txn_id, context.get());
+
+    try {
+        execute_fast_insert_direct(tab_name, values, context.get());
+        if (context->txn_ != nullptr && context->txn_->get_txn_mode() == false &&
+            context->txn_->get_state() != TransactionState::COMMITTED &&
+            context->txn_->get_state() != TransactionState::ABORTED) {
+            txn_manager->commit(context->txn_, context->log_mgr_);
+            clear_fast_autocommit_state(context->txn_);
+        }
+    } catch (TransactionAbortException &e) {
+        set_response(data_send, offset, "abort\n");
+        txn_manager->abort(context->txn_, log_manager.get());
+        std::cout << e.GetInfo() << std::endl;
+
+        std::fstream outfile;
+        outfile.open("output.txt", std::ios::out | std::ios::app);
+        outfile << "abort\n";
+        outfile.close();
+    } catch (RMDBError &e) {
+        std::cerr << e.what() << std::endl;
+        set_response(data_send, offset, std::string(e.what()) + "\n");
+
+        std::fstream outfile;
+        outfile.open("output.txt", std::ios::out | std::ios::app);
+        outfile << "failure\n";
+        outfile.close();
+    } catch (std::exception &e) {
+        std::cerr << "Standard exception: " << e.what() << std::endl;
+        set_response(data_send, offset, std::string("Error: ") + e.what() + "\n");
+
+        std::fstream outfile;
+        outfile.open("output.txt", std::ios::out | std::ios::app);
+        outfile << "failure\n";
+        outfile.close();
+    } catch (...) {
+        std::cerr << "Unknown exception caught" << std::endl;
+        set_response(data_send, offset, "Error: Unknown error\n");
+
+        std::fstream outfile;
+        outfile.open("output.txt", std::ios::out | std::ios::app);
+        outfile << "failure\n";
+        outfile.close();
+    }
+
+    write(fd, data_send, *offset + 1);
+    return true;
+}
+
 void *client_handler(void *sock_fd) {
     int fd = *((int *)sock_fd);
     pthread_mutex_unlock(sockfd_mutex);
@@ -359,6 +591,7 @@ void *client_handler(void *sock_fd) {
         }
         if (control_cmd == "crash") {
             std::cout << "Crash command received. Simulating process failure." << std::endl;
+            log_manager->flush_log_to_disk();
             _exit(1);
         }
 
@@ -428,6 +661,10 @@ void *client_handler(void *sock_fd) {
                 if (write(fd, data_send, offset + 1) == -1) break;
                 continue;
             }
+        }
+
+        if (try_handle_fast_insert(std::string(data_recv), &txn_id, data_send, &offset, fd)) {
+            continue;
         }
 
         // Handle aggregate queries (GROUP BY, HAVING, LIMIT, aggregate functions, multi-col ORDER BY)

@@ -16,19 +16,6 @@ See the Mulan PSL v2 for more details. */
 #include <cstring>
 
 /**
- * @description: 计算bitmap中设置的位数（即记录数）
- */
-static int get_record_count_from_bitmap(const char* bitmap, int max_records) {
-    int count = 0;
-    for (int i = 0; i < max_records; i++) {
-        if (Bitmap::is_set(bitmap, i)) {
-            count++;
-        }
-    }
-    return count;
-}
-
-/**
  * @description: 从磁盘中读取所有日志记录
  */
 static std::vector<LogRecord*> read_all_logs(DiskManager* disk_manager, int start_offset = 0) {
@@ -36,70 +23,63 @@ static std::vector<LogRecord*> read_all_logs(DiskManager* disk_manager, int star
     int file_size = disk_manager->get_file_size(LOG_FILE_NAME);
     if (file_size <= 0 || start_offset >= file_size) return records;
 
-    int offset = start_offset;
-    while (offset < file_size) {
-        // Read header first to get log type and total length
-        char header_buf[LOG_HEADER_SIZE];
-        int bytes_read = disk_manager->read_log(header_buf, LOG_HEADER_SIZE, offset);
-        if (bytes_read < LOG_HEADER_SIZE) break;
+    int bytes_to_read = file_size - start_offset;
+    std::vector<char> log_data(bytes_to_read);
+    int bytes_read = disk_manager->read_log(log_data.data(), bytes_to_read, start_offset);
+    if (bytes_read <= 0) return records;
 
-        LogType log_type = *reinterpret_cast<const LogType*>(header_buf);
-        uint32_t log_tot_len = *reinterpret_cast<const uint32_t*>(header_buf + OFFSET_LOG_TOT_LEN);
+    int offset = 0;
+    while (offset + LOG_HEADER_SIZE <= bytes_read) {
+        const char *record_data = log_data.data() + offset;
+
+        LogType log_type = *reinterpret_cast<const LogType*>(record_data);
+        uint32_t log_tot_len = *reinterpret_cast<const uint32_t*>(record_data + OFFSET_LOG_TOT_LEN);
 
         if (log_tot_len == 0 || log_tot_len > LOG_BUFFER_SIZE) break;
-
-        // Read the full log record
-        char* log_data = new char[log_tot_len];
-        bytes_read = disk_manager->read_log(log_data, log_tot_len, offset);
-        if (bytes_read < (int)log_tot_len) {
-            delete[] log_data;
-            break;
-        }
+        if (offset + static_cast<int>(log_tot_len) > bytes_read) break;
 
         LogRecord* record = nullptr;
         switch (log_type) {
             case LogType::begin: {
                 record = new BeginLogRecord();
-                record->deserialize(log_data);
+                record->deserialize(record_data);
                 break;
             }
             case LogType::commit: {
                 record = new CommitLogRecord();
-                record->deserialize(log_data);
+                record->deserialize(record_data);
                 break;
             }
             case LogType::ABORT: {
                 record = new AbortLogRecord();
-                record->deserialize(log_data);
+                record->deserialize(record_data);
                 break;
             }
             case LogType::INSERT: {
                 record = new InsertLogRecord();
-                record->deserialize(log_data);
+                record->deserialize(record_data);
                 break;
             }
             case LogType::DELETE: {
                 record = new DeleteLogRecord();
-                record->deserialize(log_data);
+                record->deserialize(record_data);
                 break;
             }
             case LogType::UPDATE: {
                 record = new UpdateLogRecord();
-                record->deserialize(log_data);
+                record->deserialize(record_data);
                 break;
             }
             case LogType::CHECKPOINT: {
                 record = new CheckpointLogRecord();
-                record->deserialize(log_data);
+                record->deserialize(record_data);
                 break;
             }
             default:
-                delete[] log_data;
                 offset += log_tot_len;
                 continue;
         }
 
-        delete[] log_data;
         if (record) {
             records.push_back(record);
         }
@@ -268,14 +248,16 @@ void RecoveryManager::redo() {
                 // Redo: set bitmap and copy record data
                 char* bitmap = page->get_data() + Page::OFFSET_PAGE_HDR + sizeof(RmPageHdr);
                 char* slots = bitmap + file_hdr.bitmap_size;
+                RmPageHdr* page_hdr = reinterpret_cast<RmPageHdr*>(page->get_data() + Page::OFFSET_PAGE_HDR);
 
+                bool was_set = Bitmap::is_set(bitmap, rid.slot_no);
                 Bitmap::set(bitmap, rid.slot_no);
                 memcpy(slots + rid.slot_no * file_hdr.record_size,
                        insert_rec->insert_value_.data, file_hdr.record_size);
 
-                // Update page header record count
-                RmPageHdr* page_hdr = reinterpret_cast<RmPageHdr*>(page->get_data() + Page::OFFSET_PAGE_HDR);
-                page_hdr->num_records = get_record_count_from_bitmap(bitmap, file_hdr.num_records_per_page);
+                if (!was_set) {
+                    page_hdr->num_records++;
+                }
 
                 page->set_page_lsn(lsn);
                 buffer_pool_manager_->unpin_page(page_id, true);
@@ -347,10 +329,12 @@ void RecoveryManager::redo() {
 
                 // Redo: clear bitmap
                 char* bitmap = page->get_data() + Page::OFFSET_PAGE_HDR + sizeof(RmPageHdr);
-                Bitmap::reset(bitmap, rid.slot_no);
-
                 RmPageHdr* page_hdr = reinterpret_cast<RmPageHdr*>(page->get_data() + Page::OFFSET_PAGE_HDR);
-                page_hdr->num_records = get_record_count_from_bitmap(bitmap, file_hdr.num_records_per_page);
+                bool was_set = Bitmap::is_set(bitmap, rid.slot_no);
+                Bitmap::reset(bitmap, rid.slot_no);
+                if (was_set && page_hdr->num_records > 0) {
+                    page_hdr->num_records--;
+                }
 
                 page->set_page_lsn(lsn);
                 buffer_pool_manager_->unpin_page(page_id, true);
@@ -414,10 +398,12 @@ void RecoveryManager::undo() {
 
                     // Undo insert: clear bitmap bit
                     char* bitmap = page->get_data() + Page::OFFSET_PAGE_HDR + sizeof(RmPageHdr);
-                    Bitmap::reset(bitmap, rid.slot_no);
-
                     RmPageHdr* page_hdr = reinterpret_cast<RmPageHdr*>(page->get_data() + Page::OFFSET_PAGE_HDR);
-                    page_hdr->num_records = get_record_count_from_bitmap(bitmap, file_hdr.num_records_per_page);
+                    bool was_set = Bitmap::is_set(bitmap, rid.slot_no);
+                    Bitmap::reset(bitmap, rid.slot_no);
+                    if (was_set && page_hdr->num_records > 0) {
+                        page_hdr->num_records--;
+                    }
 
                     page->set_page_lsn(record->lsn_);
                     buffer_pool_manager_->unpin_page(page_id, true);
@@ -475,12 +461,15 @@ void RecoveryManager::undo() {
                     char* bitmap = page->get_data() + Page::OFFSET_PAGE_HDR + sizeof(RmPageHdr);
                     char* slots = bitmap + file_hdr.bitmap_size;
 
+                    bool was_set = Bitmap::is_set(bitmap, rid.slot_no);
                     Bitmap::set(bitmap, rid.slot_no);
                     memcpy(slots + rid.slot_no * file_hdr.record_size,
                            delete_rec->delete_value_.data, file_hdr.record_size);
 
                     RmPageHdr* page_hdr = reinterpret_cast<RmPageHdr*>(page->get_data() + Page::OFFSET_PAGE_HDR);
-                    page_hdr->num_records = get_record_count_from_bitmap(bitmap, file_hdr.num_records_per_page);
+                    if (!was_set) {
+                        page_hdr->num_records++;
+                    }
 
                     page->set_page_lsn(record->lsn_);
                     buffer_pool_manager_->unpin_page(page_id, true);

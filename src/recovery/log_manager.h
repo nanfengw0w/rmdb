@@ -46,6 +46,8 @@ public:
     txn_id_t log_tid_;         /* 创建当前日志的事务ID */
     lsn_t prev_lsn_;           /* 事务创建的前一条日志记录的lsn，用于undo */
 
+    virtual ~LogRecord() = default;
+
     // 把日志记录序列化到dest中
     virtual void serialize (char* dest) const {
         memcpy(dest + OFFSET_LOG_TYPE, &log_type_, sizeof(LogType));
@@ -180,6 +182,10 @@ public:
         log_tot_len_ += sizeof(size_t) + table_name_size_;
     }
 
+    ~InsertLogRecord() override {
+        delete[] table_name_;
+    }
+
     // 把insert日志记录序列化到dest中
     void serialize(char* dest) const override {
         LogRecord::serialize(dest);
@@ -245,6 +251,10 @@ public:
         table_name_ = new char[table_name_size_];
         memcpy(table_name_, table_name.c_str(), table_name_size_);
         log_tot_len_ += sizeof(size_t) + table_name_size_;
+    }
+
+    ~DeleteLogRecord() override {
+        delete[] table_name_;
     }
 
     void serialize(char* dest) const override {
@@ -314,6 +324,10 @@ public:
         table_name_ = new char[table_name_size_];
         memcpy(table_name_, table_name.c_str(), table_name_size_);
         log_tot_len_ += sizeof(size_t) + table_name_size_;
+    }
+
+    ~UpdateLogRecord() override {
+        delete[] table_name_;
     }
 
     void serialize(char* dest) const override {
@@ -459,6 +473,8 @@ public:
     }
 
 private:
+    void flush_log_to_disk_unlocked();
+
     std::atomic<lsn_t> global_lsn_{0};  // 全局lsn，递增，用于为每条记录分发lsn
     std::mutex latch_;                  // 用于对log_buffer_的互斥访问
     LogBuffer log_buffer_;              // 日志缓冲区

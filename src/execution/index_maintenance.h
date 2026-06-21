@@ -87,7 +87,7 @@ inline bool record_matches_col_key(const ColMeta &col, const RmRecord *record, c
 inline void check_logical_key_write_conflict(SmManager *sm_manager, const TabMeta &tab,
                                              const std::string &tab_name, const char *record_data,
                                              std::optional<Rid> self, Context *context) {
-    if (!is_mvcc_txn(context) || tab.cols.empty()) {
+    if (!is_snapshot_txn(context) || tab.cols.empty()) {
         return;
     }
 
