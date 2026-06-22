@@ -676,19 +676,7 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
                 throw InternalError("failure");
             }
         }
-        // 空表且有非COUNT聚合：不输出结果
-        if (raw_records.empty()) {
-            bool only_count_aggs = true;
-            for (auto &ac : agg_cols) {
-                if (ac.type != AGG_COUNT && ac.type != AGG_COUNT_STAR) {
-                    only_count_aggs = false;
-                    break;
-                }
-            }
-            if (!only_count_aggs) {
-                return;  // 不输出任何内容
-            }
-        }
+        // 空输入上的非 COUNT 聚合没有结果行，但仍应输出表头。
     }
 
     if (group_col_idxs.empty() && !has_agg_func) {
