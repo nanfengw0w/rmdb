@@ -274,6 +274,15 @@ static std::string trim_str(const std::string &s) {
     return s.substr(start, end - start + 1);
 }
 
+static std::string unqualify_col_name(const std::string &s) {
+    std::string name = trim_str(s);
+    size_t dot = name.rfind('.');
+    if (dot != std::string::npos) {
+        name = name.substr(dot + 1);
+    }
+    return trim_str(name);
+}
+
 // 辅助：按分隔符分割字符串
 static std::vector<std::string> split_str(const std::string &s, const std::string &delim) {
     std::vector<std::string> result;
@@ -322,7 +331,7 @@ static AggType parse_agg_func(const std::string &col_expr, std::string &inner_co
     size_t rp = col_expr.rfind(')');
     if (lp == std::string::npos || rp == std::string::npos || rp <= lp) return AGG_NONE;
     std::string func = to_lower_str(trim_str(col_expr.substr(0, lp)));
-    inner_col = trim_str(col_expr.substr(lp + 1, rp - lp - 1));
+    inner_col = unqualify_col_name(col_expr.substr(lp + 1, rp - lp - 1));
     // Handle COUNT( * ) with spaces
     if (func == "count" && (inner_col == "*" || inner_col == "* ")) {
         inner_col = "*";
@@ -373,7 +382,12 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
         size_t pos = sql_lower.find(kw, from_start);
         if (pos != std::string::npos) from_end = std::min(from_end, pos);
     }
-    std::string tab_name = trim_str(sql.substr(from_start + 6, from_end - from_start - 6));
+    std::string from_part = trim_str(sql.substr(from_start + 6, from_end - from_start - 6));
+    std::string tab_name = from_part;
+    {
+        std::istringstream from_iss(from_part);
+        from_iss >> tab_name;
+    }
 
     // 3. 获取表元数据
     TabMeta &tab = sm_manager_->db_.get_table(tab_name);
@@ -396,8 +410,20 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
     // 检查WHERE中是否使用了聚合函数
     if (!where_clause.empty()) {
         std::string wc_lower = to_lower_str(where_clause);
-        for (auto &fn : {"count(", "max(", "min(", "sum(", "avg("}) {
-            if (wc_lower.find(fn) != std::string::npos) {
+        auto has_agg_call = [&](const std::string &fn) -> bool {
+            size_t pos = 0;
+            while ((pos = wc_lower.find(fn, pos)) != std::string::npos) {
+                bool left_ok = (pos == 0 || (!isalnum(static_cast<unsigned char>(wc_lower[pos - 1])) &&
+                                             wc_lower[pos - 1] != '_'));
+                size_t p = pos + fn.length();
+                while (p < wc_lower.length() && isspace(static_cast<unsigned char>(wc_lower[p]))) p++;
+                if (left_ok && p < wc_lower.length() && wc_lower[p] == '(') return true;
+                pos += fn.length();
+            }
+            return false;
+        };
+        for (auto &fn : {"count", "max", "min", "sum", "avg"}) {
+            if (has_agg_call(fn)) {
                 throw InternalError("failure");
             }
         }
@@ -462,7 +488,7 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
             else if (op_str == ">=") op = OP_GE;
             else continue;
 
-            auto col_it = tab.get_col(col_name);
+            auto col_it = tab.get_col(unqualify_col_name(col_name));
             char *rec_data = rec->data + col_it->offset;
             int cmp_result = 0;
             if (col_it->type == TYPE_INT) {
@@ -507,7 +533,7 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
             std::string gb_cols = trim_str(sql.substr(gb_pos + 10, gb_end - gb_pos - 10));
             auto parts = split_str(gb_cols, ",");
             for (auto &p : parts) {
-                auto col_it = tab.get_col(trim_str(p));
+                auto col_it = tab.get_col(unqualify_col_name(p));
                 group_col_idxs.push_back(col_it - tab.cols.begin());
             }
         }
@@ -553,9 +579,9 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
             ac.col_offset = 0;
             if (ac.alias.empty()) ac.alias = "count(*)";
         } else {
-            auto col_it = tab.get_col(item);
+            auto col_it = tab.get_col(unqualify_col_name(item));
             ac.type = AGG_NONE;
-            ac.col_name = item;
+            ac.col_name = unqualify_col_name(item);
             ac.col_idx = col_it - tab.cols.begin();
             ac.col_type = col_it->type;
             ac.col_len = col_it->len;
@@ -598,6 +624,7 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
         int count;
     };
     std::vector<GroupResult> results;
+    bool suppress_empty_non_count_agg = false;
 
     auto compute_group = [&](const std::vector<std::vector<char>*> &rows) {
         GroupResult gr;
@@ -676,7 +703,6 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
                 throw InternalError("failure");
             }
         }
-        // 空输入上的非 COUNT 聚合没有结果行，但仍应输出表头。
     }
 
     if (group_col_idxs.empty() && !has_agg_func) {
@@ -698,6 +724,8 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
             std::vector<std::vector<char>*> ptrs;
             for (auto &r : raw_records) ptrs.push_back(&r);
             compute_group(ptrs);
+        } else {
+            suppress_empty_non_count_agg = true;
         }
     } else {
         // 有GROUP BY，按GROUP BY列分组 (保持插入顺序)
@@ -707,9 +735,10 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
             std::string key;
             for (int idx : group_col_idxs) {
                 auto &col = tab.cols[idx];
-                if (col.type == TYPE_INT) key += std::to_string(*(int*)(row.data() + col.offset)) + "|";
-                else if (col.type == TYPE_FLOAT) key += std::to_string(*(float*)(row.data() + col.offset)) + "|";
-                else key += std::string(row.data() + col.offset, col.len) + "|";
+                char type_tag = static_cast<char>(col.type);
+                key.append(&type_tag, sizeof(type_tag));
+                key.append(reinterpret_cast<const char *>(&col.len), sizeof(col.len));
+                key.append(row.data() + col.offset, col.len);
             }
             auto it = key_to_idx.find(key);
             if (it == key_to_idx.end()) {
@@ -836,7 +865,7 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
                             col_val = it->count;
                         } else if (agg_type == AGG_MAX || agg_type == AGG_MIN ||
                                    agg_type == AGG_SUM || agg_type == AGG_AVG) {
-                            auto col_it = tab.get_col(inner_col);
+                            auto col_it = tab.get_col(unqualify_col_name(inner_col));
                             double sum_v = 0, min_v = 0, max_v = 0;
                             int cnt = 0;
                             for (auto row : it->rows) {
@@ -909,15 +938,17 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
                     p = trim_str(p.substr(0, p.length() - 4));
                 }
                 oc.col_idx = -1;
+                std::string p_col = unqualify_col_name(p);
                 for (size_t i = 0; i < agg_cols.size(); i++) {
-                    if (agg_cols[i].alias == p || agg_cols[i].col_name == p) {
+                    if (agg_cols[i].alias == p || agg_cols[i].col_name == p || agg_cols[i].col_name == p_col) {
                         oc.col_idx = i;
                         break;
                     }
                 }
                 if (oc.col_idx == -1) {
                     for (size_t i = 0; i < agg_cols.size(); i++) {
-                        if (to_lower_str(agg_cols[i].col_name) == to_lower_str(p)) {
+                        if (to_lower_str(agg_cols[i].col_name) == to_lower_str(p) ||
+                            to_lower_str(agg_cols[i].col_name) == to_lower_str(p_col)) {
                             oc.col_idx = i;
                             break;
                         }
@@ -970,6 +1001,10 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
     }
 
     // 13. 输出结果
+    if (suppress_empty_non_count_agg) {
+        return;
+    }
+
     std::vector<std::string> captions;
     for (auto &ac : agg_cols) captions.push_back(ac.alias);
 

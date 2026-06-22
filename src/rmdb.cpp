@@ -870,16 +870,15 @@ void *client_handler(void *sock_fd) {
                 sql_raw.pop_back();
             std::string sql_lower = sql_raw;
             for (auto &c : sql_lower) c = tolower(c);
-            // Check for aggregate functions - use word boundary to avoid false matches
-            auto has_word = [&](const std::string &word) -> bool {
+            auto has_agg_func_call = [&](const std::string &fn) -> bool {
                 size_t pos = 0;
-                while ((pos = sql_lower.find(word, pos)) != std::string::npos) {
-                    // Check character before: should not be alphanumeric or underscore
-                    if (pos > 0 && (isalnum(sql_lower[pos-1]) || sql_lower[pos-1] == '_')) {
-                        pos += word.length();
-                        continue;
-                    }
-                    return true;
+                while ((pos = sql_lower.find(fn, pos)) != std::string::npos) {
+                    bool left_ok = (pos == 0 || (!isalnum(static_cast<unsigned char>(sql_lower[pos - 1])) &&
+                                                 sql_lower[pos - 1] != '_'));
+                    size_t p = pos + fn.length();
+                    while (p < sql_lower.length() && isspace(static_cast<unsigned char>(sql_lower[p]))) p++;
+                    if (left_ok && p < sql_lower.length() && sql_lower[p] == '(') return true;
+                    pos += fn.length();
                 }
                 return false;
             };
@@ -896,11 +895,11 @@ void *client_handler(void *sock_fd) {
             };
             bool has_agg = has_keyword("group by") ||
                            has_keyword("having") ||
-                           has_word("count(") ||
-                           has_word("max(") ||
-                           has_word("min(") ||
-                           has_word("sum(") ||
-                           has_word("avg(") ||
+                           has_agg_func_call("count") ||
+                           has_agg_func_call("max") ||
+                           has_agg_func_call("min") ||
+                           has_agg_func_call("sum") ||
+                           has_agg_func_call("avg") ||
                            sql_lower.find(" limit ") != std::string::npos;
             bool has_multi_orderby = false;
             if (has_keyword("order by")) {
