@@ -449,33 +449,18 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
         }
         for (auto &cond : conds) {
             CompOp op;
-            // Token化: 按空格分割为 tokens
-            std::vector<std::string> tokens;
-            {
-                std::istringstream iss(cond);
-                std::string tok;
-                while (iss >> tok) tokens.push_back(tok);
-            }
             std::string col_name, op_str, val_str;
-            if (tokens.size() >= 3 && (tokens[1] == "=" || tokens[1] == "<" || tokens[1] == ">" ||
-                tokens[1] == "<=" || tokens[1] == ">=" || tokens[1] == "<>" || tokens[1] == "!=")) {
-                col_name = tokens[0];
-                op_str = tokens[1];
-                val_str = tokens[2];
-            } else {
-                // Fallback: 找到列名后，从列名之后找操作符
-                size_t op_pos = std::string::npos;
-                for (auto &o : {"<=", ">=", "<>", "!=", "=", "<", ">"}) {
-                    size_t p = cond.find(o);
-                    if (p != std::string::npos && (op_pos == std::string::npos || p < op_pos)) {
-                        op_pos = p;
-                        op_str = o;
-                    }
+            size_t op_pos = std::string::npos;
+            for (auto &o : {"<=", ">=", "<>", "!=", "=", "<", ">"}) {
+                size_t p = cond.find(o);
+                if (p != std::string::npos && (op_pos == std::string::npos || p < op_pos)) {
+                    op_pos = p;
+                    op_str = o;
                 }
-                if (op_pos == std::string::npos) continue;
-                col_name = trim_str(cond.substr(0, op_pos));
-                val_str = trim_str(cond.substr(op_pos + op_str.length()));
             }
+            if (op_pos == std::string::npos) continue;
+            col_name = trim_str(cond.substr(0, op_pos));
+            val_str = trim_str(cond.substr(op_pos + op_str.length()));
             if (!val_str.empty() && val_str.front() == '\'' && val_str.back() == '\'')
                 val_str = val_str.substr(1, val_str.length() - 2);
 
@@ -558,6 +543,26 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
         if (as_pos != std::string::npos) {
             ac.alias = trim_str(item.substr(as_pos + 4));
             item = trim_str(item.substr(0, as_pos));
+        } else {
+            size_t rp = item.rfind(')');
+            if (rp != std::string::npos) {
+                std::string trailing = trim_str(item.substr(rp + 1));
+                if (!trailing.empty() && trailing.find(' ') == std::string::npos &&
+                    trailing.find('\t') == std::string::npos) {
+                    ac.alias = trailing;
+                    item = trim_str(item.substr(0, rp + 1));
+                }
+            }
+            if (ac.alias.empty()) {
+                std::istringstream item_iss(item);
+                std::vector<std::string> tokens;
+                std::string token;
+                while (item_iss >> token) tokens.push_back(token);
+                if (tokens.size() == 2) {
+                    item = tokens[0];
+                    ac.alias = tokens[1];
+                }
+            }
         }
         std::string inner_col;
         ac.type = parse_agg_func(item, inner_col);
@@ -657,8 +662,8 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
                 gr.agg_is_str.push_back(false);
                 if (ac.type == AGG_COUNT || ac.type == AGG_COUNT_STAR) {
                     gr.agg_strs.push_back(std::to_string((int)result_val));
-                } else if (ac.type == AGG_SUM || ac.type == AGG_AVG) {
-                    // SUM/AVG are numeric aggregate results and use float-style output.
+                } else if (ac.type == AGG_AVG) {
+                    // AVG always outputs float.
                     gr.agg_strs.push_back(std::to_string(result_val));
                 } else if (ac.col_type == TYPE_INT) {
                     gr.agg_strs.push_back(std::to_string((int)result_val));
@@ -846,12 +851,24 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
 
                     // 先在agg_cols中查找，如果找不到则直接计算
                     int agg_idx = -1;
-                    for (size_t ai = 0; ai < agg_cols.size(); ai++) {
-                        if (agg_cols[ai].type == agg_type) {
-                            if (agg_type == AGG_COUNT_STAR && inner_col == "*") {
-                                agg_idx = ai; break;
-                            } else if (agg_cols[ai].col_name == inner_col) {
-                                agg_idx = ai; break;
+                    if (agg_type == AGG_NONE) {
+                        std::string left_name = trim_str(left_expr);
+                        std::string left_col = unqualify_col_name(left_name);
+                        for (size_t ai = 0; ai < agg_cols.size(); ai++) {
+                            if (to_lower_str(agg_cols[ai].alias) == to_lower_str(left_name) ||
+                                to_lower_str(agg_cols[ai].col_name) == to_lower_str(left_col)) {
+                                agg_idx = ai;
+                                break;
+                            }
+                        }
+                    } else {
+                        for (size_t ai = 0; ai < agg_cols.size(); ai++) {
+                            if (agg_cols[ai].type == agg_type) {
+                                if (agg_type == AGG_COUNT_STAR && inner_col == "*") {
+                                    agg_idx = ai; break;
+                                } else if (agg_cols[ai].col_name == inner_col) {
+                                    agg_idx = ai; break;
+                                }
                             }
                         }
                     }
