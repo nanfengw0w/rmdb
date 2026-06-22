@@ -15,11 +15,17 @@ See the Mulan PSL v2 for more details. */
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cstring>
+#include <fstream>
+#include <iostream>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 
 #include "errors.h"
+#include "common/config.h"
 #include "common/sql_rewrite.h"
+#include "execution/index_maintenance.h"
 #include "optimizer/optimizer.h"
 #include "recovery/log_recovery.h"
 #include "optimizer/plan.h"
@@ -31,6 +37,17 @@ See the Mulan PSL v2 for more details. */
 #define MAX_CONN_LIMIT 8
 
 static bool should_exit = false;
+std::atomic<bool> enable_output_file{true};
+
+static void append_output_line(const std::string &line) {
+    if (!enable_output_file.load()) {
+        return;
+    }
+    std::fstream outfile;
+    outfile.open("output.txt", std::ios::out | std::ios::app);
+    outfile << line;
+    outfile.close();
+}
 
 static void set_response(char *data_send, int *offset, const std::string &msg) {
     if (data_send == nullptr || offset == nullptr) {
@@ -444,6 +461,183 @@ static void execute_fast_insert_direct(const std::string &tab_name, std::vector<
     }
 }
 
+static bool try_parse_load_command_local(const std::string &sql, std::string &file_name,
+                                         std::string &tab_name) {
+    std::string raw = trim_local(sql);
+    while (!raw.empty() && raw.back() == ';') {
+        raw.pop_back();
+        raw = trim_local(raw);
+    }
+
+    std::string lower = lower_local(raw);
+    const std::string prefix = "load ";
+    if (lower.rfind(prefix, 0) != 0) {
+        return false;
+    }
+
+    size_t into_pos = find_keyword_local(lower, " into ", prefix.size());
+    if (into_pos == std::string::npos) {
+        return false;
+    }
+
+    file_name = trim_local(raw.substr(prefix.size(), into_pos - prefix.size()));
+    tab_name = trim_local(raw.substr(into_pos + 6));
+    if (file_name.size() >= 2 &&
+        ((file_name.front() == '\'' && file_name.back() == '\'') ||
+         (file_name.front() == '"' && file_name.back() == '"'))) {
+        file_name = file_name.substr(1, file_name.size() - 2);
+    }
+    return !file_name.empty() && !tab_name.empty();
+}
+
+static std::string strip_csv_quotes_local(std::string value) {
+    value = trim_local(std::move(value));
+    if (value.size() >= 2 &&
+        ((value.front() == '\'' && value.back() == '\'') ||
+         (value.front() == '"' && value.back() == '"'))) {
+        return value.substr(1, value.size() - 2);
+    }
+    return value;
+}
+
+static int parse_int_csv_local(const std::string &text) {
+    std::string value = trim_local(text);
+    size_t consumed = 0;
+    int result = std::stoi(value, &consumed);
+    if (consumed != value.size()) {
+        throw RMDBError("Invalid integer value in load file");
+    }
+    return result;
+}
+
+static float parse_float_csv_local(const std::string &text) {
+    std::string value = trim_local(text);
+    size_t consumed = 0;
+    float result = std::stof(value, &consumed);
+    if (consumed != value.size()) {
+        throw RMDBError("Invalid float value in load file");
+    }
+    return result;
+}
+
+static void fill_record_from_csv_tokens_local(const TabMeta &tab, const std::vector<std::string> &tokens,
+                                              RmRecord &rec) {
+    if (tokens.size() != tab.cols.size()) {
+        throw InvalidValueCountError();
+    }
+    memset(rec.data, 0, rec.size);
+    for (size_t i = 0; i < tab.cols.size(); ++i) {
+        const auto &col = tab.cols[i];
+        char *dst = rec.data + col.offset;
+        if (col.type == TYPE_INT) {
+            *reinterpret_cast<int *>(dst) = parse_int_csv_local(tokens[i]);
+        } else if (col.type == TYPE_FLOAT) {
+            *reinterpret_cast<float *>(dst) = parse_float_csv_local(tokens[i]);
+        } else if (col.type == TYPE_STRING) {
+            std::string value = strip_csv_quotes_local(tokens[i]);
+            if (col.len < static_cast<int>(value.size())) {
+                throw StringOverflowError();
+            }
+            memset(dst, 0, col.len);
+            memcpy(dst, value.data(), value.size());
+        } else {
+            throw InternalError("Unexpected field type");
+        }
+    }
+}
+
+static void flush_loaded_table_local(const std::string &tab_name) {
+    auto fh = sm_manager->fhs_.at(tab_name).get();
+    int table_fd = fh->GetFd();
+    disk_manager->write_page(table_fd, RM_FILE_HDR_PAGE,
+                             reinterpret_cast<const char *>(&fh->get_file_hdr_ref()), sizeof(RmFileHdr));
+    buffer_pool_manager->flush_all_pages(table_fd);
+
+    TabMeta &tab = sm_manager->db_.get_table(tab_name);
+    for (const auto &index : tab.indexes) {
+        auto ix_name = sm_manager->get_ix_manager()->get_index_name(tab_name, index.cols);
+        auto ih = sm_manager->ihs_.at(ix_name).get();
+        ih->flush_file_header();
+        buffer_pool_manager->flush_all_pages(ih->GetFd());
+    }
+    sm_manager->flush_meta();
+    log_manager->flush_log_to_disk();
+}
+
+static size_t execute_load_file_direct(const std::string &file_name, const std::string &tab_name) {
+    TabMeta &tab = sm_manager->db_.get_table(tab_name);
+    RmFileHandle *fh = sm_manager->fhs_.at(tab_name).get();
+
+    std::ifstream input(file_name);
+    if (!input.is_open()) {
+        throw RMDBError("Cannot open load file: " + file_name);
+    }
+
+    std::string line;
+    std::getline(input, line);  // header
+    size_t loaded_rows = 0;
+    while (std::getline(input, line)) {
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        if (trim_local(line).empty()) {
+            continue;
+        }
+
+        std::vector<std::string> tokens = split_commas_local(line);
+        RmRecord rec(fh->get_file_hdr().record_size);
+        fill_record_from_csv_tokens_local(tab, tokens, rec);
+
+        std::vector<std::vector<char>> index_keys;
+        index_keys.reserve(tab.indexes.size());
+        for (const auto &index : tab.indexes) {
+            auto key = index_maintenance::build_key(index, rec.data);
+            index_maintenance::check_unique_conflict(sm_manager.get(), tab_name, index, key.data(),
+                                                     std::nullopt, nullptr);
+            index_keys.emplace_back(std::move(key));
+        }
+
+        Rid rid = fh->insert_record(rec.data, nullptr);
+        for (size_t i = 0; i < tab.indexes.size(); ++i) {
+            auto ih = index_maintenance::get_index_handle(sm_manager.get(), tab_name, tab.indexes[i]);
+            ih->insert_entry(index_keys[i].data(), rid, nullptr);
+        }
+        loaded_rows++;
+    }
+
+    flush_loaded_table_local(tab_name);
+    return loaded_rows;
+}
+
+static bool try_handle_load_command(const std::string &sql, char *data_send, int *offset, int fd) {
+    std::string file_name;
+    std::string tab_name;
+    if (!try_parse_load_command_local(sql, file_name, tab_name)) {
+        return false;
+    }
+
+    memset(data_send, '\0', BUFFER_LENGTH);
+    *offset = 0;
+    try {
+        execute_load_file_direct(file_name, tab_name);
+    } catch (RMDBError &e) {
+        std::cerr << e.what() << std::endl;
+        set_response(data_send, offset, std::string(e.what()) + "\n");
+        append_output_line("failure\n");
+    } catch (std::exception &e) {
+        std::cerr << "Load error: " << e.what() << std::endl;
+        set_response(data_send, offset, std::string("Error: ") + e.what() + "\n");
+        append_output_line("failure\n");
+    } catch (...) {
+        std::cerr << "Unknown load error" << std::endl;
+        set_response(data_send, offset, "Error: Unknown error\n");
+        append_output_line("failure\n");
+    }
+
+    write(fd, data_send, *offset + 1);
+    return true;
+}
+
 static void clear_fast_autocommit_state(Transaction *txn) {
     if (txn == nullptr || txn->get_txn_mode() ||
         txn->get_state() != TransactionState::COMMITTED ||
@@ -484,34 +678,22 @@ static bool try_handle_fast_insert(const std::string &sql, txn_id_t *txn_id,
         txn_manager->abort(context->txn_, log_manager.get());
         std::cout << e.GetInfo() << std::endl;
 
-        std::fstream outfile;
-        outfile.open("output.txt", std::ios::out | std::ios::app);
-        outfile << "abort\n";
-        outfile.close();
+        append_output_line("abort\n");
     } catch (RMDBError &e) {
         std::cerr << e.what() << std::endl;
         set_response(data_send, offset, std::string(e.what()) + "\n");
 
-        std::fstream outfile;
-        outfile.open("output.txt", std::ios::out | std::ios::app);
-        outfile << "failure\n";
-        outfile.close();
+        append_output_line("failure\n");
     } catch (std::exception &e) {
         std::cerr << "Standard exception: " << e.what() << std::endl;
         set_response(data_send, offset, std::string("Error: ") + e.what() + "\n");
 
-        std::fstream outfile;
-        outfile.open("output.txt", std::ios::out | std::ios::app);
-        outfile << "failure\n";
-        outfile.close();
+        append_output_line("failure\n");
     } catch (...) {
         std::cerr << "Unknown exception caught" << std::endl;
         set_response(data_send, offset, "Error: Unknown error\n");
 
-        std::fstream outfile;
-        outfile.open("output.txt", std::ios::out | std::ios::app);
-        outfile << "failure\n";
-        outfile.close();
+        append_output_line("failure\n");
     }
 
     write(fd, data_send, *offset + 1);
@@ -581,6 +763,20 @@ void *client_handler(void *sock_fd) {
             log_manager->flush_log_to_disk();
             _exit(1);
         }
+        if (control_cmd == "set output_file off") {
+            enable_output_file.store(false);
+            memset(data_send, '\0', BUFFER_LENGTH);
+            offset = 0;
+            if (write(fd, data_send, offset + 1) == -1) break;
+            continue;
+        }
+        if (control_cmd == "set output_file on") {
+            enable_output_file.store(true);
+            memset(data_send, '\0', BUFFER_LENGTH);
+            offset = 0;
+            if (write(fd, data_send, offset + 1) == -1) break;
+            continue;
+        }
 
         // Handle create static_checkpoint
         {
@@ -612,8 +808,17 @@ void *client_handler(void *sock_fd) {
 
                     // (3) Flush all dirty pages to disk
                     for (auto &entry : sm_manager->fhs_) {
-                        int fd_table = entry.second->GetFd();
+                        auto fh = entry.second.get();
+                        int fd_table = fh->GetFd();
+                        disk_manager->write_page(fd_table, RM_FILE_HDR_PAGE,
+                                                 reinterpret_cast<const char *>(&fh->get_file_hdr_ref()),
+                                                 sizeof(RmFileHdr));
                         buffer_pool_manager->flush_all_pages(fd_table);
+                    }
+                    for (auto &entry : sm_manager->ihs_) {
+                        auto ih = entry.second.get();
+                        ih->flush_file_header();
+                        buffer_pool_manager->flush_all_pages(ih->GetFd());
                     }
 
                     // (4) Write checkpoint byte offset to restart file
@@ -628,6 +833,10 @@ void *client_handler(void *sock_fd) {
                 if (write(fd, data_send, offset + 1) == -1) break;
                 continue;
             }
+        }
+
+        if (try_handle_load_command(std::string(data_recv), data_send, &offset, fd)) {
+            continue;
         }
 
         // 检查是否是 SET TRANSACTION ISOLATION LEVEL 命令（必须在aggregate处理之前）
@@ -725,10 +934,7 @@ void *client_handler(void *sock_fd) {
                 } catch (std::exception &e) {
                     std::cerr << "Aggregation error: " << e.what() << std::endl;
                     set_response(data_send, &offset, std::string(e.what()) + "\n");
-                    std::fstream outfile;
-                    outfile.open("output.txt", std::ios::out | std::ios::app);
-                    outfile << "failure\n";
-                    outfile.close();
+                    append_output_line("failure\n");
                     if (write(fd, data_send, offset + 1) == -1) break;
                     continue;
                 }
@@ -755,10 +961,7 @@ void *client_handler(void *sock_fd) {
                 set_response(data_send, &offset, "OK\n");
             } catch (std::exception &e) {
                 set_response(data_send, &offset, std::string("failure\n"));
-                std::fstream outfile;
-                outfile.open("output.txt", std::ios::out | std::ios::app);
-                outfile << "failure\n";
-                outfile.close();
+                append_output_line("failure\n");
             }
             if (write(fd, data_send, offset + 1) == -1) break;
             continue;
@@ -795,32 +998,20 @@ void *client_handler(void *sock_fd) {
                     txn_manager->abort(context->txn_, log_manager.get());
                     std::cout << e.GetInfo() << std::endl;
 
-                    std::fstream outfile;
-                    outfile.open("output.txt", std::ios::out | std::ios::app);
-                    outfile << "abort\n";
-                    outfile.close();
+                    append_output_line("abort\n");
                 } catch (RMDBError &e) {
                     std::cerr << e.what() << std::endl;
                     set_response(data_send, &offset, std::string(e.what()) + "\n");
 
-                    std::fstream outfile;
-                    outfile.open("output.txt", std::ios::out | std::ios::app);
-                    outfile << "failure\n";
-                    outfile.close();
+                    append_output_line("failure\n");
                 } catch (std::exception &e) {
                     std::cerr << "Standard exception: " << e.what() << std::endl;
                     set_response(data_send, &offset, std::string("Error: ") + e.what() + "\n");
-                    std::fstream outfile;
-                    outfile.open("output.txt", std::ios::out | std::ios::app);
-                    outfile << "failure\n";
-                    outfile.close();
+                    append_output_line("failure\n");
                 } catch (...) {
                     std::cerr << "Unknown exception caught" << std::endl;
                     set_response(data_send, &offset, "Error: Unknown error\n");
-                    std::fstream outfile;
-                    outfile.open("output.txt", std::ios::out | std::ios::app);
-                    outfile << "failure\n";
-                    outfile.close();
+                    append_output_line("failure\n");
                 }
             } else {
                 set_response(data_send, &offset, "Error: parse failed\n");
@@ -888,10 +1079,7 @@ void *client_handler(void *sock_fd) {
                     txn_manager->abort(context->txn_, log_manager.get());
                     std::cout << e.GetInfo() << std::endl;
 
-                    std::fstream outfile;
-                    outfile.open("output.txt", std::ios::out | std::ios::app);
-                    outfile << "abort\n";
-                    outfile.close();
+                    append_output_line("abort\n");
                 } catch (RMDBError &e) {
                     // 遇到异常，需要打印failure到output.txt文件中，并发异常信息返回给客户端
                     std::cerr << e.what() << std::endl;
@@ -899,26 +1087,17 @@ void *client_handler(void *sock_fd) {
                     set_response(data_send, &offset, std::string(e.what()) + "\n");
 
                     // 将报错信息写入output.txt
-                    std::fstream outfile;
-                    outfile.open("output.txt",std::ios::out | std::ios::app);
-                    outfile << "failure\n";
-                    outfile.close();
+                    append_output_line("failure\n");
                 } catch (std::exception &e) {
                     std::cerr << "Standard exception: " << e.what() << std::endl;
                     std::string err_msg = std::string("Error: ") + e.what();
                     set_response(data_send, &offset, err_msg + "\n");
-                    std::fstream outfile;
-                    outfile.open("output.txt", std::ios::out | std::ios::app);
-                    outfile << "failure\n";
-                    outfile.close();
+                    append_output_line("failure\n");
                 } catch (...) {
                     std::cerr << "Unknown exception caught" << std::endl;
                     std::string err_msg = "Error: Unknown error";
                     set_response(data_send, &offset, err_msg + "\n");
-                    std::fstream outfile;
-                    outfile.open("output.txt", std::ios::out | std::ios::app);
-                    outfile << "failure\n";
-                    outfile.close();
+                    append_output_line("failure\n");
                 }
             } else {
                 set_response(data_send, &offset, "Error: empty query\n");

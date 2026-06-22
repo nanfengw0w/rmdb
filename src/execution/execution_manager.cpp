@@ -15,6 +15,7 @@ See the Mulan PSL v2 for more details. */
 #include <sstream>
 #include <set>
 #include "executor_delete.h"
+#include "common/config.h"
 #include "parser/ast.h"
 #include "common/sql_rewrite.h"
 #include "optimizer/optimizer.h"
@@ -197,13 +198,16 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
     rec_printer.print_record(captions, context);
     rec_printer.print_separator(context);
     // print header into file
+    bool write_output_file = enable_output_file.load();
     std::fstream outfile;
-    outfile.open("output.txt", std::ios::out | std::ios::app);
-    outfile << "|";
-    for(int i = 0; i < captions.size(); ++i) {
-        outfile << " " << captions[i] << " |";
+    if (write_output_file) {
+        outfile.open("output.txt", std::ios::out | std::ios::app);
+        outfile << "|";
+        for(int i = 0; i < captions.size(); ++i) {
+            outfile << " " << captions[i] << " |";
+        }
+        outfile << "\n";
     }
-    outfile << "\n";
 
     // Print records
     size_t num_rec = 0;
@@ -227,14 +231,18 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
         // print record into buffer
         rec_printer.print_record(columns, context);
         // print record into file
-        outfile << "|";
-        for(int i = 0; i < columns.size(); ++i) {
-            outfile << " " << columns[i] << " |";
+        if (write_output_file) {
+            outfile << "|";
+            for(int i = 0; i < columns.size(); ++i) {
+                outfile << " " << columns[i] << " |";
+            }
+            outfile << "\n";
         }
-        outfile << "\n";
         num_rec++;
     }
-    outfile.close();
+    if (write_output_file) {
+        outfile.close();
+    }
     // Print footer into buffer
     rec_printer.print_separator(context);
     // Print record count into buffer
@@ -977,11 +985,14 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
     std::vector<std::string> captions;
     for (auto &ac : agg_cols) captions.push_back(ac.alias);
 
+    bool write_output_file = enable_output_file.load();
     std::fstream outfile;
-    outfile.open("output.txt", std::ios::out | std::ios::app);
-    outfile << "|";
-    for (auto &c : captions) outfile << " " << c << " |";
-    outfile << "\n";
+    if (write_output_file) {
+        outfile.open("output.txt", std::ios::out | std::ios::app);
+        outfile << "|";
+        for (auto &c : captions) outfile << " " << c << " |";
+        outfile << "\n";
+    }
 
     RecordPrinter rec_printer(captions.size());
     rec_printer.print_separator(context);
@@ -995,12 +1006,16 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
             columns.push_back(gr.agg_strs[i]);
         }
         rec_printer.print_record(columns, context);
-        outfile << "|";
-        for (auto &c : columns) outfile << " " << c << " |";
-        outfile << "\n";
+        if (write_output_file) {
+            outfile << "|";
+            for (auto &c : columns) outfile << " " << c << " |";
+            outfile << "\n";
+        }
         num_rec++;
     }
-    outfile.close();
+    if (write_output_file) {
+        outfile.close();
+    }
     rec_printer.print_separator(context);
 }
 
@@ -1375,11 +1390,14 @@ void QlManager::handle_union(const std::string &sql, Context *context) {
     }
 
     // 9. 输出
+    bool write_output_file = enable_output_file.load();
     std::fstream outfile;
-    outfile.open("output.txt", std::ios::out | std::ios::app);
-    outfile << "|";
-    for (auto &name : out_names) outfile << " " << name << " |";
-    outfile << "\n";
+    if (write_output_file) {
+        outfile.open("output.txt", std::ios::out | std::ios::app);
+        outfile << "|";
+        for (auto &name : out_names) outfile << " " << name << " |";
+        outfile << "\n";
+    }
 
     RecordPrinter rec_printer(num_cols);
     rec_printer.print_separator(context);
@@ -1389,12 +1407,16 @@ void QlManager::handle_union(const std::string &sql, Context *context) {
     size_t num_rec = 0;
     for (auto &ur : all_rows) {
         rec_printer.print_record(ur.vals, context);
-        outfile << "|";
-        for (auto &v : ur.vals) outfile << " " << v << " |";
-        outfile << "\n";
+        if (write_output_file) {
+            outfile << "|";
+            for (auto &v : ur.vals) outfile << " " << v << " |";
+            outfile << "\n";
+        }
         num_rec++;
     }
-    outfile.close();
+    if (write_output_file) {
+        outfile.close();
+    }
     rec_printer.print_separator(context);
     RecordPrinter::print_record_count(num_rec, context);
 }
@@ -2112,10 +2134,12 @@ void QlManager::handle_explain_analyze(const std::string &sql, Context *context)
     sort_explain_attr_lists(output, "condition=[");
     sort_explain_attr_lists(output, "tables=[");
 
-    std::fstream outfile;
-    outfile.open("output.txt", std::ios::out | std::ios::app);
-    outfile << output;
-    outfile.close();
+    if (enable_output_file.load()) {
+        std::fstream outfile;
+        outfile.open("output.txt", std::ios::out | std::ios::app);
+        outfile << output;
+        outfile.close();
+    }
 
     memcpy(context->data_send_ + *(context->offset_), output.c_str(), output.size());
     *(context->offset_) += output.size();

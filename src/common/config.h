@@ -23,6 +23,9 @@ extern std::chrono::milliseconds cycle_detection_interval;
 /** True if logging should be enabled, false otherwise. */
 extern std::atomic<bool> enable_logging;
 
+/** True if query results should be appended to output.txt. */
+extern std::atomic<bool> enable_output_file;
+
 /** If ENABLE_LOGGING is true, the log should be flushed to disk every LOG_TIMEOUT. */
 extern std::chrono::duration<int64_t> log_timeout;
 
@@ -55,4 +58,3 @@ static const std::string LOG_FILE_NAME = "db.log";
 static const std::string REPLACER_TYPE = "LRU";
 
 static const std::string DB_META_NAME = "db.meta";
-
