@@ -657,8 +657,8 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
                 gr.agg_is_str.push_back(false);
                 if (ac.type == AGG_COUNT || ac.type == AGG_COUNT_STAR) {
                     gr.agg_strs.push_back(std::to_string((int)result_val));
-                } else if (ac.type == AGG_AVG) {
-                    // AVG always outputs float
+                } else if (ac.type == AGG_SUM || ac.type == AGG_AVG) {
+                    // SUM/AVG are numeric aggregate results and use float-style output.
                     gr.agg_strs.push_back(std::to_string(result_val));
                 } else if (ac.col_type == TYPE_INT) {
                     gr.agg_strs.push_back(std::to_string((int)result_val));
