@@ -663,8 +663,19 @@ static void abort_active_transaction(Context *context) {
     txn_manager->abort(context->txn_, context->log_mgr_);
 }
 
+static bool is_explicit_active_txn(Context *context) {
+    return context != nullptr && context->txn_ != nullptr && context->txn_->get_txn_mode();
+}
+
+static void mark_failed_if_explicit(Context *context, bool *txn_failed) {
+    if (txn_failed != nullptr && is_explicit_active_txn(context)) {
+        *txn_failed = true;
+    }
+}
+
 static bool try_handle_fast_insert(const std::string &sql, txn_id_t *txn_id,
-                                   char *data_send, int *offset, int fd) {
+                                   char *data_send, int *offset, int fd,
+                                   bool *txn_failed) {
     std::string tab_name;
     std::vector<Value> values;
     if (!try_parse_simple_insert_local(sql, tab_name, values)) {
@@ -686,23 +697,27 @@ static bool try_handle_fast_insert(const std::string &sql, txn_id_t *txn_id,
         }
     } catch (TransactionAbortException &e) {
         set_response(data_send, offset, "abort\n");
+        mark_failed_if_explicit(context.get(), txn_failed);
         txn_manager->abort(context->txn_, log_manager.get());
         std::cout << e.GetInfo() << std::endl;
 
         append_output_line("abort\n");
     } catch (RMDBError &e) {
+        mark_failed_if_explicit(context.get(), txn_failed);
         abort_active_transaction(context.get());
         std::cerr << e.what() << std::endl;
         set_response(data_send, offset, std::string(e.what()) + "\n");
 
         append_output_line("failure\n");
     } catch (std::exception &e) {
+        mark_failed_if_explicit(context.get(), txn_failed);
         abort_active_transaction(context.get());
         std::cerr << "Standard exception: " << e.what() << std::endl;
         set_response(data_send, offset, std::string("Error: ") + e.what() + "\n");
 
         append_output_line("failure\n");
     } catch (...) {
+        mark_failed_if_explicit(context.get(), txn_failed);
         abort_active_transaction(context.get());
         std::cerr << "Unknown exception caught" << std::endl;
         set_response(data_send, offset, "Error: Unknown error\n");
@@ -727,6 +742,7 @@ void *client_handler(void *sock_fd) {
     int offset = 0;
     // 记录客户端当前正在执行的事务ID
     txn_id_t txn_id = INVALID_TXN_ID;
+    bool txn_failed = false;
 
     std::string output = "establish client connection, sockfd: " + std::to_string(fd) + "\n";
     std::cout << output;
@@ -790,6 +806,32 @@ void *client_handler(void *sock_fd) {
             offset = 0;
             if (write(fd, data_send, offset + 1) == -1) break;
             continue;
+        }
+
+        if (txn_failed) {
+            if (control_cmd == "begin") {
+                txn_id = INVALID_TXN_ID;
+                txn_failed = false;
+            } else if (control_cmd == "abort" || control_cmd == "rollback") {
+                txn_id = INVALID_TXN_ID;
+                txn_failed = false;
+                memset(data_send, '\0', BUFFER_LENGTH);
+                offset = 0;
+                if (write(fd, data_send, offset + 1) == -1) break;
+                continue;
+            } else if (control_cmd == "commit") {
+                txn_id = INVALID_TXN_ID;
+                txn_failed = false;
+                set_response(data_send, &offset, "abort\n");
+                append_output_line("abort\n");
+                if (write(fd, data_send, offset + 1) == -1) break;
+                continue;
+            } else {
+                set_response(data_send, &offset, "abort\n");
+                append_output_line("abort\n");
+                if (write(fd, data_send, offset + 1) == -1) break;
+                continue;
+            }
         }
 
         // Handle create static_checkpoint
@@ -873,7 +915,7 @@ void *client_handler(void *sock_fd) {
             }
         }
 
-        if (try_handle_fast_insert(std::string(data_recv), &txn_id, data_send, &offset, fd)) {
+        if (try_handle_fast_insert(std::string(data_recv), &txn_id, data_send, &offset, fd, &txn_failed)) {
             continue;
         }
 
@@ -946,6 +988,7 @@ void *client_handler(void *sock_fd) {
                     }
                     continue;
                 } catch (std::exception &e) {
+                    mark_failed_if_explicit(context_agg.get(), &txn_failed);
                     abort_active_transaction(context_agg.get());
                     std::cerr << "Aggregation error: " << e.what() << std::endl;
                     set_response(data_send, &offset, std::string(e.what()) + "\n");
@@ -1010,28 +1053,33 @@ void *client_handler(void *sock_fd) {
                     portal->drop();
                 } catch (TransactionAbortException &e) {
                     set_response(data_send, &offset, "abort\n");
+                    mark_failed_if_explicit(context.get(), &txn_failed);
                     txn_manager->abort(context->txn_, log_manager.get());
                     std::cout << e.GetInfo() << std::endl;
 
                     append_output_line("abort\n");
                 } catch (RMDBError &e) {
+                    mark_failed_if_explicit(context.get(), &txn_failed);
                     abort_active_transaction(context.get());
                     std::cerr << e.what() << std::endl;
                     set_response(data_send, &offset, std::string(e.what()) + "\n");
 
                     append_output_line("failure\n");
                 } catch (std::exception &e) {
+                    mark_failed_if_explicit(context.get(), &txn_failed);
                     abort_active_transaction(context.get());
                     std::cerr << "Standard exception: " << e.what() << std::endl;
                     set_response(data_send, &offset, std::string("Error: ") + e.what() + "\n");
                     append_output_line("failure\n");
                 } catch (...) {
+                    mark_failed_if_explicit(context.get(), &txn_failed);
                     abort_active_transaction(context.get());
                     std::cerr << "Unknown exception caught" << std::endl;
                     set_response(data_send, &offset, "Error: Unknown error\n");
                     append_output_line("failure\n");
                 }
             } else {
+                mark_failed_if_explicit(context.get(), &txn_failed);
                 abort_active_transaction(context.get());
                 set_response(data_send, &offset, "Error: parse failed\n");
             }
@@ -1093,6 +1141,7 @@ void *client_handler(void *sock_fd) {
                 } catch (TransactionAbortException &e) {
                     // 事务需要回滚，需要把abort信息返回给客户端并写入output.txt文件中
                     set_response(data_send, &offset, "abort\n");
+                    mark_failed_if_explicit(context.get(), &txn_failed);
 
                     // 回滚事务
                     txn_manager->abort(context->txn_, log_manager.get());
@@ -1100,6 +1149,7 @@ void *client_handler(void *sock_fd) {
 
                     append_output_line("abort\n");
                 } catch (RMDBError &e) {
+                    mark_failed_if_explicit(context.get(), &txn_failed);
                     abort_active_transaction(context.get());
                     // 遇到异常，需要打印failure到output.txt文件中，并发异常信息返回给客户端
                     std::cerr << e.what() << std::endl;
@@ -1109,12 +1159,14 @@ void *client_handler(void *sock_fd) {
                     // 将报错信息写入output.txt
                     append_output_line("failure\n");
                 } catch (std::exception &e) {
+                    mark_failed_if_explicit(context.get(), &txn_failed);
                     abort_active_transaction(context.get());
                     std::cerr << "Standard exception: " << e.what() << std::endl;
                     std::string err_msg = std::string("Error: ") + e.what();
                     set_response(data_send, &offset, err_msg + "\n");
                     append_output_line("failure\n");
                 } catch (...) {
+                    mark_failed_if_explicit(context.get(), &txn_failed);
                     abort_active_transaction(context.get());
                     std::cerr << "Unknown exception caught" << std::endl;
                     std::string err_msg = "Error: Unknown error";
@@ -1122,10 +1174,12 @@ void *client_handler(void *sock_fd) {
                     append_output_line("failure\n");
                 }
             } else {
+                mark_failed_if_explicit(context.get(), &txn_failed);
                 abort_active_transaction(context.get());
                 set_response(data_send, &offset, "Error: empty query\n");
             }
         } else {
+            mark_failed_if_explicit(context.get(), &txn_failed);
             abort_active_transaction(context.get());
             set_response(data_send, &offset, "Error: parse failed\n");
         }
