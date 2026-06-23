@@ -408,6 +408,28 @@ static void compute_agg(AggType type, const char *data, int len, ColType col_typ
     count_val++;
 }
 
+static std::string read_char_value(const char *data, int len) {
+    std::string value(data, len);
+    value.resize(strlen(value.c_str()));
+    return value;
+}
+
+static std::string compute_string_minmax(AggType type, const std::vector<std::vector<char>*> &rows,
+                                         int offset, int len) {
+    std::string result;
+    bool initialized = false;
+    for (auto row : rows) {
+        std::string value = read_char_value(row->data() + offset, len);
+        if (!initialized) {
+            result = value;
+            initialized = true;
+        } else if ((type == AGG_MIN && value < result) || (type == AGG_MAX && value > result)) {
+            result = value;
+        }
+    }
+    return result;
+}
+
 void QlManager::handle_aggregate(const std::string &sql, Context *context) {
     std::string sql_lower = to_lower_str(sql);
 
@@ -677,6 +699,12 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
                 gr.agg_nums.push_back((double)rows.size());
                 gr.agg_is_str.push_back(false);
             } else if (ac.type == AGG_MAX || ac.type == AGG_MIN || ac.type == AGG_SUM || ac.type == AGG_AVG) {
+                if (ac.col_type == TYPE_STRING && (ac.type == AGG_MAX || ac.type == AGG_MIN)) {
+                    gr.agg_strs.push_back(compute_string_minmax(ac.type, rows, ac.col_offset, ac.col_len));
+                    gr.agg_nums.push_back(0);
+                    gr.agg_is_str.push_back(true);
+                    continue;
+                }
                 double sum_v = 0, min_v = 0, max_v = 0;
                 int cnt = 0;
                 for (auto &row : rows) {
@@ -882,16 +910,22 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
                         } else if (agg_type == AGG_MAX || agg_type == AGG_MIN ||
                                    agg_type == AGG_SUM || agg_type == AGG_AVG) {
                             auto col_it = tab.get_col(unqualify_col_name(inner_col));
-                            double sum_v = 0, min_v = 0, max_v = 0;
-                            int cnt = 0;
-                            for (auto row : it->rows) {
-                                compute_agg(agg_type, row->data() + col_it->offset, col_it->len,
-                                            col_it->type, sum_v, min_v, max_v, cnt);
+                            if (col_it->type == TYPE_STRING &&
+                                (agg_type == AGG_MAX || agg_type == AGG_MIN)) {
+                                lhs_is_str = true;
+                                lhs_str = compute_string_minmax(agg_type, it->rows, col_it->offset, col_it->len);
+                            } else {
+                                double sum_v = 0, min_v = 0, max_v = 0;
+                                int cnt = 0;
+                                for (auto row : it->rows) {
+                                    compute_agg(agg_type, row->data() + col_it->offset, col_it->len,
+                                                col_it->type, sum_v, min_v, max_v, cnt);
+                                }
+                                if (agg_type == AGG_MAX) col_val = max_v;
+                                else if (agg_type == AGG_MIN) col_val = min_v;
+                                else if (agg_type == AGG_SUM) col_val = sum_v;
+                                else col_val = cnt > 0 ? sum_v / cnt : 0;
                             }
-                            if (agg_type == AGG_MAX) col_val = max_v;
-                            else if (agg_type == AGG_MIN) col_val = min_v;
-                            else if (agg_type == AGG_SUM) col_val = sum_v;
-                            else col_val = cnt > 0 ? sum_v / cnt : 0;
                         } else if (agg_type == AGG_NONE) {
                             auto col_it = tab.get_col(unqualify_col_name(left_expr));
                             int col_idx = col_it - tab.cols.begin();
@@ -1056,10 +1090,30 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
                 if (oc.agg_type == AGG_AVG) return cnt > 0 ? sum_v / cnt : 0;
                 return 0.0;
             };
+            auto extra_agg_order_is_string = [&](const OrderCol &oc) {
+                if (!oc.is_extra_agg || (oc.agg_type != AGG_MAX && oc.agg_type != AGG_MIN)) {
+                    return false;
+                }
+                auto col_it = tab.get_col(unqualify_col_name(oc.agg_col_name));
+                return col_it->type == TYPE_STRING;
+            };
+            auto eval_extra_agg_order_str = [&](const GroupResult &gr, const OrderCol &oc) {
+                auto col_it = tab.get_col(unqualify_col_name(oc.agg_col_name));
+                return compute_string_minmax(oc.agg_type, gr.rows, col_it->offset, col_it->len);
+            };
             std::sort(results.begin(), results.end(), [&](const GroupResult &a, const GroupResult &b) {
                 for (auto &oc : order_cols) {
                     if (oc.col_idx < 0 || oc.col_idx >= (int)a.agg_nums.size()) {
                         if (!oc.is_extra_agg) continue;
+                        if (extra_agg_order_is_string(oc)) {
+                            std::string va = eval_extra_agg_order_str(a, oc);
+                            std::string vb = eval_extra_agg_order_str(b, oc);
+                            int cmp = va.compare(vb);
+                            if (cmp != 0) {
+                                return oc.is_desc ? (cmp > 0) : (cmp < 0);
+                            }
+                            continue;
+                        }
                         double va = eval_extra_agg_order(a, oc);
                         double vb = eval_extra_agg_order(b, oc);
                         if (va != vb) {
