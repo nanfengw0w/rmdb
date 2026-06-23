@@ -74,6 +74,47 @@ void rollback_update_index_entries(SmManager *sm_manager, const std::string &tab
     }
 }
 
+void cleanup_committed_mvcc_changes(SmManager *sm_manager, Transaction *txn) {
+    if (sm_manager == nullptr || txn == nullptr || !txn->get_serial_txn_lock_held()) {
+        return;
+    }
+
+    auto write_set = txn->get_write_set();
+    for (auto *wr : *write_set) {
+        auto &tab_name = wr->GetTableName();
+        auto &rid = wr->GetRid();
+        auto fh = sm_manager->fhs_.at(tab_name).get();
+        auto &tab = sm_manager->db_.get_table(tab_name);
+
+        switch (wr->GetWriteType()) {
+            case WType::DELETE_TUPLE: {
+                delete_abort_index_entries(sm_manager, tab_name, tab, wr->GetRecord().data);
+                auto current = fh->get_record(rid, nullptr);
+                if (current != nullptr) {
+                    fh->delete_record(rid, nullptr);
+                }
+                break;
+            }
+            case WType::UPDATE_TUPLE: {
+                auto current = fh->get_record(rid, nullptr);
+                if (current == nullptr) {
+                    break;
+                }
+                for (const auto &index : tab.indexes) {
+                    auto old_key = build_abort_index_key(index, wr->GetRecord().data);
+                    auto current_key = build_abort_index_key(index, current->data);
+                    if (old_key != current_key) {
+                        get_abort_index_handle(sm_manager, tab_name, index)->delete_entry(old_key.data(), nullptr);
+                    }
+                }
+                break;
+            }
+            case WType::INSERT_TUPLE:
+                break;
+        }
+    }
+}
+
 void clear_write_records(Transaction *txn) {
     if (txn == nullptr) {
         return;
@@ -169,6 +210,10 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
         txn->set_prev_lsn(lsn);
         log_manager->flush_log_to_disk();
         log_manager->remove_active_txn(txn->get_transaction_id());
+    }
+
+    if (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE) {
+        cleanup_committed_mvcc_changes(sm_manager_, txn);
     }
 
     // Release all locks held by this transaction
