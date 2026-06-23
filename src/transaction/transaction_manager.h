@@ -70,6 +70,10 @@ public:
 
     void abort(Transaction* txn, LogManager* log_manager);
 
+    void acquire_explicit_txn_lock(Transaction* txn);
+
+    void release_explicit_txn_lock(Transaction* txn);
+
     ConcurrencyMode get_concurrency_mode() { return concurrency_mode_; }
 
     void set_concurrency_mode(ConcurrencyMode concurrency_mode) { concurrency_mode_ = concurrency_mode; }
@@ -447,6 +451,7 @@ private:
     std::atomic<timestamp_t> next_timestamp_{0};    // 用于分发事务时间戳
     std::atomic<int64_t> next_commit_order_{0};  // 用于分发提交顺序
     std::mutex latch_;  // 用于txn_map的并发
+    std::mutex explicit_txn_mutex_;
     SmManager *sm_manager_;
     LockManager *lock_manager_;
     std::mutex session_mutex_;  // 用于会话隔离级别映射的并发

@@ -1154,6 +1154,12 @@ void *client_handler(void *sock_fd) {
     }
 
     // Clear
+    if (txn_id != INVALID_TXN_ID) {
+        Transaction *txn = txn_manager->get_transaction(txn_id);
+        if (txn != nullptr && txn->get_state() == TransactionState::GROWING) {
+            txn_manager->abort(txn, log_manager.get());
+        }
+    }
     std::cout << "Terminating current client_connection..." << std::endl;
     delete[] data_send;
     close(fd);           // close a file descriptor.
