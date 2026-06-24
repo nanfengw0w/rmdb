@@ -91,70 +91,48 @@ inline void check_logical_key_write_conflict(SmManager *sm_manager, const TabMet
         return;
     }
 
+    // 优化：如果第一列有唯一索引，跳过此检查
+    // 原因：
+    // 1. 唯一索引检查(check_unique_conflict)已处理主键冲突
+    // 2. update_record/delete_record中的check_write_conflict已处理并发修改
+    // 3. 唯一索引保证第一列值最多对应一条记录，不存在"逻辑键"冲突
     const auto &key_col = tab.cols.front();
+    for (const auto &index : tab.indexes) {
+        if (index.cols.empty()) continue;
+        if (index.cols[0].name == key_col.name && index.cols[0].tab_name == key_col.tab_name) {
+            // 第一列有索引（在RMDB中所有索引都是唯一的），直接返回
+            return;
+        }
+    }
+
+    // 无索引时回退到全表扫描
     const char *key = record_data + key_col.offset;
     auto fh = sm_manager->get_table_fh(tab_name);
     auto &vm = VersionManager::instance();
 
-    // 优化：如果第一列有索引，使用索引查找匹配记录，避免全表扫描
-    // 对于TPCC等使用主键的场景，第一列通常是主键的一部分，索引查找远快于全表扫描
-    bool used_index = false;
-    for (const auto &index : tab.indexes) {
-        if (index.cols.empty()) continue;
-        // 检查索引的第一列是否与表的第一列匹配
-        if (index.cols[0].name != key_col.name || index.cols[0].tab_name != key_col.tab_name) {
+    RmScan scan(fh);
+    while (!scan.is_end()) {
+        Rid rid = scan.rid();
+        scan.next();
+
+        if (self.has_value() && same_rid(rid, *self)) {
             continue;
         }
 
-        // 使用索引查找匹配的记录
-        auto ih = get_index_handle(sm_manager, tab_name, index);
-        if (ih == nullptr) continue;
-
-        std::vector<char> index_key(index.col_tot_len, 0);
-        memcpy(index_key.data(), key, key_col.len);
-
-        std::vector<Rid> result;
-        if (ih->get_value(index_key.data(), &result, nullptr)) {
-            for (const auto &rid : result) {
-                if (self.has_value() && same_rid(rid, *self)) {
-                    continue;
-                }
-                if (!vm.check_write_conflict(fh->GetFd(), rid, context->txn_)) {
-                    throw TransactionAbortException(context->txn_->get_transaction_id(),
-                        AbortReason::DEADLOCK_PREVENTION);
-                }
-            }
+        auto physical = fh->get_record(rid, nullptr);
+        if (physical == nullptr) {
+            continue;
         }
-        used_index = true;
-        break;
-    }
 
-    // 如果没有可用的索引，回退到全表扫描
-    if (!used_index) {
-        RmScan scan(fh);
-        while (!scan.is_end()) {
-            Rid rid = scan.rid();
-            scan.next();
+        auto visible = fh->get_record(rid, context);
+        if (!record_matches_col_key(key_col, physical.get(), key) &&
+            !record_matches_col_key(key_col, visible.get(), key)) {
+            continue;
+        }
 
-            if (self.has_value() && same_rid(rid, *self)) {
-                continue;
-            }
-
-            auto physical = fh->get_record(rid, nullptr);
-            if (physical == nullptr) {
-                continue;
-            }
-
-            auto visible = fh->get_record(rid, context);
-            if (!record_matches_col_key(key_col, physical.get(), key) &&
-                !record_matches_col_key(key_col, visible.get(), key)) {
-                continue;
-            }
-
-            if (!vm.check_write_conflict(fh->GetFd(), rid, context->txn_)) {
-                throw TransactionAbortException(context->txn_->get_transaction_id(),
-                    AbortReason::DEADLOCK_PREVENTION);
-            }
+        if (!vm.check_write_conflict(fh->GetFd(), rid, context->txn_)) {
+            throw TransactionAbortException(context->txn_->get_transaction_id(),
+                AbortReason::DEADLOCK_PREVENTION);
         }
     }
 }
@@ -237,11 +215,6 @@ inline void check_unique_conflict_by_scan(SmManager *sm_manager, const std::stri
 inline void check_unique_conflict(SmManager *sm_manager, const std::string &tab_name, const IndexMeta &index,
                                   const char *key, std::optional<Rid> self = std::nullopt,
                                   Context *context = nullptr) {
-    if (is_snapshot_txn(context)) {
-        check_unique_conflict_by_scan(sm_manager, tab_name, index, key, self, context);
-        return;
-    }
-
     auto ih = get_index_handle(sm_manager, tab_name, index);
     std::vector<Rid> existing;
     if (!ih->get_value(key, &existing, nullptr)) {
@@ -263,11 +236,13 @@ inline void check_unique_conflict(SmManager *sm_manager, const std::string &tab_
             throw UniqueIndexConflictError(tab_name, index_col_names(index));
         }
 
+        // MVCC: 检查可见性和写冲突
         auto &vm = VersionManager::instance();
         bool write_conflict = !vm.check_write_conflict(fh->GetFd(), rid, context->txn_);
         auto record = fh->get_record(rid, context);
 
         if (record == nullptr) {
+            // 记录对当前事务不可见
             if (write_conflict) {
                 throw TransactionAbortException(context->txn_->get_transaction_id(),
                     AbortReason::DEADLOCK_PREVENTION);
