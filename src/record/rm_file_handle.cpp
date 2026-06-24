@@ -70,6 +70,19 @@ Rid RmFileHandle::insert_record(char* buf, Context* context) {
 
     memcpy(page_handle.get_slot(slot_no), buf, file_hdr_.record_size);
 
+    int page_no = page_handle.page->get_page_id().page_no;
+    Rid rid{page_no, slot_no};
+
+    // MVCC: 必须在设置bitmap之前创建版本链条目
+    // 否则在bitmap设置后、版本链创建前的窗口期，其他事务会读到未提交的插入数据
+    if (context != nullptr && context->txn_ != nullptr) {
+        IsolationLevel level = context->txn_->get_isolation_level();
+        if (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE) {
+            auto& vm = VersionManager::instance();
+            vm.save_old_data(fd_, rid, context->txn_, nullptr, true);  // 之前不存在
+        }
+    }
+
     Bitmap::set(page_handle.bitmap, slot_no);
 
     page_handle.page_hdr->num_records++;
@@ -80,19 +93,7 @@ Rid RmFileHandle::insert_record(char* buf, Context* context) {
 
     BufferPoolManager::mark_dirty(page_handle.page);
 
-    int page_no = page_handle.page->get_page_id().page_no;
     buffer_pool_manager_->unpin_page(PageId{fd_, page_no}, true);
-
-    Rid rid{page_no, slot_no};
-
-    // MVCC: 记录插入操作（旧数据为空，表示之前记录不存在）
-    if (context != nullptr && context->txn_ != nullptr) {
-        IsolationLevel level = context->txn_->get_isolation_level();
-        if (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE) {
-            auto& vm = VersionManager::instance();
-            vm.save_old_data(fd_, rid, context->txn_, nullptr, true);  // 之前不存在
-        }
-    }
 
     return rid;
 }
