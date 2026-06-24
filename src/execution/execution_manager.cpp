@@ -135,6 +135,9 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t *txn_id, Co
                 txn_mgr_->acquire_explicit_txn_lock(context->txn_);
                 if (context->txn_->get_isolation_level() == IsolationLevel::READ_COMMITTED) {
                     context->txn_->set_isolation_level(IsolationLevel::SNAPSHOT_ISOLATION);
+                }
+                if (context->txn_->get_isolation_level() == IsolationLevel::SNAPSHOT_ISOLATION ||
+                    context->txn_->get_isolation_level() == IsolationLevel::SERIALIZABLE) {
                     context->txn_->set_start_ts(txn_mgr_->get_next_timestamp());
                 }
                 context->txn_->set_txn_mode(true);
@@ -1368,6 +1371,10 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
     RmScan scan(fh);
     while (!scan.is_end()) {
         auto rec = fh->get_record(scan.rid(), context);
+        if (rec == nullptr) {
+            scan.next();
+            continue;
+        }
         if (eval_where(rec.get())) {
             std::vector<char> row(rec->data, rec->data + fh->get_file_hdr().record_size);
             raw_records.push_back(row);
