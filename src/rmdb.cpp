@@ -178,6 +178,85 @@ static std::string value_to_update_sql_local(const Value &value) {
     return std::to_string(value.int_val);
 }
 
+static bool parse_lhs_arithmetic_terms_local(const std::string &rhs, const std::string &lhs,
+                                             std::vector<std::pair<ArithOp, Value>> &terms) {
+    terms.clear();
+
+    std::string rhs_lower = lower_local(rhs);
+    std::string lhs_lower = lower_local(lhs);
+    size_t pos = 0;
+    while (pos < rhs_lower.size() && std::isspace(static_cast<unsigned char>(rhs_lower[pos]))) {
+        pos++;
+    }
+
+    if (rhs_lower.compare(pos, lhs_lower.size(), lhs_lower) != 0) {
+        return false;
+    }
+    pos += lhs_lower.size();
+    if (pos < rhs_lower.size() &&
+        (std::isalnum(static_cast<unsigned char>(rhs_lower[pos])) || rhs_lower[pos] == '_')) {
+        return false;
+    }
+
+    while (true) {
+        while (pos < rhs.size() && std::isspace(static_cast<unsigned char>(rhs[pos]))) {
+            pos++;
+        }
+        if (pos == rhs.size()) {
+            break;
+        }
+
+        char op_char = rhs[pos];
+        if (op_char != '+' && op_char != '-' && op_char != '*' && op_char != '/') {
+            return false;
+        }
+        pos++;
+
+        while (pos < rhs.size() && std::isspace(static_cast<unsigned char>(rhs[pos]))) {
+            pos++;
+        }
+        size_t value_start = pos;
+        bool in_string = false;
+        while (pos < rhs.size()) {
+            char ch = rhs[pos];
+            if (ch == '\'') {
+                in_string = !in_string;
+                pos++;
+                continue;
+            }
+            if (!in_string && (ch == '+' || ch == '-' || ch == '*' || ch == '/') && pos > value_start) {
+                char prev = rhs[pos - 1];
+                if ((ch == '+' || ch == '-') && (prev == 'e' || prev == 'E')) {
+                    pos++;
+                    continue;
+                }
+                break;
+            }
+            pos++;
+        }
+
+        std::string value_text = trim_local(rhs.substr(value_start, pos - value_start));
+        if (value_text.empty()) {
+            return false;
+        }
+
+        Value value;
+        if (!parse_literal_local(value_text, value)) {
+            return false;
+        }
+        if (value.type != TYPE_INT && value.type != TYPE_FLOAT) {
+            return false;
+        }
+
+        ArithOp op = op_char == '+' ? ArithOp::ADD :
+                     op_char == '-' ? ArithOp::SUB :
+                     op_char == '*' ? ArithOp::MUL : ArithOp::DIV;
+        terms.emplace_back(op, std::move(value));
+    }
+
+    return !terms.empty();
+}
+
 static bool try_parse_arithmetic_update(const std::string &sql, std::string &dummy_sql,
                                         std::vector<SetClause> &set_clauses) {
     std::string raw = trim_local(sql);
@@ -212,7 +291,27 @@ static bool try_parse_arithmetic_update(const std::string &sql, std::string &dum
         if (eq_pos == std::string::npos) {
             return false;
         }
-        std::string lhs = trim_local(assignment.substr(0, eq_pos));
+        bool compound_assignment = false;
+        ArithOp compound_op = ArithOp::NO_OP;
+        size_t lhs_end = eq_pos;
+        if (eq_pos > 0) {
+            size_t op_pos = eq_pos;
+            while (op_pos > 0 && std::isspace(static_cast<unsigned char>(assignment[op_pos - 1]))) {
+                op_pos--;
+            }
+            if (op_pos > 0) {
+                char op_ch = assignment[op_pos - 1];
+                if (op_ch == '+' || op_ch == '-' || op_ch == '*' || op_ch == '/') {
+                    compound_assignment = true;
+                    compound_op = op_ch == '+' ? ArithOp::ADD :
+                                  op_ch == '-' ? ArithOp::SUB :
+                                  op_ch == '*' ? ArithOp::MUL : ArithOp::DIV;
+                    lhs_end = op_pos - 1;
+                }
+            }
+        }
+
+        std::string lhs = trim_local(assignment.substr(0, lhs_end));
         std::string rhs = trim_local(assignment.substr(eq_pos + 1));
         if (lhs.empty() || rhs.empty()) {
             return false;
@@ -222,42 +321,38 @@ static bool try_parse_arithmetic_update(const std::string &sql, std::string &dum
         clause.lhs = {.tab_name = tab_name, .col_name = lhs};
         clause.op = ArithOp::NO_OP;
 
-        std::string rhs_lower = lower_local(rhs);
-        std::string lhs_lower = lower_local(lhs);
-        size_t pos = 0;
-        while (pos < rhs_lower.size() && std::isspace(static_cast<unsigned char>(rhs_lower[pos]))) {
-            pos++;
-        }
         bool parsed_arith = false;
-        if (rhs_lower.compare(pos, lhs_lower.size(), lhs_lower) == 0) {
-            size_t op_pos = pos + lhs_lower.size();
-            while (op_pos < rhs_lower.size() && std::isspace(static_cast<unsigned char>(rhs_lower[op_pos]))) {
-                op_pos++;
+        if (compound_assignment) {
+            if (!parse_literal_local(rhs, clause.rhs)) {
+                return false;
             }
-            if (op_pos < rhs_lower.size()) {
-                char op = rhs_lower[op_pos];
-                if (op == '+' || op == '-' || op == '*' || op == '/') {
-                    std::string val_text = trim_local(rhs.substr(op_pos + 1));
-                    if (parse_literal_local(val_text, clause.rhs)) {
-                        if (clause.rhs.type != TYPE_INT && clause.rhs.type != TYPE_FLOAT) {
-                            return false;
-                        }
-                        clause.op = op == '+' ? ArithOp::ADD :
-                                    op == '-' ? ArithOp::SUB :
-                                    op == '*' ? ArithOp::MUL : ArithOp::DIV;
-                        has_arith = true;
-                        parsed_arith = true;
-                    }
-                }
+            if (clause.rhs.type != TYPE_INT && clause.rhs.type != TYPE_FLOAT) {
+                return false;
             }
+            clause.op = compound_op;
+            parsed.push_back(clause);
+            has_arith = true;
+            parsed_arith = true;
+        }
+
+        std::vector<std::pair<ArithOp, Value>> arithmetic_terms;
+        if (!parsed_arith && parse_lhs_arithmetic_terms_local(rhs, lhs, arithmetic_terms)) {
+            for (auto &term : arithmetic_terms) {
+                SetClause arithmetic_clause = clause;
+                arithmetic_clause.op = term.first;
+                arithmetic_clause.rhs = std::move(term.second);
+                parsed.push_back(std::move(arithmetic_clause));
+            }
+            has_arith = true;
+            parsed_arith = true;
         }
 
         if (!parsed_arith) {
             if (!parse_literal_local(rhs, clause.rhs)) {
                 return false;
             }
+            parsed.push_back(clause);
         }
-        parsed.push_back(clause);
         dummy_assigns.push_back(lhs + "=" + (parsed_arith ? "0" : value_to_update_sql_local(clause.rhs)));
     }
 
