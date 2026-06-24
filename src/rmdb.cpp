@@ -16,6 +16,7 @@ See the Mulan PSL v2 for more details. */
 #include <atomic>
 #include <cctype>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -88,6 +89,31 @@ static std::string strip_sql_line_comments(const std::string &sql) {
 
 static bool is_blank_sql(const std::string &sql) {
     return sql.find_first_not_of(" \t\r\n;") == std::string::npos;
+}
+
+static std::vector<std::string> split_sql_requests(const std::string &sql) {
+    std::vector<std::string> requests;
+    bool in_string = false;
+    size_t start = 0;
+    for (size_t i = 0; i < sql.size(); ++i) {
+        if (sql[i] == '\'') {
+            in_string = !in_string;
+            continue;
+        }
+        if (!in_string && sql[i] == ';') {
+            std::string part = sql.substr(start, i - start + 1);
+            if (!is_blank_sql(part)) {
+                requests.push_back(part);
+            }
+            start = i + 1;
+        }
+    }
+
+    std::string tail = sql.substr(start);
+    if (!is_blank_sql(tail)) {
+        requests.push_back(tail);
+    }
+    return requests;
 }
 
 static std::string trim_local(std::string s) {
@@ -838,6 +864,7 @@ void *client_handler(void *sock_fd) {
     // 记录客户端当前正在执行的事务ID
     txn_id_t txn_id = INVALID_TXN_ID;
     bool txn_failed = false;
+    std::deque<std::string> pending_requests;
 
     std::string output = "establish client connection, sockfd: " + std::to_string(fd) + "\n";
     std::cout << output;
@@ -845,29 +872,38 @@ void *client_handler(void *sock_fd) {
     while (true) {
         memset(data_recv, 0, BUFFER_LENGTH);
 
-        i_recvBytes = read(fd, data_recv, BUFFER_LENGTH);
+        if (pending_requests.empty()) {
+            i_recvBytes = read(fd, data_recv, BUFFER_LENGTH);
 
-        if (i_recvBytes == 0) {
-            std::cout << "Maybe the client has closed" << std::endl;
-            break;
-        }
-        if (i_recvBytes == -1) {
-            std::cout << "Client read error!" << std::endl;
-            break;
-        }
-        
-        std::string sanitized_sql = strip_sql_line_comments(std::string(data_recv));
-        if (is_blank_sql(sanitized_sql)) {
-            memset(data_send, '\0', BUFFER_LENGTH);
-            offset = 0;
-            if (write(fd, data_send, 1) == -1) {
+            if (i_recvBytes == 0) {
+                std::cout << "Maybe the client has closed" << std::endl;
                 break;
             }
-            continue;
+            if (i_recvBytes == -1) {
+                std::cout << "Client read error!" << std::endl;
+                break;
+            }
+
+            std::string sanitized_sql = strip_sql_line_comments(std::string(data_recv));
+            auto requests = split_sql_requests(sanitized_sql);
+            if (requests.empty()) {
+                memset(data_send, '\0', BUFFER_LENGTH);
+                offset = 0;
+                if (write(fd, data_send, 1) == -1) {
+                    break;
+                }
+                continue;
+            }
+            for (auto &request : requests) {
+                pending_requests.push_back(std::move(request));
+            }
         }
+
+        std::string current_sql = pending_requests.front();
+        pending_requests.pop_front();
         memset(data_recv, 0, BUFFER_LENGTH);
-        size_t sanitized_len = std::min(sanitized_sql.size(), static_cast<size_t>(BUFFER_LENGTH - 1));
-        memcpy(data_recv, sanitized_sql.data(), sanitized_len);
+        size_t sanitized_len = std::min(current_sql.size(), static_cast<size_t>(BUFFER_LENGTH - 1));
+        memcpy(data_recv, current_sql.data(), sanitized_len);
 
         std::string control_cmd(data_recv);
         size_t ctrl_start = control_cmd.find_first_not_of(" \t\r\n");
