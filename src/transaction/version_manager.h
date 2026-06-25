@@ -146,6 +146,22 @@ public:
         }
     }
 
+    void commit_record(int fd, const Rid& rid, txn_id_t txn_id, timestamp_t commit_ts) {
+        VersionKey key{fd, rid.page_no, rid.slot_no};
+        auto& bucket = get_bucket(key);
+        std::lock_guard<std::mutex> lock(bucket.mutex_);
+
+        auto it = bucket.chains_.find(key);
+        if (it == bucket.chains_.end()) {
+            return;
+        }
+        for (auto& entry : it->second) {
+            if (entry.txn_id_ == txn_id && entry.commit_ts_ == 0) {
+                entry.commit_ts_ = commit_ts;
+            }
+        }
+    }
+
     /**
      * @brief 回滚事务的所有写操作
      * @return 需要恢复的记录列表 (fd, rid, old_data, is_deleted)

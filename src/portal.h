@@ -161,9 +161,7 @@ class Portal
             return std::make_unique<ProjectionExecutor>(convert_plan_executor(x->subplan_, context), 
                                                         x->sel_cols_);
         } else if(auto x = std::dynamic_pointer_cast<ScanPlan>(plan)) {
-            bool force_seq_scan = context != nullptr && context->txn_ != nullptr &&
-                                  context->txn_->get_isolation_level() == IsolationLevel::SNAPSHOT_ISOLATION;
-            if(x->tag == T_SeqScan || force_seq_scan) {
+            if(x->tag == T_SeqScan) {
                 return std::make_unique<SeqScanExecutor>(sm_manager_, x->tab_name_, x->conds_, context);
             }
             else {
