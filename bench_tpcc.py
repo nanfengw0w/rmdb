@@ -109,9 +109,17 @@ def new_order_txn(sock, w_id, d_id):
     send_sql(sock, 'BEGIN;')
     time.sleep(0.01)
 
-    # Read district
+    # Read district and get next order id
     resp = send_sql(sock, f'SELECT d_next_o_id FROM district WHERE d_w_id = {w_id} AND d_id = {d_id};')
     time.sleep(0.01)
+    # Parse the order id from response
+    lines = resp.strip().split('\n')
+    o_id = 3001  # default
+    for line in lines:
+        line = line.strip().strip('|').strip()
+        if line.isdigit():
+            o_id = int(line)
+            break
 
     # Update district
     resp = send_sql(sock, f'UPDATE district SET d_next_o_id = d_next_o_id + 1 WHERE d_w_id = {w_id} AND d_id = {d_id};')
@@ -121,24 +129,24 @@ def new_order_txn(sock, w_id, d_id):
         return False
 
     # Insert order
-    resp = send_sql(sock, f'INSERT INTO orders VALUES ({w_id}, {d_id}, 3001, 1, \"2020-01-01\", 0, 5, 1);')
+    resp = send_sql(sock, f"INSERT INTO orders VALUES ({w_id}, {d_id}, {o_id}, 1, '2020-01-01', 0, 5, 1);")
     time.sleep(0.01)
-    if 'abort' in resp.lower():
+    if 'abort' in resp.lower() or 'error' in resp.lower():
         send_sql(sock, 'ABORT;')
         return False
 
     # Insert new_order
-    resp = send_sql(sock, f'INSERT INTO new_orders VALUES ({w_id}, {d_id}, 3001);')
+    resp = send_sql(sock, f'INSERT INTO new_orders VALUES ({w_id}, {d_id}, {o_id});')
     time.sleep(0.01)
-    if 'abort' in resp.lower():
+    if 'abort' in resp.lower() or 'error' in resp.lower():
         send_sql(sock, 'ABORT;')
         return False
 
     # Insert order lines
     for ol in range(1, 6):
-        resp = send_sql(sock, f'INSERT INTO order_line VALUES ({w_id}, {d_id}, 3001, {ol}, {ol}, {w_id}, \"\", 5, {ol * 5.0:.2f}, \"dist\");')
+        resp = send_sql(sock, f"INSERT INTO order_line VALUES ({w_id}, {d_id}, {o_id}, {ol}, {ol}, {w_id}, '', 5, {ol * 5.0:.2f}, 'dist');")
         time.sleep(0.01)
-        if 'abort' in resp.lower():
+        if 'abort' in resp.lower() or 'error' in resp.lower():
             send_sql(sock, 'ABORT;')
             return False
 
@@ -146,7 +154,7 @@ def new_order_txn(sock, w_id, d_id):
     for ol in range(1, 6):
         resp = send_sql(sock, f'UPDATE stock SET s_quantity = s_quantity - 1, s_ytd = s_ytd + 1, s_order_cnt = s_order_cnt + 1 WHERE s_w_id = {w_id} AND s_i_id = {ol};')
         time.sleep(0.01)
-        if 'abort' in resp.lower():
+        if 'abort' in resp.lower() or 'error' in resp.lower():
             send_sql(sock, 'ABORT;')
             return False
 
