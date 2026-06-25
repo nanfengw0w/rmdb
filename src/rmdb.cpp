@@ -1311,11 +1311,9 @@ void *client_handler(void *sock_fd) {
             try {
                 if (control_cmd == "begin") {
                     SetTransaction(&txn_id, context.get());
+                    txn_manager->acquire_explicit_txn_lock(context->txn_);
                     if (context->txn_->get_isolation_level() == IsolationLevel::READ_COMMITTED) {
                         context->txn_->set_isolation_level(IsolationLevel::SNAPSHOT_ISOLATION);
-                    }
-                    if (context->txn_->get_isolation_level() == IsolationLevel::SERIALIZABLE) {
-                        txn_manager->acquire_explicit_txn_lock(context->txn_);
                     }
                     if (context->txn_->get_isolation_level() == IsolationLevel::SNAPSHOT_ISOLATION ||
                         context->txn_->get_isolation_level() == IsolationLevel::SERIALIZABLE) {
