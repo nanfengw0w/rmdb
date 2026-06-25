@@ -68,7 +68,7 @@ def setup_and_load(db_name, use_csv=True, csv_dir=None):
         [f'./build/bin/rmdb', db_name],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
-    time.sleep(1)
+    time.sleep(2)  # 等待服务器完全启动
 
     sock = create_connection()
 
