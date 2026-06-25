@@ -1252,19 +1252,17 @@ void *client_handler(void *sock_fd) {
 
         // 用于判断是否已经调用了yy_delete_buffer来删除buf
         bool finish_analyze = false;
-        std::shared_ptr<ast::TreeNode> local_parse_tree;
         pthread_mutex_lock(buffer_mutex);
         ast::parse_tree = nullptr;
         YY_BUFFER_STATE buf = yy_scan_string(processed_sql.c_str());
         if (yyparse() == 0) {
-            local_parse_tree = ast::parse_tree;
-            yy_delete_buffer(buf);
-            finish_analyze = true;
-            pthread_mutex_unlock(buffer_mutex);
-            if (local_parse_tree != nullptr) {
+            if (ast::parse_tree != nullptr) {
                 try {
-                    // analyze and rewrite (outside lock for concurrency)
-                    std::shared_ptr<Query> query = analyze->do_analyze(local_parse_tree);
+                    // analyze and rewrite
+                    std::shared_ptr<Query> query = analyze->do_analyze(ast::parse_tree);
+                    yy_delete_buffer(buf);
+                    finish_analyze = true;
+                    pthread_mutex_unlock(buffer_mutex);
                     // 优化器
                     std::shared_ptr<Plan> plan = optimizer->plan_query(query, context.get());
                     // portal
@@ -1312,9 +1310,6 @@ void *client_handler(void *sock_fd) {
                 set_response(data_send, &offset, "Error: empty query\n");
             }
         } else {
-            yy_delete_buffer(buf);
-            finish_analyze = true;
-            pthread_mutex_unlock(buffer_mutex);
             mark_failed_if_explicit(context.get(), &txn_failed);
             abort_active_transaction(context.get());
             set_response(data_send, &offset, "Error: parse failed\n");
