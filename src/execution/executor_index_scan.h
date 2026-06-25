@@ -115,6 +115,12 @@ class IndexScanExecutor : public AbstractExecutor {
             return;
         }
 
+        if (index_meta_.col_num > 1) {
+            materialize_index_scan(ih_->leaf_begin(), ih_->leaf_end());
+            finish_materialized_scan();
+            return;
+        }
+
         auto exact_key = build_exact_match_key();
         if (exact_key.has_value()) {
             std::vector<Rid> result;
@@ -127,25 +133,6 @@ class IndexScanExecutor : public AbstractExecutor {
                     }
                 }
             }
-            finish_materialized_scan();
-            return;
-        }
-
-        auto prefix_bounds = build_prefix_bounds();
-        if (prefix_bounds.has_value()) {
-            auto &[lower_bound, upper_bound] = *prefix_bounds;
-            if (bounds_are_empty(lower_bound, upper_bound)) {
-                return;
-            }
-            Iid lower = lower_bound.has_value()
-                            ? (lower_bound->inclusive ? ih_->lower_bound(lower_bound->key.data())
-                                                      : ih_->upper_bound(lower_bound->key.data()))
-                            : ih_->leaf_begin();
-            Iid upper = upper_bound.has_value()
-                            ? (upper_bound->inclusive ? ih_->upper_bound(upper_bound->key.data())
-                                                      : ih_->lower_bound(upper_bound->key.data()))
-                            : ih_->leaf_end();
-            materialize_index_scan(lower, upper);
             finish_materialized_scan();
             return;
         }
@@ -225,20 +212,10 @@ class IndexScanExecutor : public AbstractExecutor {
     std::string getType() override { return "IndexScanExecutor"; }
 
     bool can_runtime_lookup(const TabCol &col) const {
-        if (col.tab_name != tab_name_ || index_meta_.cols.empty()) {
-            return false;
-        }
-        bool runtime_col_found = false;
-        for (auto &index_col : index_meta_.cols) {
-            if (col.col_name == index_col.name) {
-                runtime_col_found = true;
-                continue;
-            }
-            if (find_value_cond(index_col.name, OP_EQ) == nullptr) {
-                return false;
-            }
-        }
-        return runtime_col_found;
+        return index_meta_.col_num == 1 &&
+               col.tab_name == tab_name_ &&
+               !index_meta_.cols.empty() &&
+               col.col_name == index_meta_.cols[0].name;
     }
 
     void set_runtime_lookup_key(const TabCol &col, const char *value) {
@@ -247,20 +224,7 @@ class IndexScanExecutor : public AbstractExecutor {
             return;
         }
         runtime_eq_key_ = std::vector<char>(index_meta_.col_tot_len, 0);
-        size_t offset = 0;
-        for (auto &index_col : index_meta_.cols) {
-            if (col.col_name == index_col.name) {
-                memcpy(runtime_eq_key_->data() + offset, value, index_col.len);
-            } else {
-                auto *eq_cond = find_value_cond(index_col.name, OP_EQ);
-                if (eq_cond == nullptr) {
-                    runtime_eq_key_.reset();
-                    return;
-                }
-                memcpy(runtime_eq_key_->data() + offset, eq_cond->rhs_val.raw->data, index_col.len);
-            }
-            offset += index_col.len;
-        }
+        memcpy(runtime_eq_key_->data(), value, index_meta_.cols[0].len);
     }
 
     void clear_runtime_lookup_key() {
@@ -372,117 +336,12 @@ class IndexScanExecutor : public AbstractExecutor {
         return key;
     }
 
-    std::optional<std::pair<std::optional<Bound>, std::optional<Bound>>> build_prefix_bounds() {
-        if (index_meta_.cols.empty()) {
-            return std::nullopt;
-        }
-
-        std::vector<char> prefix_key(index_meta_.col_tot_len, 0);
-        size_t prefix_cols = 0;
-        for (; prefix_cols < index_meta_.cols.size(); ++prefix_cols) {
-            const auto &col = index_meta_.cols[prefix_cols];
-            const Condition *eq_cond = find_value_cond(col.name, OP_EQ);
-            if (eq_cond == nullptr) {
-                break;
-            }
-            memcpy(prefix_key.data() + col_offset(prefix_cols), eq_cond->rhs_val.raw->data, col.len);
-        }
-
-        std::optional<Bound> lower_bound;
-        std::optional<Bound> upper_bound;
-
-        if (prefix_cols > 0) {
-            auto lower_key = prefix_key;
-            fill_suffix_with_min_key(lower_key, prefix_cols);
-            auto upper_key = prefix_key;
-            fill_suffix_with_max_key(upper_key, prefix_cols);
-            lower_bound = Bound{std::move(lower_key), true};
-            upper_bound = Bound{std::move(upper_key), true};
-        }
-
-        if (prefix_cols < index_meta_.cols.size()) {
-            const auto &range_col = index_meta_.cols[prefix_cols];
-            for (auto &cond : conds_) {
-                if (!cond.is_rhs_val || cond.lhs_col.tab_name != tab_name_ ||
-                    cond.lhs_col.col_name != range_col.name) {
-                    continue;
-                }
-                if (cond.op == OP_EQ || cond.op == OP_NE) {
-                    continue;
-                }
-
-                auto make_range_key = [&](bool suffix_max) {
-                    auto key = prefix_key;
-                    size_t offset = col_offset(prefix_cols);
-                    memcpy(key.data() + offset, cond.rhs_val.raw->data, range_col.len);
-                    if (suffix_max) {
-                        fill_suffix_with_max_key(key, prefix_cols + 1);
-                    } else {
-                        fill_suffix_with_min_key(key, prefix_cols + 1);
-                    }
-                    return key;
-                };
-
-                switch (cond.op) {
-                    case OP_GT:
-                        update_lower_bound(lower_bound, Bound{make_range_key(true), false});
-                        break;
-                    case OP_GE:
-                        update_lower_bound(lower_bound, Bound{make_range_key(false), true});
-                        break;
-                    case OP_LT:
-                        update_upper_bound(upper_bound, Bound{make_range_key(false), false});
-                        break;
-                    case OP_LE:
-                        update_upper_bound(upper_bound, Bound{make_range_key(true), true});
-                        break;
-                    default:
-                        break;
-                }
-            }
-        }
-
-        if (!lower_bound.has_value() && !upper_bound.has_value()) {
-            return std::nullopt;
-        }
-        return std::make_pair(std::move(lower_bound), std::move(upper_bound));
-    }
-
-    const Condition *find_value_cond(const std::string &col_name, CompOp op) const {
-        for (auto &cond : conds_) {
-            if (cond.is_rhs_val && cond.lhs_col.tab_name == tab_name_ &&
-                cond.lhs_col.col_name == col_name && cond.op == op) {
-                return &cond;
-            }
-        }
-        return nullptr;
-    }
-
-    size_t col_offset(size_t target_col) const {
-        size_t offset = 0;
-        for (size_t i = 0; i < target_col; ++i) {
-            offset += index_meta_.cols[i].len;
-        }
-        return offset;
-    }
-
     void fill_suffix_with_min_key(std::vector<char> &key, size_t begin_col) {
         int offset = 0;
         for (size_t i = 0; i < index_meta_.cols.size(); ++i) {
             auto &col = index_meta_.cols[i];
             if (i >= begin_col) {
                 fill_min_key_part(key.data() + offset, col);
-            }
-            offset += col.len;
-        }
-    }
-
-    void fill_suffix_with_max_key(std::vector<char> &key, size_t begin_col) {
-        int offset = 0;
-        for (size_t i = 0; i < index_meta_.cols.size(); ++i) {
-            auto &col = index_meta_.cols[i];
-            if (i >= begin_col) {
-                fill_max_key_part(key.data() + offset, col);
             }
             offset += col.len;
         }
@@ -506,34 +365,9 @@ class IndexScanExecutor : public AbstractExecutor {
         }
     }
 
-    void fill_max_key_part(char *dest, const ColMeta &col) {
-        switch (col.type) {
-            case TYPE_INT: {
-                int value = std::numeric_limits<int>::max();
-                memcpy(dest, &value, sizeof(value));
-                break;
-            }
-            case TYPE_FLOAT: {
-                float value = std::numeric_limits<float>::max();
-                memcpy(dest, &value, sizeof(value));
-                break;
-            }
-            case TYPE_STRING:
-                memset(dest, 0xff, col.len);
-                break;
-        }
-    }
-
-    int compare_index_key(const std::vector<char> &lhs, const std::vector<char> &rhs) {
-        size_t offset = 0;
-        for (auto &col : index_meta_.cols) {
-            int cmp = compare_value(lhs.data() + offset, rhs.data() + offset, col.type, col.len);
-            if (cmp != 0) {
-                return cmp;
-            }
-            offset += col.len;
-        }
-        return 0;
+    int compare_first_col_key(const std::vector<char> &lhs, const std::vector<char> &rhs) {
+        auto &col = index_meta_.cols[0];
+        return compare_value(lhs.data(), rhs.data(), col.type, col.len);
     }
 
     void update_lower_bound(std::optional<Bound> &current, Bound candidate) {
@@ -541,7 +375,7 @@ class IndexScanExecutor : public AbstractExecutor {
             current = std::move(candidate);
             return;
         }
-        int cmp = compare_index_key(candidate.key, current->key);
+        int cmp = compare_first_col_key(candidate.key, current->key);
         if (cmp > 0 || (cmp == 0 && current->inclusive && !candidate.inclusive)) {
             current = std::move(candidate);
         }
@@ -552,7 +386,7 @@ class IndexScanExecutor : public AbstractExecutor {
             current = std::move(candidate);
             return;
         }
-        int cmp = compare_index_key(candidate.key, current->key);
+        int cmp = compare_first_col_key(candidate.key, current->key);
         if (cmp < 0 || (cmp == 0 && current->inclusive && !candidate.inclusive)) {
             current = std::move(candidate);
         }
@@ -562,7 +396,7 @@ class IndexScanExecutor : public AbstractExecutor {
         if (!lower.has_value() || !upper.has_value()) {
             return false;
         }
-        int cmp = compare_index_key(lower->key, upper->key);
+        int cmp = compare_first_col_key(lower->key, upper->key);
         return cmp > 0 || (cmp == 0 && (!lower->inclusive || !upper->inclusive));
     }
 

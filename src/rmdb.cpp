@@ -26,19 +26,16 @@ See the Mulan PSL v2 for more details. */
 #include "errors.h"
 #include "common/config.h"
 #include "common/sql_rewrite.h"
-#include "execution/executor_index_scan.h"
-#include "execution/executor_seq_scan.h"
 #include "execution/index_maintenance.h"
 #include "optimizer/optimizer.h"
 #include "recovery/log_recovery.h"
 #include "optimizer/plan.h"
 #include "optimizer/planner.h"
 #include "portal.h"
-#include "record_printer.h"
 #include "analyze/analyze.h"
 
 #define SOCK_PORT 8765
-#define MAX_CONN_LIMIT 128
+#define MAX_CONN_LIMIT 8
 
 static bool should_exit = false;
 std::atomic<bool> enable_output_file{true};
@@ -505,10 +502,6 @@ static bool try_parse_simple_insert_local(const std::string &sql, std::string &t
     return true;
 }
 
-static void clear_fast_autocommit_state(Transaction *txn);
-static void abort_active_transaction(Context *context);
-static void mark_failed_if_explicit(Context *context, bool *txn_failed);
-
 static void execute_fast_insert_direct(const std::string &tab_name, std::vector<Value> &values, Context *context) {
     TabMeta &tab = sm_manager->db_.get_table(tab_name);
     if (values.size() != tab.cols.size()) {
@@ -587,336 +580,6 @@ static void execute_fast_insert_direct(const std::string &tab_name, std::vector<
         auto ih = index_maintenance::get_index_handle(sm_manager.get(), tab_name, index);
         ih->insert_entry(index_keys[i].data(), rid, txn);
     }
-}
-
-static std::vector<std::string> split_and_conditions_local(const std::string &clause) {
-    std::vector<std::string> result;
-    std::string lower = lower_local(clause);
-    bool in_string = false;
-    size_t start = 0;
-    for (size_t i = 0; i + 3 <= clause.size(); ++i) {
-        if (clause[i] == '\'') {
-            in_string = !in_string;
-            continue;
-        }
-        if (in_string || lower.compare(i, 3, "and") != 0) {
-            continue;
-        }
-        bool left_ok = i == 0 ||
-                       (!std::isalnum(static_cast<unsigned char>(lower[i - 1])) && lower[i - 1] != '_');
-        bool right_ok = i + 3 >= lower.size() ||
-                        (!std::isalnum(static_cast<unsigned char>(lower[i + 3])) && lower[i + 3] != '_');
-        if (!left_ok || !right_ok) {
-            continue;
-        }
-        result.push_back(trim_local(clause.substr(start, i - start)));
-        i += 2;
-        start = i + 1;
-    }
-    result.push_back(trim_local(clause.substr(start)));
-    return result;
-}
-
-static std::string unqualify_local(std::string name) {
-    name = trim_local(std::move(name));
-    size_t dot = name.rfind('.');
-    if (dot != std::string::npos) {
-        name = name.substr(dot + 1);
-    }
-    return trim_local(name);
-}
-
-static bool parse_literal_for_col_local(std::string literal, const ColMeta &col, Value &value) {
-    literal = trim_local(std::move(literal));
-    if (literal.empty()) {
-        return false;
-    }
-    try {
-        if (col.type == TYPE_INT) {
-            size_t consumed = 0;
-            int v = std::stoi(literal, &consumed);
-            while (consumed < literal.size() && std::isspace(static_cast<unsigned char>(literal[consumed]))) {
-                consumed++;
-            }
-            if (consumed != literal.size()) return false;
-            value.set_int(v);
-        } else if (col.type == TYPE_FLOAT) {
-            size_t consumed = 0;
-            float v = std::stof(literal, &consumed);
-            while (consumed < literal.size() && std::isspace(static_cast<unsigned char>(literal[consumed]))) {
-                consumed++;
-            }
-            if (consumed != literal.size()) return false;
-            value.set_float(v);
-        } else if (col.type == TYPE_STRING) {
-            if (literal.size() >= 2 && literal.front() == '\'' && literal.back() == '\'') {
-                literal = literal.substr(1, literal.size() - 2);
-            } else {
-                return false;
-            }
-            value.set_str(literal);
-        } else {
-            return false;
-        }
-        value.init_raw(col.len);
-        return true;
-    } catch (...) {
-        return false;
-    }
-}
-
-static bool parse_fast_select_conditions(const std::string &where_clause, TabMeta &tab,
-                                         const std::string &tab_name, std::vector<Condition> &conds) {
-    conds.clear();
-    if (where_clause.empty()) {
-        return true;
-    }
-    for (auto cond_text : split_and_conditions_local(where_clause)) {
-        if (cond_text.empty()) continue;
-        size_t op_pos = std::string::npos;
-        size_t op_len = 0;
-        std::string op_str;
-        for (auto candidate : {"<=", ">=", "<>", "!=", "=", "<", ">"}) {
-            size_t p = cond_text.find(candidate);
-            if (p != std::string::npos && (op_pos == std::string::npos || p < op_pos)) {
-                op_pos = p;
-                op_len = strlen(candidate);
-                op_str = candidate;
-            }
-        }
-        if (op_pos == std::string::npos) {
-            return false;
-        }
-
-        std::string lhs = unqualify_local(cond_text.substr(0, op_pos));
-        std::string rhs = trim_local(cond_text.substr(op_pos + op_len));
-        auto col_it = tab.get_col(lhs);
-
-        Value value;
-        if (!parse_literal_for_col_local(rhs, *col_it, value)) {
-            return false;
-        }
-
-        Condition cond;
-        cond.lhs_col = TabCol{tab_name, col_it->name};
-        if (op_str == "=") cond.op = OP_EQ;
-        else if (op_str == "<>" || op_str == "!=") cond.op = OP_NE;
-        else if (op_str == "<") cond.op = OP_LT;
-        else if (op_str == ">") cond.op = OP_GT;
-        else if (op_str == "<=") cond.op = OP_LE;
-        else if (op_str == ">=") cond.op = OP_GE;
-        else return false;
-        cond.is_rhs_val = true;
-        cond.rhs_val = std::move(value);
-        conds.push_back(std::move(cond));
-    }
-    return true;
-}
-
-static bool fast_condition_has_eq(const std::vector<Condition> &conds, const std::string &col_name) {
-    for (const auto &cond : conds) {
-        if (cond.is_rhs_val && cond.lhs_col.col_name == col_name && cond.op == OP_EQ) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static bool fast_condition_has_range(const std::vector<Condition> &conds, const std::string &col_name) {
-    for (const auto &cond : conds) {
-        if (!cond.is_rhs_val || cond.lhs_col.col_name != col_name) continue;
-        if (cond.op == OP_LT || cond.op == OP_LE || cond.op == OP_GT || cond.op == OP_GE) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static bool choose_fast_select_index(const TabMeta &tab, const std::vector<Condition> &conds,
-                                     std::vector<std::string> &index_col_names) {
-    int best_score = 0;
-    const IndexMeta *best_index = nullptr;
-    for (const auto &index : tab.indexes) {
-        int score = 0;
-        for (const auto &col : index.cols) {
-            if (fast_condition_has_eq(conds, col.name)) {
-                score += 2;
-            } else if (fast_condition_has_range(conds, col.name)) {
-                score += 1;
-                break;
-            } else {
-                break;
-            }
-        }
-        if (score > best_score) {
-            best_score = score;
-            best_index = &index;
-        }
-    }
-    if (best_index == nullptr) {
-        return false;
-    }
-    index_col_names.clear();
-    for (const auto &col : best_index->cols) {
-        index_col_names.push_back(col.name);
-    }
-    return true;
-}
-
-static std::string format_record_col_local(const ColMeta &col, const char *record_data) {
-    const char *data = record_data + col.offset;
-    if (col.type == TYPE_INT) {
-        return std::to_string(*reinterpret_cast<const int *>(data));
-    }
-    if (col.type == TYPE_FLOAT) {
-        return std::to_string(*reinterpret_cast<const float *>(data));
-    }
-    std::string value(data, col.len);
-    value.resize(strlen(value.c_str()));
-    return value;
-}
-
-static bool try_handle_fast_select(const std::string &sql, txn_id_t *txn_id,
-                                   char *data_send, int *offset, int fd,
-                                   bool *txn_failed) {
-    std::string raw = trim_local(sql);
-    while (!raw.empty() && raw.back() == ';') {
-        raw.pop_back();
-        raw = trim_local(raw);
-    }
-    std::string lower = lower_local(raw);
-    if (lower.rfind("select ", 0) != 0) {
-        return false;
-    }
-    if (lower.find(" join ") != std::string::npos || lower.find(" group by ") != std::string::npos ||
-        lower.find(" having ") != std::string::npos || lower.find(" order by ") != std::string::npos ||
-        lower.find(" limit ") != std::string::npos || lower.find(" union ") != std::string::npos ||
-        lower.find('(') != std::string::npos) {
-        return false;
-    }
-
-    size_t from_pos = find_keyword_local(lower, " from ", 0);
-    if (from_pos == std::string::npos) {
-        return false;
-    }
-    std::string select_part = trim_local(raw.substr(7, from_pos - 7));
-    size_t where_pos = find_keyword_local(lower, " where ", from_pos + 6);
-    std::string from_part = where_pos == std::string::npos
-        ? trim_local(raw.substr(from_pos + 6))
-        : trim_local(raw.substr(from_pos + 6, where_pos - (from_pos + 6)));
-    if (from_part.find(',') != std::string::npos) {
-        return false;
-    }
-    std::istringstream from_iss(from_part);
-    std::string tab_name;
-    from_iss >> tab_name;
-    std::string extra_from_token;
-    if (from_iss >> extra_from_token) {
-        return false;
-    }
-    if (tab_name.empty()) {
-        return false;
-    }
-    std::string where_clause = where_pos == std::string::npos ? "" : trim_local(raw.substr(where_pos + 7));
-
-    memset(data_send, '\0', BUFFER_LENGTH);
-    *offset = 0;
-    auto context = std::make_unique<Context>(lock_manager.get(), log_manager.get(), nullptr, data_send, offset);
-    SetTransaction(txn_id, context.get());
-
-    try {
-        TabMeta &tab = sm_manager->db_.get_table(tab_name);
-        std::vector<ColMeta> selected_cols;
-        std::vector<std::string> captions;
-        if (trim_local(select_part) == "*") {
-            selected_cols = tab.cols;
-            for (const auto &col : selected_cols) captions.push_back(col.name);
-        } else {
-            for (auto item : split_commas_local(select_part)) {
-                item = unqualify_local(item);
-                if (item.empty()) return false;
-                auto col_it = tab.get_col(item);
-                selected_cols.push_back(*col_it);
-                captions.push_back(col_it->name);
-            }
-        }
-
-        std::vector<Condition> conds;
-        if (!parse_fast_select_conditions(where_clause, tab, tab_name, conds)) {
-            return false;
-        }
-
-        std::vector<std::string> index_col_names;
-        std::unique_ptr<AbstractExecutor> executor;
-        if (choose_fast_select_index(tab, conds, index_col_names)) {
-            executor = std::make_unique<IndexScanExecutor>(sm_manager.get(), tab_name, conds,
-                                                           index_col_names, context.get());
-        } else {
-            executor = std::make_unique<SeqScanExecutor>(sm_manager.get(), tab_name, conds, context.get());
-        }
-
-        RecordPrinter rec_printer(captions.size());
-        rec_printer.print_separator(context.get());
-        rec_printer.print_record(captions, context.get());
-        rec_printer.print_separator(context.get());
-
-        bool write_output_file = enable_output_file.load();
-        std::fstream outfile;
-        if (write_output_file) {
-            outfile.open("output.txt", std::ios::out | std::ios::app);
-            outfile << "|";
-            for (const auto &caption : captions) outfile << " " << caption << " |";
-            outfile << "\n";
-        }
-
-        size_t num_rec = 0;
-        for (executor->beginTuple(); !executor->is_end(); executor->nextTuple()) {
-            auto tuple = executor->Next();
-            if (tuple == nullptr) continue;
-            std::vector<std::string> columns;
-            columns.reserve(selected_cols.size());
-            for (const auto &col : selected_cols) {
-                columns.push_back(format_record_col_local(col, tuple->data));
-            }
-            rec_printer.print_record(columns, context.get());
-            if (write_output_file) {
-                outfile << "|";
-                for (const auto &col : columns) outfile << " " << col << " |";
-                outfile << "\n";
-            }
-            num_rec++;
-        }
-        if (write_output_file) {
-            outfile.close();
-        }
-        rec_printer.print_separator(context.get());
-        RecordPrinter::print_record_count(num_rec, context.get());
-
-        if (context->txn_ != nullptr && context->txn_->get_txn_mode() == false &&
-            context->txn_->get_state() != TransactionState::COMMITTED &&
-            context->txn_->get_state() != TransactionState::ABORTED) {
-            txn_manager->commit(context->txn_, context->log_mgr_);
-            clear_fast_autocommit_state(context->txn_);
-        }
-    } catch (TransactionAbortException &e) {
-        set_response(data_send, offset, "abort\n");
-        mark_failed_if_explicit(context.get(), txn_failed);
-        txn_manager->abort(context->txn_, log_manager.get());
-        append_output_line("abort\n");
-    } catch (RMDBError &e) {
-        mark_failed_if_explicit(context.get(), txn_failed);
-        abort_active_transaction(context.get());
-        set_response(data_send, offset, std::string(e.what()) + "\n");
-        append_output_line("failure\n");
-    } catch (std::exception &e) {
-        mark_failed_if_explicit(context.get(), txn_failed);
-        abort_active_transaction(context.get());
-        set_response(data_send, offset, std::string("Error: ") + e.what() + "\n");
-        append_output_line("failure\n");
-    }
-
-    write(fd, data_send, *offset + 1);
-    return true;
 }
 
 static bool try_parse_load_command_local(const std::string &sql, std::string &file_name,
@@ -1302,49 +965,6 @@ void *client_handler(void *sock_fd) {
             }
         }
 
-        if (control_cmd == "begin" || control_cmd == "commit" ||
-            control_cmd == "abort" || control_cmd == "rollback") {
-            memset(data_send, '\0', BUFFER_LENGTH);
-            offset = 0;
-            auto context = std::make_unique<Context>(lock_manager.get(), log_manager.get(), nullptr,
-                                                     data_send, &offset);
-            try {
-                if (control_cmd == "begin") {
-                    SetTransaction(&txn_id, context.get());
-                    txn_manager->acquire_explicit_txn_lock(context->txn_);
-                    if (context->txn_->get_isolation_level() == IsolationLevel::READ_COMMITTED) {
-                        context->txn_->set_isolation_level(IsolationLevel::SNAPSHOT_ISOLATION);
-                    }
-                    if (context->txn_->get_isolation_level() == IsolationLevel::SNAPSHOT_ISOLATION ||
-                        context->txn_->get_isolation_level() == IsolationLevel::SERIALIZABLE) {
-                        context->txn_->set_start_ts(txn_manager->get_next_timestamp());
-                    }
-                    context->txn_->set_txn_mode(true);
-                } else {
-                    context->txn_ = txn_manager->get_transaction(txn_id);
-                    if (control_cmd == "commit") {
-                        txn_manager->commit(context->txn_, context->log_mgr_);
-                    } else {
-                        txn_manager->abort(context->txn_, context->log_mgr_);
-                    }
-                }
-            } catch (TransactionAbortException &e) {
-                set_response(data_send, &offset, "abort\n");
-                txn_failed = false;
-                txn_id = INVALID_TXN_ID;
-                txn_manager->abort(context->txn_, log_manager.get());
-                append_output_line("abort\n");
-            } catch (RMDBError &e) {
-                set_response(data_send, &offset, std::string(e.what()) + "\n");
-                append_output_line("failure\n");
-            } catch (std::exception &e) {
-                set_response(data_send, &offset, std::string("Error: ") + e.what() + "\n");
-                append_output_line("failure\n");
-            }
-            if (write(fd, data_send, offset + 1) == -1) break;
-            continue;
-        }
-
         // Handle create static_checkpoint
         {
             std::string cmd_check(data_recv);
@@ -1508,10 +1128,6 @@ void *client_handler(void *sock_fd) {
                     continue;
                 }
             }
-        }
-
-        if (try_handle_fast_select(std::string(data_recv), &txn_id, data_send, &offset, fd, &txn_failed)) {
-            continue;
         }
 
         // Handle "show index from table_name" directly

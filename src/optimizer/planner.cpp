@@ -22,118 +22,6 @@ See the Mulan PSL v2 for more details. */
 #include "index/ix.h"
 #include "record_printer.h"
 
-namespace {
-
-const ColMeta *find_query_col(SmManager *sm_manager, const TabCol &target) {
-    std::string real_tab = sm_manager->resolve_table_name(target.tab_name);
-    auto &tab = sm_manager->db_.get_table(real_tab);
-    for (const auto &col : tab.cols) {
-        if (col.name == target.col_name) {
-            return &col;
-        }
-    }
-    return nullptr;
-}
-
-bool adapt_constant_to_col(SmManager *sm_manager, const Value &src, const TabCol &target_col, Value &out) {
-    const ColMeta *col = find_query_col(sm_manager, target_col);
-    if (col == nullptr) {
-        return false;
-    }
-
-    if (col->type == TYPE_INT) {
-        if (src.type == TYPE_INT) {
-            out.set_int(src.int_val);
-        } else if (src.type == TYPE_FLOAT) {
-            out.set_int(static_cast<int>(src.float_val));
-        } else {
-            return false;
-        }
-    } else if (col->type == TYPE_FLOAT) {
-        if (src.type == TYPE_INT) {
-            out.set_float(static_cast<float>(src.int_val));
-        } else if (src.type == TYPE_FLOAT) {
-            out.set_float(src.float_val);
-        } else {
-            return false;
-        }
-    } else if (col->type == TYPE_STRING) {
-        if (src.type != TYPE_STRING) {
-            return false;
-        }
-        out.set_str(src.str_val);
-    } else {
-        return false;
-    }
-    out.init_raw(col->len);
-    return true;
-}
-
-bool has_col_eq_value_cond(const std::vector<Condition> &conds, const TabCol &col) {
-    for (const auto &cond : conds) {
-        if (cond.is_rhs_val && cond.op == OP_EQ &&
-            cond.lhs_col.tab_name == col.tab_name &&
-            cond.lhs_col.col_name == col.col_name) {
-            return true;
-        }
-    }
-    return false;
-}
-
-void add_constant_if_absent(SmManager *sm_manager, std::map<TabCol, Value> &constants,
-                            const TabCol &col, const Value &value, bool &changed) {
-    if (constants.count(col) > 0) {
-        return;
-    }
-    Value adapted;
-    if (!adapt_constant_to_col(sm_manager, value, col, adapted)) {
-        return;
-    }
-    constants[col] = std::move(adapted);
-    changed = true;
-}
-
-void propagate_equal_constants(SmManager *sm_manager, std::shared_ptr<Query> query) {
-    std::map<TabCol, Value> constants;
-    bool changed = false;
-    for (const auto &cond : query->conds) {
-        if (cond.op == OP_EQ && cond.is_rhs_val) {
-            add_constant_if_absent(sm_manager, constants, cond.lhs_col, cond.rhs_val, changed);
-        }
-    }
-
-    do {
-        changed = false;
-        for (const auto &cond : query->conds) {
-            if (cond.op != OP_EQ || cond.is_rhs_val) {
-                continue;
-            }
-            auto lhs_it = constants.find(cond.lhs_col);
-            auto rhs_it = constants.find(cond.rhs_col);
-            if (lhs_it != constants.end()) {
-                add_constant_if_absent(sm_manager, constants, cond.rhs_col, lhs_it->second, changed);
-            }
-            if (rhs_it != constants.end()) {
-                add_constant_if_absent(sm_manager, constants, cond.lhs_col, rhs_it->second, changed);
-            }
-        }
-    } while (changed);
-
-    for (const auto &[col, value] : constants) {
-        if (has_col_eq_value_cond(query->conds, col)) {
-            continue;
-        }
-        Condition inferred;
-        inferred.lhs_col = col;
-        inferred.op = OP_EQ;
-        inferred.is_rhs_val = true;
-        inferred.rhs_val = value;
-        query->conds.push_back(std::move(inferred));
-    }
-}
-
-}  // namespace
-
 // 支持最左匹配原则：自动调整where条件顺序，支持单点查询和范围查询
 bool Planner::get_index_cols(std::string tab_name, std::vector<Condition> curr_conds, std::vector<std::string>& index_col_names) {
     index_col_names.clear();
@@ -265,7 +153,7 @@ std::shared_ptr<Query> Planner::logical_optimization(std::shared_ptr<Query> quer
 
 std::shared_ptr<Plan> Planner::physical_optimization(std::shared_ptr<Query> query, Context *context)
 {
-    std::shared_ptr<Plan> plan = make_one_rel(query, context);
+    std::shared_ptr<Plan> plan = make_one_rel(query);
     
     // 其他物理优化
 
@@ -277,13 +165,10 @@ std::shared_ptr<Plan> Planner::physical_optimization(std::shared_ptr<Query> quer
 
 
 
-std::shared_ptr<Plan> Planner::make_one_rel(std::shared_ptr<Query> query, Context *context)
+std::shared_ptr<Plan> Planner::make_one_rel(std::shared_ptr<Query> query)
 {
     auto x = std::dynamic_pointer_cast<ast::SelectStmt>(query->parse);
     std::vector<std::string> tables = query->tables;
-    if (context == nullptr || !context->is_explain_analyze_) {
-        propagate_equal_constants(sm_manager_, query);
-    }
     // // Scan table , 生成表算子列表tab_nodes
     std::vector<std::shared_ptr<Plan>> table_scan_executors(tables.size());
     for (size_t i = 0; i < tables.size(); i++) {

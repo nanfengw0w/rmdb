@@ -332,7 +332,6 @@ void IxIndexHandle::insert_into_parent(IxNodeHandle *old_node, const char *key, 
  * @return page_id_t 插入到的叶结点的page_no
  */
 page_id_t IxIndexHandle::insert_entry(const char *key, const Rid &value, Transaction *transaction) {
-    std::lock_guard<std::mutex> lock(root_latch_);
     auto [leaf, _] = find_leaf_page(key, Operation::INSERT, transaction);
     if (leaf == nullptr) {
         // Empty tree - should not happen after create_index initializes root
@@ -358,7 +357,6 @@ page_id_t IxIndexHandle::insert_entry(const char *key, const Rid &value, Transac
  * @param transaction 事务指针
  */
 bool IxIndexHandle::delete_entry(const char *key, Transaction *transaction) {
-    std::lock_guard<std::mutex> lock(root_latch_);
     auto [leaf, _] = find_leaf_page(key, Operation::DELETE, transaction);
     if (leaf == nullptr) return false;
 

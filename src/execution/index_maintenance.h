@@ -123,6 +123,33 @@ inline void check_logical_key_write_conflict(SmManager *sm_manager, const TabMet
         }
         return;
     }
+
+    // 无索引时回退到全表扫描
+    RmScan scan(fh);
+    while (!scan.is_end()) {
+        Rid rid = scan.rid();
+        scan.next();
+
+        if (self.has_value() && same_rid(rid, *self)) {
+            continue;
+        }
+
+        auto physical = fh->get_record(rid, nullptr);
+        if (physical == nullptr) {
+            continue;
+        }
+
+        auto visible = fh->get_record(rid, context);
+        if (!record_matches_col_key(key_col, physical.get(), key) &&
+            !record_matches_col_key(key_col, visible.get(), key)) {
+            continue;
+        }
+
+        if (!vm.check_write_conflict(fh->GetFd(), rid, context->txn_)) {
+            throw TransactionAbortException(context->txn_->get_transaction_id(),
+                AbortReason::DEADLOCK_PREVENTION);
+        }
+    }
 }
 
 inline void check_unique_conflict_by_scan(SmManager *sm_manager, const std::string &tab_name,

@@ -20,14 +20,16 @@ See the Mulan PSL v2 for more details. */
 DiskManager::DiskManager() { memset(fd2pageno_, 0, MAX_FD * (sizeof(std::atomic<page_id_t>) / sizeof(char))); }
 
 void DiskManager::write_page(int fd, page_id_t page_no, const char *offset, int num_bytes) {
-    ssize_t bytes_write = pwrite(fd, offset, num_bytes, static_cast<off_t>(page_no) * PAGE_SIZE);
+    lseek(fd, page_no * PAGE_SIZE, SEEK_SET);
+    ssize_t bytes_write = write(fd, offset, num_bytes);
     if (bytes_write != num_bytes) {
         throw InternalError("DiskManager::write_page Error");
     }
 }
 
 void DiskManager::read_page(int fd, page_id_t page_no, char *offset, int num_bytes) {
-    ssize_t bytes_read = pread(fd, offset, num_bytes, static_cast<off_t>(page_no) * PAGE_SIZE);
+    lseek(fd, page_no * PAGE_SIZE, SEEK_SET);
+    ssize_t bytes_read = read(fd, offset, num_bytes);
     if (bytes_read < 0) {
         throw InternalError("DiskManager::read_page Error");
     }
@@ -173,5 +175,6 @@ void DiskManager::write_log(char *log_data, int size) {
         throw UnixError();
     }
 }
+
 
 
