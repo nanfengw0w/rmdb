@@ -1134,6 +1134,172 @@ static std::string compute_string_minmax(AggType type, const std::vector<std::ve
     return result;
 }
 
+static const ColMeta *find_table_col(const TabMeta &tab, const std::string &col_name) {
+    std::string unqualified = unqualify_col_name(col_name);
+    for (const auto &col : tab.cols) {
+        if (col.name == unqualified) {
+            return &col;
+        }
+    }
+    return nullptr;
+}
+
+static bool parse_literal_for_col(const std::string &text, const ColMeta &col, Value &value) {
+    std::string literal = trim_str(text);
+    if (literal.empty()) {
+        return false;
+    }
+
+    try {
+        if (col.type == TYPE_INT) {
+            size_t consumed = 0;
+            int v = std::stoi(literal, &consumed);
+            while (consumed < literal.size() && isspace(static_cast<unsigned char>(literal[consumed]))) {
+                consumed++;
+            }
+            if (consumed != literal.size()) {
+                return false;
+            }
+            value.set_int(v);
+        } else if (col.type == TYPE_FLOAT) {
+            size_t consumed = 0;
+            float v = std::stof(literal, &consumed);
+            while (consumed < literal.size() && isspace(static_cast<unsigned char>(literal[consumed]))) {
+                consumed++;
+            }
+            if (consumed != literal.size()) {
+                return false;
+            }
+            value.set_float(v);
+        } else if (col.type == TYPE_STRING) {
+            if (literal.size() >= 2 && literal.front() == '\'' && literal.back() == '\'') {
+                literal = literal.substr(1, literal.size() - 2);
+            }
+            value.set_str(literal);
+        } else {
+            return false;
+        }
+        value.init_raw(col.len);
+    } catch (...) {
+        return false;
+    }
+    return true;
+}
+
+static std::vector<Condition> parse_simple_where_conditions_for_index(const std::string &where_clause,
+                                                                      const TabMeta &tab,
+                                                                      const std::string &tab_name) {
+    std::vector<Condition> parsed;
+    if (where_clause.empty()) {
+        return parsed;
+    }
+
+    for (auto cond_text : split_conditions_by_and(where_clause)) {
+        CompOp op;
+        std::string op_str;
+        size_t op_pos = std::string::npos;
+        size_t op_len = 0;
+        for (auto &candidate : {"<=", ">=", "<>", "!=", "=", "<", ">"}) {
+            size_t p = cond_text.find(candidate);
+            if (p != std::string::npos && (op_pos == std::string::npos || p < op_pos)) {
+                op_pos = p;
+                op_len = strlen(candidate);
+                op_str = candidate;
+            }
+        }
+        if (op_pos == std::string::npos) {
+            continue;
+        }
+
+        if (op_str == "=") op = OP_EQ;
+        else if (op_str == "<>" || op_str == "!=") op = OP_NE;
+        else if (op_str == "<") op = OP_LT;
+        else if (op_str == ">") op = OP_GT;
+        else if (op_str == "<=") op = OP_LE;
+        else if (op_str == ">=") op = OP_GE;
+        else continue;
+
+        std::string lhs = trim_str(cond_text.substr(0, op_pos));
+        std::string rhs = trim_str(cond_text.substr(op_pos + op_len));
+        const ColMeta *col = find_table_col(tab, lhs);
+        if (col == nullptr) {
+            continue;
+        }
+
+        Value value;
+        if (!parse_literal_for_col(rhs, *col, value)) {
+            continue;
+        }
+
+        Condition cond;
+        cond.lhs_col = TabCol{tab_name, col->name};
+        cond.op = op;
+        cond.is_rhs_val = true;
+        cond.rhs_val = std::move(value);
+        parsed.push_back(std::move(cond));
+    }
+    return parsed;
+}
+
+static bool condition_has_op_on_col(const std::vector<Condition> &conds, const std::string &col_name,
+                                    CompOp op) {
+    for (const auto &cond : conds) {
+        if (cond.is_rhs_val && cond.lhs_col.col_name == col_name && cond.op == op) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool condition_has_range_on_col(const std::vector<Condition> &conds, const std::string &col_name) {
+    for (const auto &cond : conds) {
+        if (!cond.is_rhs_val || cond.lhs_col.col_name != col_name) {
+            continue;
+        }
+        if (cond.op == OP_LT || cond.op == OP_LE || cond.op == OP_GT || cond.op == OP_GE) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int aggregate_index_score(const IndexMeta &index, const std::vector<Condition> &conds) {
+    int score = 0;
+    for (const auto &col : index.cols) {
+        if (condition_has_op_on_col(conds, col.name, OP_EQ)) {
+            score += 2;
+            continue;
+        }
+        if (condition_has_range_on_col(conds, col.name)) {
+            score += 1;
+        }
+        break;
+    }
+    return score;
+}
+
+static bool choose_aggregate_index(const TabMeta &tab, const std::vector<Condition> &conds,
+                                   std::vector<std::string> &index_col_names) {
+    int best_score = 0;
+    const IndexMeta *best_index = nullptr;
+    for (const auto &index : tab.indexes) {
+        int score = aggregate_index_score(index, conds);
+        if (score > best_score) {
+            best_score = score;
+            best_index = &index;
+        }
+    }
+    if (best_index == nullptr) {
+        return false;
+    }
+
+    index_col_names.clear();
+    for (const auto &col : best_index->cols) {
+        index_col_names.push_back(col.name);
+    }
+    return true;
+}
+
 void QlManager::handle_aggregate(const std::string &sql, Context *context) {
     std::string sql_lower = to_lower_str(sql);
 
@@ -1366,20 +1532,28 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
         agg_cols.push_back(ac);
     }
 
-    // 8. 扫描表并收集记录
+    // 8. 扫描表并收集记录。性能测试中的单表聚合也必须走普通扫描算子，
+    // 否则 count/min/sum 带 WHERE 时会绕过索引退化成全表扫。
     std::vector<std::vector<char>> raw_records;
-    RmScan scan(fh);
-    while (!scan.is_end()) {
-        auto rec = fh->get_record(scan.rid(), context);
+    auto index_conds = parse_simple_where_conditions_for_index(where_clause, tab, tab_name);
+    std::vector<std::string> index_col_names;
+    std::unique_ptr<AbstractExecutor> scan_executor;
+    if (choose_aggregate_index(tab, index_conds, index_col_names)) {
+        scan_executor = std::make_unique<IndexScanExecutor>(sm_manager_, tab_name, index_conds,
+                                                            index_col_names, context);
+    } else {
+        scan_executor = std::make_unique<SeqScanExecutor>(sm_manager_, tab_name,
+                                                          std::vector<Condition>(), context);
+    }
+    for (scan_executor->beginTuple(); !scan_executor->is_end(); scan_executor->nextTuple()) {
+        auto rec = scan_executor->Next();
         if (rec == nullptr) {
-            scan.next();
             continue;
         }
         if (eval_where(rec.get())) {
             std::vector<char> row(rec->data, rec->data + fh->get_file_hdr().record_size);
             raw_records.push_back(row);
         }
-        scan.next();
     }
 
     // 9. 分组与聚合计算
@@ -2952,7 +3126,9 @@ void QlManager::handle_explain_analyze(const std::string &sql, Context *context)
     auto query = analyze_inst->do_analyze(ast::parse_tree);
     auto planner_inst = std::make_unique<Planner>(sm_manager_);
     auto optimizer_inst = std::make_unique<Optimizer>(sm_manager_, planner_inst.get());
+    context->is_explain_analyze_ = true;
     auto plan = optimizer_inst->plan_query(query, context);
+    context->is_explain_analyze_ = false;
 
     auto dml_plan = std::dynamic_pointer_cast<DMLPlan>(plan);
     if (!dml_plan || dml_plan->tag != T_select) throw InternalError("EXPLAIN ANALYZE only supports SELECT");

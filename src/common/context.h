@@ -35,4 +35,5 @@ public:
     char *data_send_;
     int *offset_;
     bool ellipsis_;
+    bool is_explain_analyze_{false};
 };
