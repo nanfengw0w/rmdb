@@ -35,7 +35,7 @@ See the Mulan PSL v2 for more details. */
 #include "analyze/analyze.h"
 
 #define SOCK_PORT 8765
-#define MAX_CONN_LIMIT 8
+#define MAX_CONN_LIMIT 128
 
 static bool should_exit = false;
 std::atomic<bool> enable_output_file{true};
@@ -963,6 +963,52 @@ void *client_handler(void *sock_fd) {
                 if (write(fd, data_send, offset + 1) == -1) break;
                 continue;
             }
+        }
+
+        if (control_cmd == "begin" || control_cmd == "commit" ||
+            control_cmd == "abort" || control_cmd == "rollback") {
+            memset(data_send, '\0', BUFFER_LENGTH);
+            offset = 0;
+            auto context = std::make_unique<Context>(lock_manager.get(), log_manager.get(), nullptr,
+                                                     data_send, &offset);
+            try {
+                if (control_cmd == "begin") {
+                    SetTransaction(&txn_id, context.get());
+                    txn_manager->acquire_explicit_txn_lock(context->txn_);
+                    if (context->txn_->get_isolation_level() == IsolationLevel::READ_COMMITTED) {
+                        context->txn_->set_isolation_level(IsolationLevel::SNAPSHOT_ISOLATION);
+                    }
+                    if (context->txn_->get_isolation_level() == IsolationLevel::SNAPSHOT_ISOLATION ||
+                        context->txn_->get_isolation_level() == IsolationLevel::SERIALIZABLE) {
+                        context->txn_->set_start_ts(txn_manager->get_next_timestamp());
+                    }
+                    context->txn_->set_txn_mode(true);
+                } else {
+                    context->txn_ = txn_manager->get_transaction(txn_id);
+                    if (control_cmd == "commit") {
+                        txn_manager->commit(context->txn_, context->log_mgr_);
+                    } else {
+                        txn_manager->abort(context->txn_, context->log_mgr_);
+                    }
+                }
+            } catch (TransactionAbortException &e) {
+                set_response(data_send, &offset, "abort\n");
+                mark_failed_if_explicit(context.get(), &txn_failed);
+                txn_manager->abort(context->txn_, log_manager.get());
+                append_output_line("abort\n");
+            } catch (RMDBError &e) {
+                mark_failed_if_explicit(context.get(), &txn_failed);
+                abort_active_transaction(context.get());
+                set_response(data_send, &offset, std::string(e.what()) + "\n");
+                append_output_line("failure\n");
+            } catch (std::exception &e) {
+                mark_failed_if_explicit(context.get(), &txn_failed);
+                abort_active_transaction(context.get());
+                set_response(data_send, &offset, std::string("Error: ") + e.what() + "\n");
+                append_output_line("failure\n");
+            }
+            if (write(fd, data_send, offset + 1) == -1) break;
+            continue;
         }
 
         // Handle create static_checkpoint
