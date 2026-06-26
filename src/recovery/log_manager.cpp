@@ -34,10 +34,15 @@ lsn_t LogManager::add_log_to_buffer(LogRecord* log_record) {
 }
 
 /**
- * @description: 把日志缓冲区的内容刷到磁盘中，由于目前只设置了一个缓冲区，因此需要阻塞其他日志操作
+ * @description: 把日志缓冲区的内容刷到磁盘中
+ * 优化：如果缓冲区为空，跳过刷盘以减少不必要的磁盘I/O
  */
 void LogManager::flush_log_to_disk() {
     std::lock_guard<std::mutex> lock(latch_);
+    // 快速路径：缓冲区为空时跳过刷盘
+    if (log_buffer_.offset_ == 0) {
+        return;
+    }
     flush_log_to_disk_unlocked();
 }
 
