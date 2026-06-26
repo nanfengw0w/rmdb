@@ -128,81 +128,62 @@ public:
         }
 
         chain.push_back(std::move(entry));
-
-        // 记录此事务修改的键（需要加锁保护并发访问）
-        {
-            std::lock_guard<std::mutex> key_lock(txn_keys_mutex_);
-            txn_keys_[txn->get_transaction_id()].push_back(key);
-        }
     }
 
     /**
-     * @brief 提交事务的所有写操作（优化：只遍历事务修改过的键）
+     * @brief 提交事务的所有写操作
      */
     void commit_transaction(txn_id_t txn_id, timestamp_t commit_ts) {
-        std::vector<VersionKey> keys;
-        {
-            std::lock_guard<std::mutex> lock(txn_keys_mutex_);
-            auto it = txn_keys_.find(txn_id);
-            if (it == txn_keys_.end()) return;
-            keys = std::move(it->second);
-            txn_keys_.erase(it);
-        }
-
-        for (auto& key : keys) {
-            auto& bucket = get_bucket(key);
-            std::lock_guard<std::mutex> lock(bucket.mutex_);
-            auto chain_it = bucket.chains_.find(key);
-            if (chain_it == bucket.chains_.end()) continue;
-            for (auto& entry : chain_it->second) {
-                if (entry.txn_id_ == txn_id && entry.commit_ts_ == 0) {
-                    entry.commit_ts_ = commit_ts;
+        for (size_t i = 0; i < NUM_SHARDS; ++i) {
+            std::lock_guard<std::mutex> lock(shards_[i].mutex_);
+            for (auto& [key, chain] : shards_[i].chains_) {
+                for (auto& entry : chain) {
+                    if (entry.txn_id_ == txn_id && entry.commit_ts_ == 0) {
+                        entry.commit_ts_ = commit_ts;
+                    }
                 }
             }
         }
     }
 
     /**
-     * @brief 回滚事务的所有写操作（优化：只遍历事务修改过的键）
+     * @brief 回滚事务的所有写操作
      * @return 需要恢复的记录列表 (fd, rid, old_data, is_deleted)
      */
     std::vector<std::tuple<int, Rid, std::shared_ptr<RmRecord>, bool>> abort_transaction(txn_id_t txn_id) {
         std::vector<std::tuple<int, Rid, std::shared_ptr<RmRecord>, bool>> to_restore;
-        std::vector<VersionKey> keys;
-        {
-            std::lock_guard<std::mutex> lock(txn_keys_mutex_);
-            auto it = txn_keys_.find(txn_id);
-            if (it == txn_keys_.end()) return to_restore;
-            keys = std::move(it->second);
-            txn_keys_.erase(it);
-        }
 
-        for (auto& key : keys) {
-            auto& bucket = get_bucket(key);
-            std::lock_guard<std::mutex> lock(bucket.mutex_);
-            auto chain_it = bucket.chains_.find(key);
-            if (chain_it == bucket.chains_.end()) continue;
+        for (size_t i = 0; i < NUM_SHARDS; ++i) {
+            std::lock_guard<std::mutex> lock(shards_[i].mutex_);
+            auto& chains = shards_[i].chains_;
 
-            auto& chain = chain_it->second;
-            for (auto& entry : chain) {
-                if (entry.txn_id_ == txn_id) {
-                    to_restore.push_back({key.fd,
-                                          Rid{key.page_no, key.slot_no},
-                                          entry.old_data_,
-                                          entry.is_deleted_});
+            for (auto it = chains.begin(); it != chains.end(); ) {
+                auto& chain = it->second;
+
+                // 找到该事务的版本条目，恢复旧数据
+                for (auto& entry : chain) {
+                    if (entry.txn_id_ == txn_id) {
+                        to_restore.push_back({it->first.fd,
+                                              Rid{it->first.page_no, it->first.slot_no},
+                                              entry.old_data_,
+                                              entry.is_deleted_});
+                    }
                 }
-            }
 
-            chain.erase(
-                std::remove_if(chain.begin(), chain.end(),
-                    [txn_id](const VersionEntry& entry) {
-                        return entry.txn_id_ == txn_id;
-                    }),
-                chain.end()
-            );
+                // 移除该事务的版本条目
+                chain.erase(
+                    std::remove_if(chain.begin(), chain.end(),
+                        [txn_id](const VersionEntry& entry) {
+                            return entry.txn_id_ == txn_id;
+                        }),
+                    chain.end()
+                );
 
-            if (chain.empty()) {
-                bucket.chains_.erase(chain_it);
+                if (chain.empty()) {
+                    it = chains.erase(it);
+                } else {
+                    ++it;
+                }
             }
         }
 
@@ -352,10 +333,6 @@ private:
     };
 
     Shard shards_[NUM_SHARDS];
-
-    // 每事务版本键跟踪，用于快速 commit/abort
-    std::mutex txn_keys_mutex_;
-    std::unordered_map<txn_id_t, std::vector<VersionKey>> txn_keys_;
 
     Shard& get_bucket(const VersionKey& key) {
         size_t hash = VersionKeyHash{}(key);
