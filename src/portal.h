@@ -161,14 +161,19 @@ class Portal
             return std::make_unique<ProjectionExecutor>(convert_plan_executor(x->subplan_, context), 
                                                         x->sel_cols_);
         } else if(auto x = std::dynamic_pointer_cast<ScanPlan>(plan)) {
-            bool force_seq_scan = context != nullptr && context->txn_ != nullptr &&
-                                  context->txn_->get_isolation_level() == IsolationLevel::SNAPSHOT_ISOLATION;
+            // SI 下复合索引(col_num>1)会回退到全索引扫描，性能差且风险未排除，强制 SeqScan。
+            // 单列索引有精确范围边界，MVCC 可见性过滤保证结果正确，允许 IndexScan。
+            bool force_seq_scan = false;
+            if (context != nullptr && context->txn_ != nullptr &&
+                context->txn_->get_isolation_level() == IsolationLevel::SNAPSHOT_ISOLATION) {
+                force_seq_scan = (x->tag == T_IndexScan && x->index_col_names_.size() > 1);
+            }
             if(x->tag == T_SeqScan || force_seq_scan) {
                 return std::make_unique<SeqScanExecutor>(sm_manager_, x->tab_name_, x->conds_, context);
             }
             else {
                 return std::make_unique<IndexScanExecutor>(sm_manager_, x->tab_name_, x->conds_, x->index_col_names_, context);
-            } 
+            }
         } else if(auto x = std::dynamic_pointer_cast<JoinPlan>(plan)) {
             std::unique_ptr<AbstractExecutor> left = convert_plan_executor(x->left_, context);
             std::unique_ptr<AbstractExecutor> right = convert_plan_executor(x->right_, context);

@@ -20,16 +20,14 @@ See the Mulan PSL v2 for more details. */
 DiskManager::DiskManager() { memset(fd2pageno_, 0, MAX_FD * (sizeof(std::atomic<page_id_t>) / sizeof(char))); }
 
 void DiskManager::write_page(int fd, page_id_t page_no, const char *offset, int num_bytes) {
-    lseek(fd, page_no * PAGE_SIZE, SEEK_SET);
-    ssize_t bytes_write = write(fd, offset, num_bytes);
+    ssize_t bytes_write = pwrite(fd, offset, num_bytes, page_no * PAGE_SIZE);
     if (bytes_write != num_bytes) {
         throw InternalError("DiskManager::write_page Error");
     }
 }
 
 void DiskManager::read_page(int fd, page_id_t page_no, char *offset, int num_bytes) {
-    lseek(fd, page_no * PAGE_SIZE, SEEK_SET);
-    ssize_t bytes_read = read(fd, offset, num_bytes);
+    ssize_t bytes_read = pread(fd, offset, num_bytes, page_no * PAGE_SIZE);
     if (bytes_read < 0) {
         throw InternalError("DiskManager::read_page Error");
     }
@@ -158,8 +156,7 @@ int DiskManager::read_log(char *log_data, int size, int offset) {
 
     size = std::min(size, file_size - offset);
     if(size == 0) return 0;
-    lseek(log_fd_, offset, SEEK_SET);
-    ssize_t bytes_read = read(log_fd_, log_data, size);
+    ssize_t bytes_read = pread(log_fd_, log_data, size, offset);
     assert(bytes_read == size);
     return bytes_read;
 }
@@ -169,8 +166,9 @@ void DiskManager::write_log(char *log_data, int size) {
         log_fd_ = open_file(LOG_FILE_NAME);
     }
 
-    lseek(log_fd_, 0, SEEK_END);
-    ssize_t bytes_write = write(log_fd_, log_data, size);
+    // 追加写入：先获取文件大小作为偏移
+    int file_size = get_file_size(LOG_FILE_NAME);
+    ssize_t bytes_write = pwrite(log_fd_, log_data, size, file_size);
     if (bytes_write != size) {
         throw UnixError();
     }

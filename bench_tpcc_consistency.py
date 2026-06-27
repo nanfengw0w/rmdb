@@ -42,11 +42,12 @@ def send_sql(sock, sql, timeout=30):
     return b"".join(chunks).decode(errors="replace").replace("\0", "")
 
 
-def connect():
+def connect(snapshot=True):
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(30)
     sock.connect(("127.0.0.1", PORT))
-    send_sql(sock, "SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION;")
+    if snapshot:
+        send_sql(sock, "SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION;")
     send_sql(sock, "set output_file off")
     return sock
 
@@ -379,14 +380,19 @@ def build_snapshot_model(sock):
     }
 
     stock_keys = set()
+
     for w_id in range(1, WAREHOUSES + 1):
         for d_id in range(1, DISTRICTS + 1):
             key = (w_id, d_id)
-            model["district_next"][key] = query_scalar(
-                sock, f"SELECT d_next_o_id FROM district WHERE d_w_id={w_id} AND d_id={d_id};")
+            d_next = query_scalar(sock, f"SELECT d_next_o_id FROM district WHERE d_w_id={w_id} AND d_id={d_id};")
+            model["district_next"][key] = d_next
 
+    for w_id in range(1, WAREHOUSES + 1):
+        for d_id in range(1, DISTRICTS + 1):
+            key = (w_id, d_id)
             order_rows = parse_table(send_sql(
-                sock, f"SELECT o_id, o_ol_cnt FROM orders WHERE o_w_id={w_id} AND o_d_id={d_id};",
+                sock,
+                f"SELECT o_id, o_d_id, o_w_id, o_ol_cnt FROM orders WHERE o_w_id={w_id} AND o_d_id={d_id};",
                 timeout=120))
             for row in order_rows:
                 o_id = to_int(row["o_id"])
@@ -395,8 +401,8 @@ def build_snapshot_model(sock):
 
                 ol_rows = parse_table(send_sql(
                     sock,
-                    f"SELECT ol_i_id, ol_supply_w_id, ol_quantity FROM order_line "
-                    f"WHERE ol_w_id={w_id} AND ol_d_id={d_id} AND ol_o_id={o_id};",
+                    f"SELECT ol_o_id, ol_d_id, ol_w_id, ol_i_id, ol_supply_w_id, ol_quantity "
+                    f"FROM order_line WHERE ol_w_id={w_id} AND ol_d_id={d_id} AND ol_o_id={o_id};",
                     timeout=120))
                 model["order_line_count"][key] += len(ol_rows)
                 if o_id is not None and o_id > INITIAL_ORDERS_PER_DIST:
@@ -407,21 +413,24 @@ def build_snapshot_model(sock):
                         model["new_order_stock_qty"][stock_key] += to_int(ol_row["ol_quantity"]) or 0
 
             no_rows = parse_table(send_sql(
-                sock, f"SELECT no_o_id FROM new_orders WHERE no_w_id={w_id} AND no_d_id={d_id};",
+                sock,
+                f"SELECT no_o_id, no_d_id, no_w_id FROM new_orders WHERE no_w_id={w_id} AND no_d_id={d_id};",
                 timeout=120))
             for row in no_rows:
                 model["new_orders"][key].append(to_int(row["no_o_id"]))
 
-    for stock_key in stock_keys:
-        w_id, i_id = stock_key
-        stock_rows = parse_table(send_sql(
-            sock,
-            f"SELECT s_quantity, s_ytd, s_order_cnt FROM stock WHERE s_w_id={w_id} AND s_i_id={i_id};",
-            timeout=120))
-        if not stock_rows:
+    for w_id, i_id in stock_keys:
+        rows = [
+            row for row in parse_table(send_sql(
+                sock,
+                f"SELECT s_i_id, s_w_id, s_quantity, s_ytd, s_order_cnt FROM stock WHERE s_i_id={i_id};",
+                timeout=120))
+            if to_int(row["s_w_id"]) == w_id
+        ]
+        if not rows:
             continue
-        row = stock_rows[0]
-        model["stock"][stock_key] = {
+        row = rows[0]
+        model["stock"][(w_id, i_id)] = {
             "s_quantity": to_int(row["s_quantity"]),
             "s_ytd": to_int(row["s_ytd"]),
             "s_order_cnt": to_int(row["s_order_cnt"]),
@@ -444,7 +453,7 @@ def expect_float_equal(failures, label, actual, expected):
 
 
 def validate_consistency(expected_new_orders, run_probe=True):
-    sock = connect()
+    sock = connect(snapshot=False)
     failures = []
     model = build_snapshot_model(sock)
     for w_id in range(1, WAREHOUSES + 1):
@@ -460,11 +469,11 @@ def validate_consistency(expected_new_orders, run_probe=True):
             raw_max_no = max(no_ids) if no_ids else None
             raw_count_ol = model["order_line_count"][key]
 
-            if raw_d_next != raw_max_o + 1:
+            if raw_max_o is not None and raw_d_next != raw_max_o + 1:
                 failures.append(f"raw district/order mismatch ({w_id},{d_id}): d_next={raw_d_next}, max_o={raw_max_o}")
             if raw_count_no and raw_max_no is not None and raw_min_no is not None and raw_count_no != raw_max_no - raw_min_no + 1:
                 failures.append(f"raw new_orders gap ({w_id},{d_id}): count={raw_count_no}, min={raw_min_no}, max={raw_max_no}")
-            if raw_count_no and raw_max_no != raw_max_o:
+            if raw_count_no and raw_max_o is not None and raw_max_no != raw_max_o:
                 failures.append(f"raw new_orders max mismatch ({w_id},{d_id}): max_no={raw_max_no}, max_o={raw_max_o}")
             if order_ol_sum != raw_count_ol:
                 failures.append(f"raw orders/order_line mismatch ({w_id},{d_id}): sum_o_ol_cnt={order_ol_sum}, count_ol={raw_count_ol}")
@@ -517,6 +526,7 @@ def validate_consistency(expected_new_orders, run_probe=True):
     if run_probe:
         failures.extend(validate_index_read_path_probe(sock))
         failures.extend(validate_order_limit_probe(sock))
+        failures.extend(validate_composite_index_probe(sock))
     sock.close()
     return failures
 
@@ -586,6 +596,63 @@ def validate_index_read_path_probe(sock):
     expect_equal(failures, "probe min k>=100", min_ge_100, min([k for _, k, _ in raw if k >= 100], default=None))
     expect_equal(failures, "probe max k<100", max_lt_100, max([k for _, k, _ in raw if k < 100], default=None))
     expect_float_equal(failures, "probe sum k>=100", sum_ge_100, raw_sum_ge_100)
+    return failures
+
+
+def validate_composite_index_probe(sock):
+    failures = []
+    for sql in [
+        "CREATE TABLE composite_probe (a int, b int, c int, payload int);",
+        "CREATE INDEX composite_probe (a, b, c);",
+        "INSERT INTO composite_probe VALUES (1, 1, 4, 40);",
+        "INSERT INTO composite_probe VALUES (1, 1, 5, 50);",
+        "INSERT INTO composite_probe VALUES (1, 1, 6, 60);",
+        "INSERT INTO composite_probe VALUES (1, 1, 7, 70);",
+        "INSERT INTO composite_probe VALUES (1, 2, 5, 125);",
+        "INSERT INTO composite_probe VALUES (2, 1, 5, 215);",
+        "UPDATE composite_probe SET c=8 WHERE a=1 AND b=1 AND c=4;",
+        "DELETE FROM composite_probe WHERE a=1 AND b=1 AND c=7;",
+    ]:
+        resp = send_sql(sock, sql)
+        if is_bad_response(resp):
+            failures.append(f"composite probe setup failed for `{sql}`: {resp.strip()}")
+            return failures
+
+    checks = [
+        ("count closed-open range",
+         "SELECT COUNT(payload) as cnt FROM composite_probe WHERE a=1 AND b=1 AND c>=5 AND c<8;", 2),
+        ("sum closed-open range",
+         "SELECT SUM(payload) as s FROM composite_probe WHERE a=1 AND b=1 AND c>=5 AND c<8;", 110),
+        ("count closed range after update",
+         "SELECT COUNT(payload) as cnt FROM composite_probe WHERE a=1 AND b=1 AND c>=5 AND c<=8;", 3),
+        ("count deleted exact key",
+         "SELECT COUNT(payload) as cnt FROM composite_probe WHERE a=1 AND b=1 AND c=7;", 0),
+        ("count updated exact key",
+         "SELECT COUNT(payload) as cnt FROM composite_probe WHERE a=1 AND b=1 AND c=8;", 1),
+        ("prefix range excludes other b",
+         "SELECT COUNT(payload) as cnt FROM composite_probe WHERE a=1 AND b=1 AND c>=0;", 3),
+    ]
+    for label, sql, expected in checks:
+        actual = query_scalar(sock, sql)
+        expect_float_equal(failures, f"composite probe {label}", actual, expected)
+
+    row_checks = [
+        ("select closed-open range",
+         "SELECT payload FROM composite_probe WHERE a=1 AND b=1 AND c>=5 AND c<8;", [50, 60]),
+        ("select closed range after update",
+         "SELECT payload FROM composite_probe WHERE a=1 AND b=1 AND c>=5 AND c<=8;", [40, 50, 60]),
+        ("select deleted exact key",
+         "SELECT payload FROM composite_probe WHERE a=1 AND b=1 AND c=7;", []),
+        ("select updated exact key",
+         "SELECT payload FROM composite_probe WHERE a=1 AND b=1 AND c=8;", [40]),
+        ("select prefix range excludes other b",
+         "SELECT payload FROM composite_probe WHERE a=1 AND b=1 AND c>=0;", [40, 50, 60]),
+    ]
+    for label, sql, expected in row_checks:
+        rows = parse_table(send_sql(sock, sql))
+        actual = sorted(to_int(row["payload"]) for row in rows)
+        if actual != expected:
+            failures.append(f"composite probe {label}: actual={actual}, expected={expected}")
     return failures
 
 

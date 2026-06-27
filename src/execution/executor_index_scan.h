@@ -50,6 +50,59 @@ class IndexScanExecutor : public AbstractExecutor {
         bool inclusive;
     };
 
+    // 预计算：条件中列的元数据，避免每次 eval_conds 做 O(n) 线性搜索
+    struct CondColInfo {
+        size_t offset;
+        ColType type;
+        int len;
+        size_t rhs_offset;
+        bool is_rhs_val;
+        CompOp op;
+    };
+    std::vector<CondColInfo> cond_col_infos_;
+    bool cond_info_inited_ = false;
+
+    // 预计算：索引键条件列偏移
+    struct IndexKeyColInfo {
+        int offset;  // 在索引键中的偏移
+        ColType type;
+        int len;
+        // 对应的条件索引（-1 表示无 EQ 条件）
+        int cond_idx;
+    };
+    std::vector<IndexKeyColInfo> index_key_col_infos_;
+    bool index_key_info_inited_ = false;
+
+    void init_cond_col_infos() {
+        if (cond_info_inited_) return;
+        cond_info_inited_ = true;
+        cond_col_infos_.reserve(fed_conds_.size());
+        for (auto &cond : fed_conds_) {
+            CondColInfo info;
+            auto lhs_pos = std::find_if(cols_.begin(), cols_.end(), [&](const ColMeta &col) {
+                return col.tab_name == cond.lhs_col.tab_name && col.name == cond.lhs_col.col_name;
+            });
+            if (lhs_pos == cols_.end()) {
+                cond_col_infos_.push_back(info);
+                continue;
+            }
+            info.offset = lhs_pos->offset;
+            info.type = lhs_pos->type;
+            info.len = lhs_pos->len;
+            info.op = cond.op;
+            info.is_rhs_val = cond.is_rhs_val;
+            if (cond.is_rhs_val) {
+                info.rhs_offset = 0;
+            } else {
+                auto rhs_pos = std::find_if(cols_.begin(), cols_.end(), [&](const ColMeta &col) {
+                    return col.tab_name == cond.rhs_col.tab_name && col.name == cond.rhs_col.col_name;
+                });
+                info.rhs_offset = (rhs_pos != cols_.end()) ? rhs_pos->offset : 0;
+            }
+            cond_col_infos_.push_back(info);
+        }
+    }
+
    public:
     IndexScanExecutor(SmManager *sm_manager, std::string tab_name, std::vector<Condition> conds, std::vector<std::string> index_col_names,
                     Context *context) {
@@ -91,6 +144,7 @@ class IndexScanExecutor : public AbstractExecutor {
     }
 
     void beginTuple() override {
+        init_cond_col_infos();
         matched_rids_.clear();
         matched_pos_ = 0;
         is_end_ = true;
@@ -415,6 +469,24 @@ class IndexScanExecutor : public AbstractExecutor {
     }
 
     bool eval_conds(RmRecord *record, const std::vector<Condition> &conds) {
+        // 使用预计算的列信息（如果可用）
+        if (cond_info_inited_ && conds.size() == cond_col_infos_.size()) {
+            for (size_t i = 0; i < conds.size(); ++i) {
+                auto &info = cond_col_infos_[i];
+                char *lhs_buf = record->data + info.offset;
+                if (conds[i].is_rhs_val) {
+                    char *rhs_buf = conds[i].rhs_val.raw->data;
+                    int cmp = compare_value(lhs_buf, rhs_buf, info.type, info.len);
+                    if (!eval_cmp(cmp, info.op)) return false;
+                } else {
+                    char *rhs_buf = record->data + info.rhs_offset;
+                    int cmp = compare_value(lhs_buf, rhs_buf, info.type, info.len);
+                    if (!eval_cmp(cmp, info.op)) return false;
+                }
+            }
+            return true;
+        }
+        // 回退到原始实现
         for (auto &cond : conds) {
             auto &lhs_col_meta = find_col_meta(cols_, cond.lhs_col);
             char *lhs_buf = record->data + lhs_col_meta.offset;
