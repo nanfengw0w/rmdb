@@ -561,9 +561,15 @@ class IndexScanExecutor : public AbstractExecutor {
         }
     }
 
-    int compare_first_col_key(const std::vector<char> &lhs, const std::vector<char> &rhs) {
-        auto &col = index_meta_.cols[0];
-        return compare_value(lhs.data(), rhs.data(), col.type, col.len);
+    // 比较完整复合 key（所有列按序比较），而不是只比较第一列
+    int compare_full_key(const std::vector<char> &lhs, const std::vector<char> &rhs) {
+        int offset = 0;
+        for (auto &col : index_meta_.cols) {
+            int cmp = compare_value(lhs.data() + offset, rhs.data() + offset, col.type, col.len);
+            if (cmp != 0) return cmp;
+            offset += col.len;
+        }
+        return 0;
     }
 
     void update_lower_bound(std::optional<Bound> &current, Bound candidate) {
@@ -571,7 +577,7 @@ class IndexScanExecutor : public AbstractExecutor {
             current = std::move(candidate);
             return;
         }
-        int cmp = compare_first_col_key(candidate.key, current->key);
+        int cmp = compare_full_key(candidate.key, current->key);
         if (cmp > 0 || (cmp == 0 && current->inclusive && !candidate.inclusive)) {
             current = std::move(candidate);
         }
@@ -582,7 +588,7 @@ class IndexScanExecutor : public AbstractExecutor {
             current = std::move(candidate);
             return;
         }
-        int cmp = compare_first_col_key(candidate.key, current->key);
+        int cmp = compare_full_key(candidate.key, current->key);
         if (cmp < 0 || (cmp == 0 && current->inclusive && !candidate.inclusive)) {
             current = std::move(candidate);
         }
@@ -592,7 +598,7 @@ class IndexScanExecutor : public AbstractExecutor {
         if (!lower.has_value() || !upper.has_value()) {
             return false;
         }
-        int cmp = compare_first_col_key(lower->key, upper->key);
+        int cmp = compare_full_key(lower->key, upper->key);
         return cmp > 0 || (cmp == 0 && (!lower->inclusive || !upper->inclusive));
     }
 
