@@ -1202,13 +1202,46 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
     }
 
     // 5. 解析WHERE条件为函数
-    auto eval_where = [&](RmRecord *rec) -> bool {
-        if (where_clause.empty()) return true;
-        std::string wc = where_clause;
-        std::vector<std::string> conds = split_conditions_by_and(wc);
-        for (auto &cond : conds) {
-            CompOp op;
-            std::string col_name, op_str, val_str;
+    struct ParsedWhereCond {
+        int col_idx = -1;
+        std::string col_name;
+        CompOp op = OP_EQ;
+        ColType type = TYPE_INT;
+        int len = 0;
+        int offset = 0;
+        std::vector<char> rhs_raw;
+    };
+
+    auto eval_parsed_cmp = [](int cmp_result, CompOp op) {
+        switch (op) {
+            case OP_EQ: return cmp_result == 0;
+            case OP_NE: return cmp_result != 0;
+            case OP_LT: return cmp_result < 0;
+            case OP_GT: return cmp_result > 0;
+            case OP_LE: return cmp_result <= 0;
+            case OP_GE: return cmp_result >= 0;
+            default: return true;
+        }
+    };
+
+    auto compare_parsed_value = [](const char *lhs, const ParsedWhereCond &cond) {
+        if (cond.type == TYPE_INT) {
+            int lv = *reinterpret_cast<const int *>(lhs);
+            int rv = *reinterpret_cast<const int *>(cond.rhs_raw.data());
+            return (lv > rv) ? 1 : ((lv < rv) ? -1 : 0);
+        }
+        if (cond.type == TYPE_FLOAT) {
+            float lv = *reinterpret_cast<const float *>(lhs);
+            float rv = *reinterpret_cast<const float *>(cond.rhs_raw.data());
+            return (lv > rv) ? 1 : ((lv < rv) ? -1 : 0);
+        }
+        return memcmp(lhs, cond.rhs_raw.data(), cond.len);
+    };
+
+    std::vector<ParsedWhereCond> parsed_where;
+    if (!where_clause.empty()) {
+        for (auto &cond : split_conditions_by_and(where_clause)) {
+            std::string op_str;
             size_t op_pos = std::string::npos;
             for (auto &o : {"<=", ">=", "<>", "!=", "=", "<", ">"}) {
                 size_t p = cond.find(o);
@@ -1217,49 +1250,50 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
                     op_str = o;
                 }
             }
-            if (op_pos == std::string::npos) continue;
-            col_name = trim_str(cond.substr(0, op_pos));
-            val_str = trim_str(cond.substr(op_pos + op_str.length()));
-            if (!val_str.empty() && val_str.front() == '\'' && val_str.back() == '\'')
-                val_str = val_str.substr(1, val_str.length() - 2);
+            if (op_pos == std::string::npos) {
+                continue;
+            }
 
-            if (op_str == "=") op = OP_EQ;
-            else if (op_str == "<>") op = OP_NE;
-            else if (op_str == "!=") op = OP_NE;
-            else if (op_str == "<") op = OP_LT;
-            else if (op_str == ">") op = OP_GT;
-            else if (op_str == "<=") op = OP_LE;
-            else if (op_str == ">=") op = OP_GE;
+            ParsedWhereCond parsed;
+            std::string col_name = trim_str(cond.substr(0, op_pos));
+            std::string val_str = trim_str(cond.substr(op_pos + op_str.length()));
+            if (!val_str.empty() && val_str.front() == '\'' && val_str.back() == '\'') {
+                val_str = val_str.substr(1, val_str.length() - 2);
+            }
+
+            if (op_str == "=") parsed.op = OP_EQ;
+            else if (op_str == "<>" || op_str == "!=") parsed.op = OP_NE;
+            else if (op_str == "<") parsed.op = OP_LT;
+            else if (op_str == ">") parsed.op = OP_GT;
+            else if (op_str == "<=") parsed.op = OP_LE;
+            else if (op_str == ">=") parsed.op = OP_GE;
             else continue;
 
             auto col_it = tab.get_col(unqualify_col_name(col_name));
-            char *rec_data = rec->data + col_it->offset;
-            int cmp_result = 0;
-            if (col_it->type == TYPE_INT) {
-                int val = std::stoi(val_str);
-                int rec_val = *(int*)rec_data;
-                cmp_result = (rec_val > val) ? 1 : ((rec_val < val) ? -1 : 0);
-            } else if (col_it->type == TYPE_FLOAT) {
-                float val = std::stof(val_str);
-                float rec_val = *(float*)rec_data;
-                cmp_result = (rec_val > val) ? 1 : ((rec_val < val) ? -1 : 0);
-            } else if (col_it->type == TYPE_STRING) {
-                // Pad val_str to column length with null bytes for proper comparison
-                std::string padded_val(col_it->len, '\0');
-                memcpy(padded_val.data(), val_str.c_str(), std::min(val_str.length(), (size_t)col_it->len));
-                cmp_result = memcmp(rec_data, padded_val.c_str(), col_it->len);
+            parsed.col_idx = static_cast<int>(col_it - tab.cols.begin());
+            parsed.col_name = col_it->name;
+            parsed.type = col_it->type;
+            parsed.len = col_it->len;
+            parsed.offset = col_it->offset;
+            parsed.rhs_raw.assign(parsed.len, 0);
+            if (parsed.type == TYPE_INT) {
+                int value = std::stoi(val_str);
+                memcpy(parsed.rhs_raw.data(), &value, sizeof(value));
+            } else if (parsed.type == TYPE_FLOAT) {
+                float value = std::stof(val_str);
+                memcpy(parsed.rhs_raw.data(), &value, sizeof(value));
+            } else if (parsed.type == TYPE_STRING) {
+                memcpy(parsed.rhs_raw.data(), val_str.c_str(),
+                       std::min(val_str.length(), static_cast<size_t>(parsed.len)));
             }
-            bool pass = false;
-            switch (op) {
-                case OP_EQ: pass = (cmp_result == 0); break;
-                case OP_NE: pass = (cmp_result != 0); break;
-                case OP_LT: pass = (cmp_result < 0); break;
-                case OP_GT: pass = (cmp_result > 0); break;
-                case OP_LE: pass = (cmp_result <= 0); break;
-                case OP_GE: pass = (cmp_result >= 0); break;
-                default: pass = true;
-            }
-            if (!pass) return false;
+            parsed_where.push_back(std::move(parsed));
+        }
+    }
+
+    auto eval_where = [&](RmRecord *rec) -> bool {
+        for (auto &cond : parsed_where) {
+            int cmp_result = compare_parsed_value(rec->data + cond.offset, cond);
+            if (!eval_parsed_cmp(cmp_result, cond.op)) return false;
         }
         return true;
     };
@@ -1366,20 +1400,135 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
         agg_cols.push_back(ac);
     }
 
+    // 检查是否有聚合函数
+    bool has_agg_func = false;
+    for (auto &ac : agg_cols) {
+        if (ac.type != AGG_NONE) { has_agg_func = true; break; }
+    }
+
+    size_t order_by_pos_for_scan = sql_lower.find(" order by ");
+    bool has_order_by_for_scan = order_by_pos_for_scan != std::string::npos;
+    int early_limit_n = -1;
+    {
+        size_t lim_pos = sql_lower.find(" limit ");
+        if (lim_pos != std::string::npos) {
+            early_limit_n = std::stoi(trim_str(sql.substr(lim_pos + 7)));
+        }
+    }
+    std::string first_order_col;
+    bool first_order_desc = false;
+    if (has_order_by_for_scan) {
+        size_t ob_end = sql.length();
+        size_t lim_pos = sql_lower.find(" limit ", order_by_pos_for_scan);
+        if (lim_pos != std::string::npos) ob_end = lim_pos;
+        std::string ob_cols = trim_str(sql.substr(order_by_pos_for_scan + 10,
+                                                  ob_end - order_by_pos_for_scan - 10));
+        auto order_parts = split_str(ob_cols, ",");
+        if (!order_parts.empty()) {
+            std::string first = trim_str(order_parts[0]);
+            std::string first_lower = to_lower_str(first);
+            if (first_lower.find(" desc") != std::string::npos) {
+                first_order_desc = true;
+                first = trim_str(first.substr(0, first.length() - 5));
+            } else if (first_lower.find(" asc") != std::string::npos) {
+                first = trim_str(first.substr(0, first.length() - 4));
+            }
+            first_order_col = unqualify_col_name(first);
+        }
+    }
+
+    const IndexMeta *scan_index = nullptr;
+    IxIndexHandle *scan_ih = nullptr;
+    int best_index_score = 0;
+    bool may_change_raw_order = has_order_by_for_scan || (has_agg_func && group_col_idxs.empty());
+    if (may_change_raw_order) {
+        for (auto &index : tab.indexes) {
+            if (index.cols.empty()) continue;
+            int score = 0;
+            if (!first_order_col.empty() && index.cols[0].name == first_order_col) {
+                score += 100;
+            }
+            for (auto &cond : parsed_where) {
+                for (auto &col : index.cols) {
+                    if (col.name == cond.col_name) {
+                        score += 1;
+                        break;
+                    }
+                }
+            }
+            if (score > best_index_score) {
+                auto ix_name = sm_manager_->get_ix_manager()->get_index_name(tab_name, index.cols);
+                auto ih_it = sm_manager_->ihs_.find(ix_name);
+                if (ih_it != sm_manager_->ihs_.end()) {
+                    best_index_score = score;
+                    scan_index = &index;
+                    scan_ih = ih_it->second.get();
+                }
+            }
+        }
+    }
+
+    auto index_key_passes_where = [&](const IndexMeta &index, const char *key) {
+        int key_offset = 0;
+        for (auto &idx_col : index.cols) {
+            for (auto &cond : parsed_where) {
+                if (cond.col_name == idx_col.name) {
+                    int cmp_result = compare_parsed_value(key + key_offset, cond);
+                    if (!eval_parsed_cmp(cmp_result, cond.op)) {
+                        return false;
+                    }
+                }
+            }
+            key_offset += idx_col.len;
+        }
+        return true;
+    };
+
+    bool can_stop_after_limit = scan_ih != nullptr && scan_index != nullptr &&
+                                early_limit_n >= 0 && !first_order_desc &&
+                                !first_order_col.empty() &&
+                                scan_index->cols[0].name == first_order_col &&
+                                group_col_idxs.empty() && !has_agg_func;
+
     // 8. 扫描表并收集记录
     std::vector<std::vector<char>> raw_records;
-    RmScan scan(fh);
-    while (!scan.is_end()) {
-        auto rec = fh->get_record(scan.rid(), context);
-        if (rec == nullptr) {
+    if (scan_ih != nullptr && scan_index != nullptr) {
+        std::set<std::pair<int, int>> seen_rids;
+        IxScan scan(scan_ih, scan_ih->leaf_begin(), scan_ih->leaf_end(), sm_manager_->get_bpm());
+        while (!scan.is_end()) {
+            if (!index_key_passes_where(*scan_index, scan.key())) {
+                scan.next();
+                continue;
+            }
+            Rid rid = scan.rid();
+            if (!seen_rids.insert({rid.page_no, rid.slot_no}).second) {
+                scan.next();
+                continue;
+            }
+            auto rec = fh->get_record(rid, context);
+            if (rec != nullptr && eval_where(rec.get())) {
+                std::vector<char> row(rec->data, rec->data + fh->get_file_hdr().record_size);
+                raw_records.push_back(row);
+                if (can_stop_after_limit && static_cast<int>(raw_records.size()) >= early_limit_n) {
+                    break;
+                }
+            }
             scan.next();
-            continue;
         }
-        if (eval_where(rec.get())) {
-            std::vector<char> row(rec->data, rec->data + fh->get_file_hdr().record_size);
-            raw_records.push_back(row);
+    } else {
+        RmScan scan(fh);
+        while (!scan.is_end()) {
+            auto rec = fh->get_record(scan.rid(), context);
+            if (rec == nullptr) {
+                scan.next();
+                continue;
+            }
+            if (eval_where(rec.get())) {
+                std::vector<char> row(rec->data, rec->data + fh->get_file_hdr().record_size);
+                raw_records.push_back(row);
+            }
+            scan.next();
         }
-        scan.next();
     }
 
     // 9. 分组与聚合计算
@@ -1463,12 +1612,6 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
         }
         results.push_back(gr);
     };
-
-    // 检查是否有聚合函数
-    bool has_agg_func = false;
-    for (auto &ac : agg_cols) {
-        if (ac.type != AGG_NONE) { has_agg_func = true; break; }
-    }
 
     // 有聚合函数但没有GROUP BY时，SELECT中不能有非聚合列
     if (has_agg_func && group_col_idxs.empty()) {
