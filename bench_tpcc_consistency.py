@@ -656,6 +656,34 @@ def validate_composite_index_probe(sock):
     return failures
 
 
+def validate_index_scan_code():
+    """代码审计：检查 IndexScanExecutor 的 bounds_are_empty 是否使用了正确的 key 比较函数"""
+    failures = []
+    try:
+        with open("src/execution/executor_index_scan.h", "r") as f:
+            content = f.read()
+
+        import re
+        pattern = r'bool\s+bounds_are_empty\s*\([^)]*\)\s*\{'
+        match = re.search(pattern, content)
+        if match:
+            start = match.end()
+            depth = 1
+            pos = start
+            while pos < len(content) and depth > 0:
+                if content[pos] == '{':
+                    depth += 1
+                elif content[pos] == '}':
+                    depth -= 1
+                pos += 1
+            body = content[start:pos]
+            if 'compare_first_col_key' in body:
+                failures.append("index scan code audit: bounds_are_empty uses compare_first_col_key (bug: only compares first column of composite key)")
+    except FileNotFoundError:
+        pass
+    return failures
+
+
 def main():
     global WAREHOUSES, CUSTOMERS_PER_DIST, ITEMS, INITIAL_ORDERS_PER_DIST, INITIAL_NEW_ORDER_START
 
@@ -692,6 +720,7 @@ def main():
             t.join()
         elapsed = time.time() - start
         failures = validate_consistency(stats["new_order_total"], run_probe=not args.skip_probe)
+        failures.extend(validate_index_scan_code())
         print(f"elapsed={elapsed:.2f}s new_order={stats['new_order']} delivery={stats['delivery']} "
               f"payment={stats['payment']} order_status={stats['order_status']} "
               f"stock_level={stats['stock_level']} abort={stats['abort']} "
