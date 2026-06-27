@@ -196,17 +196,9 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
         txn->set_commit_ts(commit_ts);
         txn->commit_order_ = global_commit_order_++;
 
-        // 提交本事务实际写过的版本，避免每次 commit 扫描所有版本链。
+        // 提交版本管理器中的所有写操作
         auto& vm = VersionManager::instance();
-        auto write_set = txn->get_write_set();
-        for (auto *wr : *write_set) {
-            auto fh_it = sm_manager_->fhs_.find(wr->GetTableName());
-            if (fh_it == sm_manager_->fhs_.end()) {
-                continue;
-            }
-            vm.commit_record(fh_it->second->GetFd(), wr->GetRid(),
-                             txn->get_transaction_id(), commit_ts);
-        }
+        vm.commit_transaction(txn->get_transaction_id(), commit_ts);
     }
 
     txn->set_state(TransactionState::COMMITTED);
