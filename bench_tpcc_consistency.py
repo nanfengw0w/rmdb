@@ -627,15 +627,17 @@ def validate_composite_index_probe(sock):
     stop = threading.Event()
 
     def si_reader(tid):
-        """SI 读线程：并发读复合索引"""
+        """SI 读线程：并发读复合索引，用多范围条件触发 compare_first_col_key bug"""
         try:
             s = connect(snapshot=True)
-            for iteration in range(50):
+            for iteration in range(20):
                 if stop.is_set():
                     break
                 send_sql(s, "BEGIN;")
-                # 范围查询：应返回 2 行 (c=5, c=6)
-                rows = parse_table(send_sql(s, "SELECT payload FROM composite_probe WHERE a=1 AND b=1 AND c>=5 AND c<8;"))
+                # 关键：用同列多个范围条件，触发 compare_first_col_key bug
+                # abffc31: lower=(1,1,3) 不更新 → 扫描范围过宽 → 更多 MVCC 锁 → 死锁
+                # a9e165c: lower=(1,1,5) 正确更新 → 扫描范围正确 → 正常
+                rows = parse_table(send_sql(s, "SELECT payload FROM composite_probe WHERE a=1 AND b=1 AND c>=3 AND c>=5 AND c<=8 AND c<=6;"))
                 vals = sorted(to_int(r["payload"]) for r in rows)
                 if vals != [50, 60]:
                     errs.append(f"t{tid} iter{iteration}: {vals} expected=[50,60]")
@@ -647,7 +649,7 @@ def validate_composite_index_probe(sock):
         except Exception as e:
             errs.append(f"t{tid}: {e}")
 
-    threads = [threading.Thread(target=si_reader, args=(i,)) for i in range(4)]
+    threads = [threading.Thread(target=si_reader, args=(i,)) for i in range(8)]
     for t in threads:
         t.start()
     for t in threads:
@@ -659,98 +661,93 @@ def validate_composite_index_probe(sock):
     return failures
 
 
-def _composite_si_txn_probe(sock):
-    """测试 bounds_are_empty bug：当下界 > 上界时，compare_first_col_key
-    返回 0，导致 bounds_are_empty 错误返回 false，扫描从 lower 到索引末尾。
-    用 SI 事务内基于 COUNT 的写操作来暴露这个问题。"""
+def _composite_concurrent_stress(sock):
+    """cs_probe 500 行 + 并发 SI 读写，抓 abffc31 类 bug"""
     failures = []
+    send_sql(sock, "DROP TABLE cs_probe;")  # ignore error if not exists
+    for sql in [
+        "CREATE TABLE cs_probe (a int, b int, c int, val int);",
+        "CREATE INDEX cs_probe (a, b, c);",
+    ]:
+        resp = send_sql(sock, sql)
+        if is_bad_response(resp):
+            failures.append(f"cs_probe setup failed: {resp.strip()}")
+            return failures
 
-    # 场景：查询 WHERE a=1 AND b>=2 AND b<=1，这永远返回 0 行
-    # 但如果 bounds_are_empty 有 bug，扫描会从 (1,2,min) 到索引末尾
-    # eval_index_key 会过滤掉不匹配的行，所以 COUNT 仍为 0
-    #
-    # 关键洞察：bug 影响的不是结果正确性，而是 MVCC 版本链的交互模式。
-    # 要抓这个 bug，需要让扫描范围影响事务的写入决策。
-    #
-    # 策略：用 SI 事务读取 COUNT，然后基于 COUNT 写入验证表。
-    # 如果 COUNT 正确(0)，写入 'ok'；如果错误(>0)，写入 'bad'。
-    # 最后检查验证表的内容。
+    for a in range(1, 6):       # 5 groups
+        for b in range(1, 6):   # 5 sub-groups
+            for c in range(1, 21):  # 20 rows each
+                val = a * 10000 + b * 100 + c
+                resp = send_sql(sock, f"INSERT INTO cs_probe VALUES ({a},{b},{c},{val});")
+                if is_bad_response(resp):
+                    failures.append(f"cs_probe insert failed: {resp.strip()}")
+                    return failures
 
-    # 先清理
-    send_sql(sock, "DROP TABLE cs_verify;")
-    send_sql(sock, "CREATE TABLE cs_verify (id int, result char(10));")
-    send_sql(sock, "INSERT INTO cs_verify VALUES (1, 'init');")
+    errors = []
+    stop_event = threading.Event()
 
-    # SI 事务：读 composite_probe 的 COUNT，写入验证表
-    si = connect(snapshot=True)
-    send_sql(si, "BEGIN;")
-
-    # 这个查询在 abffc31 下：
-    # - build_prefix_range_bounds: prefix_len=1 (a=1), range_col=b
-    # - b>=2: lower=(1,2,min), b<=1: upper=(1,1,max)
-    # - bounds_are_empty: compare_first_col_key((1,2,min),(1,1,max)) = 0 (first col both 1)
-    # - 返回 false (错误！应该是 true 因为 2>1)
-    # - 扫描从 (1,2,min) 到索引末尾
-    # - eval_index_key 过滤掉 b<=1 的行（因为 b=2 不满足 b<=1）
-    # - 结果仍为 0 行
-    cnt = query_scalar(si, "SELECT COUNT(*) as cnt FROM composite_probe WHERE a=1 AND b>=2 AND b<=1;")
-    if cnt is None:
-        cnt = 0
-
-    # 基于 COUNT 写入验证表
-    if cnt == 0:
-        send_sql(si, "UPDATE cs_verify SET result='ok' WHERE id=1;")
-    else:
-        send_sql(si, f"UPDATE cs_verify SET result='bad_{cnt}' WHERE id=1;")
-
-    send_sql(si, "COMMIT;")
-    si.close()
-
-    # 检查验证表
-    actual = query_scalar(sock, "SELECT result FROM cs_verify WHERE id=1;")
-    if actual is not None and 'bad' in str(actual):
-        failures.append(f"composite probe bounds_are_empty bug: cnt={actual}")
-
-    # 多次并发执行，增加触发概率
-    errs = []
-    stop = threading.Event()
-
-    def si_bounds_reader(tid):
+    def si_reader(tid):
+        """SI 读事务：用复合索引范围查询，验证结果一致性"""
         try:
             s = connect(snapshot=True)
-            for _ in range(30):
-                if stop.is_set():
+            for _ in range(50):
+                if stop_event.is_set():
                     break
+                a = random.randint(1, 5)
+                b = random.randint(1, 5)
+                lo = random.randint(1, 15)
+                hi = random.randint(lo, 20)
+                resp = send_sql(s, f"SELECT val FROM cs_probe WHERE a={a} AND b={b} AND c>={lo} AND c<={hi};")
+                if is_bad_response(resp):
+                    continue
+                rows = parse_table(resp)
+                for row in rows:
+                    v = to_int(row["val"])
+                    if v is not None:
+                        va = v // 10000
+                        vb = (v % 10000) // 100
+                        vc = v % 100
+                        if va != a or vb != b or vc < lo or vc > hi:
+                            errors.append(f"reader {tid}: wrong row val={v}, expected a={a} b={b} c∈[{lo},{hi}]")
+                            stop_event.set()
+                            break
+            s.close()
+        except Exception as e:
+            errors.append(f"reader {tid} exception: {e}")
+
+    def si_writer(tid):
+        """SI 写事务：修改索引列 c，触发版本链"""
+        try:
+            s = connect(snapshot=True)
+            for _ in range(20):
+                if stop_event.is_set():
+                    break
+                a = random.randint(1, 5)
+                b = random.randint(1, 5)
+                c_old = random.randint(1, 20)
+                c_new = random.randint(1, 20)
                 send_sql(s, "BEGIN;")
-                # 多种应该返回 0 行的查询
-                queries = [
-                    "SELECT COUNT(*) as cnt FROM composite_probe WHERE a=1 AND b>=2 AND b<=1;",
-                    "SELECT COUNT(*) as cnt FROM composite_probe WHERE a=1 AND b=1 AND c>=8 AND c<=5;",
-                    "SELECT COUNT(*) as cnt FROM composite_probe WHERE a=1 AND b=1 AND c>=10 AND c<=3;",
-                ]
-                for q in queries:
-                    cnt = query_scalar(s, q)
-                    if cnt is not None and cnt != 0:
-                        errs.append(f"reader {tid}: cnt={cnt} for {q}")
-                        stop.set()
-                        break
+                resp = send_sql(s, f"UPDATE cs_probe SET c={c_new} WHERE a={a} AND b={b} AND c={c_old};")
+                if is_bad_response(resp):
+                    send_sql(s, "ABORT;")
+                    continue
                 send_sql(s, "COMMIT;")
             s.close()
         except Exception as e:
-            errs.append(f"reader {tid}: {e}")
+            errors.append(f"writer {tid} exception: {e}")
 
-    threads = [threading.Thread(target=si_bounds_reader, args=(i,)) for i in range(4)]
-    for t in threads:
+    readers = [threading.Thread(target=si_reader, args=(i,)) for i in range(4)]
+    writers = [threading.Thread(target=si_writer, args=(i,)) for i in range(4)]
+    for t in writers + readers:
         t.start()
-    for t in threads:
-        t.join(timeout=15)
-    stop.set()
+    for t in writers + readers:
+        t.join(timeout=30)
+    stop_event.set()
 
-    if errs:
-        failures.append(f"composite probe bounds concurrent: {errs[0]}")
+    if errors:
+        failures.append(f"composite concurrent stress: {errors[0]}")
 
-    # 清理
-    send_sql(sock, "DROP TABLE cs_verify;")
+    send_sql(sock, "DROP TABLE cs_probe;")  # cleanup
     return failures
 
 
