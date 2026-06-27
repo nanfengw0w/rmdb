@@ -658,6 +658,10 @@ def validate_composite_index_probe(sock):
 
     if errs:
         failures.append(f"composite probe concurrent SI: {errs[0]}")
+
+    # 关键：cs_probe 大表并发读写（500行 + 4读4写）
+    # 写者修改索引列创建版本链条目，与 abffc31 的过宽扫描范围交互导致死锁
+    failures.extend(_composite_concurrent_stress(sock))
     return failures
 
 
@@ -736,8 +740,8 @@ def _composite_concurrent_stress(sock):
         except Exception as e:
             errors.append(f"writer {tid} exception: {e}")
 
-    readers = [threading.Thread(target=si_reader, args=(i,)) for i in range(4)]
-    writers = [threading.Thread(target=si_writer, args=(i,)) for i in range(4)]
+    readers = [threading.Thread(target=si_reader, args=(i,)) for i in range(8)]
+    writers = [threading.Thread(target=si_writer, args=(i,)) for i in range(8)]
     for t in writers + readers:
         t.start()
     for t in writers + readers:
@@ -748,100 +752,6 @@ def _composite_concurrent_stress(sock):
         failures.append(f"composite concurrent stress: {errors[0]}")
 
     send_sql(sock, "DROP TABLE cs_probe;")  # cleanup
-    return failures
-
-
-def _composite_concurrent_stress(sock):
-    failures = []
-    # 建表 + 插入大量数据
-    send_sql(sock, "DROP TABLE cs_probe;")  # ignore error if not exists
-    for sql in [
-        "CREATE TABLE cs_probe (a int, b int, c int, val int);",
-        "CREATE INDEX cs_probe (a, b, c);",
-    ]:
-        resp = send_sql(sock, sql)
-        if is_bad_response(resp):
-            failures.append(f"cs_probe setup failed: {resp.strip()}")
-            return failures
-
-    for a in range(1, 6):       # 5 groups
-        for b in range(1, 6):   # 5 sub-groups
-            for c in range(1, 21):  # 20 rows each
-                val = a * 10000 + b * 100 + c
-                resp = send_sql(sock, f"INSERT INTO cs_probe VALUES ({a},{b},{c},{val});")
-                if is_bad_response(resp):
-                    failures.append(f"cs_probe insert failed: {resp.strip()}")
-                    return failures
-
-    errors = []
-    stop_event = threading.Event()
-
-    def si_reader(tid):
-        """SI 读事务：用复合索引范围查询，验证结果一致性"""
-        try:
-            s = connect(snapshot=True)
-            for _ in range(30):
-                if stop_event.is_set():
-                    break
-                a = random.randint(1, 5)
-                b = random.randint(1, 5)
-                lo = random.randint(1, 15)
-                hi = random.randint(lo, 20)
-                # 范围查询：应只返回 a,b 在指定范围内的行
-                resp = send_sql(s, f"SELECT val FROM cs_probe WHERE a={a} AND b={b} AND c>={lo} AND c<={hi};")
-                if is_bad_response(resp):
-                    continue
-                rows = parse_table(resp)
-                for row in rows:
-                    v = to_int(row["val"])
-                    if v is not None:
-                        # 验证 val 的 a,b,c 编码正确
-                        va = v // 10000
-                        vb = (v % 10000) // 100
-                        vc = v % 100
-                        if va != a or vb != b or vc < lo or vc > hi:
-                            errors.append(f"reader {tid}: wrong row val={v}, expected a={a} b={b} c∈[{lo},{hi}]")
-                            stop_event.set()
-                            break
-            s.close()
-        except Exception as e:
-            errors.append(f"reader {tid} exception: {e}")
-
-    def si_writer(tid):
-        """SI 写事务：修改索引列 c，触发版本链"""
-        try:
-            s = connect(snapshot=True)
-            for _ in range(20):
-                if stop_event.is_set():
-                    break
-                a = random.randint(1, 5)
-                b = random.randint(1, 5)
-                c_old = random.randint(1, 20)
-                c_new = random.randint(1, 20)
-                send_sql(s, "BEGIN;")
-                resp = send_sql(s, f"UPDATE cs_probe SET c={c_new} WHERE a={a} AND b={b} AND c={c_old};")
-                if is_bad_response(resp):
-                    send_sql(s, "ABORT;")
-                    continue
-                send_sql(s, "COMMIT;")
-            s.close()
-        except Exception as e:
-            errors.append(f"writer {tid} exception: {e}")
-
-    # 启动并发读写线程
-    readers = [threading.Thread(target=si_reader, args=(i,)) for i in range(4)]
-    writers = [threading.Thread(target=si_writer, args=(i,)) for i in range(4)]
-    for t in writers + readers:
-        t.start()
-    for t in writers + readers:
-        t.join(timeout=30)
-    stop_event.set()
-
-    if errors:
-        failures.append(f"composite concurrent stress: {errors[0]}")
-
-    # 清理
-    send_sql(sock, "DROP TABLE IF EXISTS cs_probe;")
     return failures
 
 
