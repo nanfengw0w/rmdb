@@ -600,10 +600,12 @@ def validate_index_read_path_probe(sock):
 
 
 def validate_composite_index_probe(sock):
+    # 用非 SI 连接建表和插数据（需要 auto-commit 生效）
     failures = []
     for sql in [
         "CREATE TABLE composite_probe (a int, b int, c int, payload int);",
         "CREATE INDEX composite_probe (a, b, c);",
+        "INSERT INTO composite_probe VALUES (1, 1, 3, 30);",
         "INSERT INTO composite_probe VALUES (1, 1, 4, 40);",
         "INSERT INTO composite_probe VALUES (1, 1, 5, 50);",
         "INSERT INTO composite_probe VALUES (1, 1, 6, 60);",
@@ -618,6 +620,14 @@ def validate_composite_index_probe(sock):
             failures.append(f"composite probe setup failed for `{sql}`: {resp.strip()}")
             return failures
 
+    # 关键：用 SI 连接运行查询
+    # SI 下 portal.h 的 force_seq_scan 决定走 IndexScan 还是 SeqScan：
+    # - abffc31 移除了复合索引的 force_seq_scan → IndexScan（有 bug → 错误结果）
+    # - 安全版本仍对复合索引生效 → SeqScan（结果正确）
+    # - a9e165c 修复后 IndexScan 也正确
+    si_sock = connect(snapshot=True)
+
+    # 数据：(1,1,3,30), (1,1,5,50), (1,1,6,60), (1,1,8,40), (1,2,5,125), (2,1,5,215)
     checks = [
         ("count closed-open range",
          "SELECT COUNT(payload) as cnt FROM composite_probe WHERE a=1 AND b=1 AND c>=5 AND c<8;", 2),
@@ -630,10 +640,10 @@ def validate_composite_index_probe(sock):
         ("count updated exact key",
          "SELECT COUNT(payload) as cnt FROM composite_probe WHERE a=1 AND b=1 AND c=8;", 1),
         ("prefix range excludes other b",
-         "SELECT COUNT(payload) as cnt FROM composite_probe WHERE a=1 AND b=1 AND c>=0;", 3),
+         "SELECT COUNT(payload) as cnt FROM composite_probe WHERE a=1 AND b=1 AND c>=0;", 4),
     ]
     for label, sql, expected in checks:
-        actual = query_scalar(sock, sql)
+        actual = query_scalar(si_sock, sql)
         expect_float_equal(failures, f"composite probe {label}", actual, expected)
 
     row_checks = [
@@ -646,13 +656,46 @@ def validate_composite_index_probe(sock):
         ("select updated exact key",
          "SELECT payload FROM composite_probe WHERE a=1 AND b=1 AND c=8;", [40]),
         ("select prefix range excludes other b",
-         "SELECT payload FROM composite_probe WHERE a=1 AND b=1 AND c>=0;", [40, 50, 60]),
+         "SELECT payload FROM composite_probe WHERE a=1 AND b=1 AND c>=0;", [30, 40, 50, 60]),
     ]
     for label, sql, expected in row_checks:
-        rows = parse_table(send_sql(sock, sql))
+        rows = parse_table(send_sql(si_sock, sql))
         actual = sorted(to_int(row["payload"]) for row in rows)
         if actual != expected:
             failures.append(f"composite probe {label}: actual={actual}, expected={expected}")
+
+    # 关键：测试同一列多个范围条件（抓 compare_first_col_key 只比较第一列的 bug）
+    # 有 bug 时 lower/upper bound 不会更新到更紧的值，导致扫描范围错误
+    multi_range_checks = [
+        # 同列双下界：looser(c>=3)在前，tighter(c>=5)在后
+        # 有 bug: lower=(1,1,3) → c=3,5,6,8 → [30,40,50,60]
+        # 无 bug: lower=(1,1,5) → c=5,6,8 → [40,50,60]
+        ("dual lower bound looser-first",
+         "SELECT payload FROM composite_probe WHERE a=1 AND b=1 AND c>=3 AND c>=5;", [40, 50, 60]),
+        ("dual lower bound tighter-first",
+         "SELECT payload FROM composite_probe WHERE a=1 AND b=1 AND c>=5 AND c>=3;", [40, 50, 60]),
+        # 同列双上界：looser(c<=8)在前，tighter(c<=6)在后
+        # 有 bug: upper=(1,1,8) → c=3,5,6,8 → [30,40,50,60]
+        # 无 bug: upper=(1,1,6) → c=3,5,6 → [30,50,60]
+        ("dual upper bound looser-first",
+         "SELECT payload FROM composite_probe WHERE a=1 AND b=1 AND c<=8 AND c<=6;", [30, 50, 60]),
+        ("dual upper bound tighter-first",
+         "SELECT payload FROM composite_probe WHERE a=1 AND b=1 AND c<=6 AND c<=8;", [30, 50, 60]),
+        # 同列四条件：两个下界+两个上界
+        # 有 bug: lower=(1,1,3), upper=(1,1,8) → c=3,5,6,8 → [30,40,50,60]
+        # 无 bug: lower=(1,1,5), upper=(1,1,6) → c=5,6 → [50,60]
+        ("quad range bounds",
+         "SELECT payload FROM composite_probe WHERE a=1 AND b=1 AND c>=3 AND c>=5 AND c<=8 AND c<=6;", [50, 60]),
+        ("prefix a=2 range",
+         "SELECT payload FROM composite_probe WHERE a=2 AND b=1 AND c>=4 AND c<=6;", [215]),
+    ]
+    for label, sql, expected in multi_range_checks:
+        rows = parse_table(send_sql(si_sock, sql))
+        actual = sorted(to_int(row["payload"]) for row in rows)
+        if actual != expected:
+            failures.append(f"composite probe {label}: actual={actual}, expected={expected}")
+
+    si_sock.close()
     return failures
 
 
