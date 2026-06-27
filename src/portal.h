@@ -161,11 +161,14 @@ class Portal
             return std::make_unique<ProjectionExecutor>(convert_plan_executor(x->subplan_, context), 
                                                         x->sel_cols_);
         } else if(auto x = std::dynamic_pointer_cast<ScanPlan>(plan)) {
-            // SI 下允许 IndexScan：
-            // - MVCC 事务不删除索引条目（executor_delete/update），索引是数据超集
-            // - get_record 的 MVCC 可见性过滤保证结果正确
-            // - IndexScanExecutor 对复合索引做前缀范围裁剪，避免全索引扫描
-            if(x->tag == T_SeqScan) {
+            // SI 下复合索引(col_num>1)会回退到全索引扫描，性能差且风险未排除，强制 SeqScan。
+            // 单列索引有精确范围边界，MVCC 可见性过滤保证结果正确，允许 IndexScan。
+            bool force_seq_scan = false;
+            if (context != nullptr && context->txn_ != nullptr &&
+                context->txn_->get_isolation_level() == IsolationLevel::SNAPSHOT_ISOLATION) {
+                force_seq_scan = (x->tag == T_IndexScan && x->index_col_names_.size() > 1);
+            }
+            if(x->tag == T_SeqScan || force_seq_scan) {
                 return std::make_unique<SeqScanExecutor>(sm_manager_, x->tab_name_, x->conds_, context);
             }
             else {
