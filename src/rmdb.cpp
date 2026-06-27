@@ -35,7 +35,7 @@ See the Mulan PSL v2 for more details. */
 #include "analyze/analyze.h"
 
 #define SOCK_PORT 8765
-#define MAX_CONN_LIMIT 128
+#define MAX_CONN_LIMIT 8
 
 static bool should_exit = false;
 std::atomic<bool> enable_output_file{true};
