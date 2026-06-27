@@ -696,6 +696,141 @@ def validate_composite_index_probe(sock):
             failures.append(f"composite probe {label}: actual={actual}, expected={expected}")
 
     si_sock.close()
+
+    # 并发压力测试：多线程 SI 读写复合索引，抓并发竞态 bug
+    failures.extend(_composite_concurrent_stress(sock))
+
+    # 关键：用 SI BEGIN 事务测试复合索引范围查询
+    # 在 SI 事务内，portal.h 的 force_seq_scan 决定走 IndexScan 还是 SeqScan
+    # abffc31 的 compare_first_col_key bug 导致 IndexScan 扫描范围过宽
+    # 虽然 eval_index_key/eval_conds 会二次过滤，但在 SI 事务内，
+    # MVCC 可见性 + 错误范围扫描 + 并并发写者 = 不可预测的竞态
+    failures.extend(_composite_si_txn_probe(sock))
+    return failures
+
+
+def _composite_si_txn_probe(sock):
+    """在 SI 事务内测试复合索引范围查询的正确性"""
+    failures = []
+    # 用 SI 连接开启显式事务，强制走 IndexScan 路径
+    si = connect(snapshot=True)
+    send_sql(si, "BEGIN;")
+
+    # 测试：同列多个范围条件，下界应取更紧的值
+    # 数据：(1,1,3,30), (1,1,5,50), (1,1,6,60), (1,1,8,40)
+    checks = [
+        ("si-txn dual lower",
+         "SELECT payload FROM composite_probe WHERE a=1 AND b=1 AND c>=3 AND c>=5;",
+         [40, 50, 60]),
+        ("si-txn dual upper",
+         "SELECT payload FROM composite_probe WHERE a=1 AND b=1 AND c<=8 AND c<=6;",
+         [30, 50, 60]),
+        ("si-txn quad bounds",
+         "SELECT payload FROM composite_probe WHERE a=1 AND b=1 AND c>=3 AND c>=5 AND c<=8 AND c<=6;",
+         [50, 60]),
+    ]
+    for label, sql, expected in checks:
+        rows = parse_table(send_sql(si, sql))
+        actual = sorted(to_int(row["payload"]) for row in rows)
+        if actual != expected:
+            failures.append(f"composite probe {label}: actual={actual}, expected={expected}")
+
+    send_sql(si, "COMMIT;")
+    si.close()
+    return failures
+
+
+def _composite_concurrent_stress(sock):
+    failures = []
+    # 建表 + 插入大量数据
+    send_sql(sock, "DROP TABLE cs_probe;")  # ignore error if not exists
+    for sql in [
+        "CREATE TABLE cs_probe (a int, b int, c int, val int);",
+        "CREATE INDEX cs_probe (a, b, c);",
+    ]:
+        resp = send_sql(sock, sql)
+        if is_bad_response(resp):
+            failures.append(f"cs_probe setup failed: {resp.strip()}")
+            return failures
+
+    for a in range(1, 6):       # 5 groups
+        for b in range(1, 6):   # 5 sub-groups
+            for c in range(1, 21):  # 20 rows each
+                val = a * 10000 + b * 100 + c
+                resp = send_sql(sock, f"INSERT INTO cs_probe VALUES ({a},{b},{c},{val});")
+                if is_bad_response(resp):
+                    failures.append(f"cs_probe insert failed: {resp.strip()}")
+                    return failures
+
+    errors = []
+    stop_event = threading.Event()
+
+    def si_reader(tid):
+        """SI 读事务：用复合索引范围查询，验证结果一致性"""
+        try:
+            s = connect(snapshot=True)
+            for _ in range(30):
+                if stop_event.is_set():
+                    break
+                a = random.randint(1, 5)
+                b = random.randint(1, 5)
+                lo = random.randint(1, 15)
+                hi = random.randint(lo, 20)
+                # 范围查询：应只返回 a,b 在指定范围内的行
+                resp = send_sql(s, f"SELECT val FROM cs_probe WHERE a={a} AND b={b} AND c>={lo} AND c<={hi};")
+                if is_bad_response(resp):
+                    continue
+                rows = parse_table(resp)
+                for row in rows:
+                    v = to_int(row["val"])
+                    if v is not None:
+                        # 验证 val 的 a,b,c 编码正确
+                        va = v // 10000
+                        vb = (v % 10000) // 100
+                        vc = v % 100
+                        if va != a or vb != b or vc < lo or vc > hi:
+                            errors.append(f"reader {tid}: wrong row val={v}, expected a={a} b={b} c∈[{lo},{hi}]")
+                            stop_event.set()
+                            break
+            s.close()
+        except Exception as e:
+            errors.append(f"reader {tid} exception: {e}")
+
+    def si_writer(tid):
+        """SI 写事务：修改索引列 c，触发版本链"""
+        try:
+            s = connect(snapshot=True)
+            for _ in range(20):
+                if stop_event.is_set():
+                    break
+                a = random.randint(1, 5)
+                b = random.randint(1, 5)
+                c_old = random.randint(1, 20)
+                c_new = random.randint(1, 20)
+                send_sql(s, "BEGIN;")
+                resp = send_sql(s, f"UPDATE cs_probe SET c={c_new} WHERE a={a} AND b={b} AND c={c_old};")
+                if is_bad_response(resp):
+                    send_sql(s, "ABORT;")
+                    continue
+                send_sql(s, "COMMIT;")
+            s.close()
+        except Exception as e:
+            errors.append(f"writer {tid} exception: {e}")
+
+    # 启动并发读写线程
+    readers = [threading.Thread(target=si_reader, args=(i,)) for i in range(4)]
+    writers = [threading.Thread(target=si_writer, args=(i,)) for i in range(4)]
+    for t in writers + readers:
+        t.start()
+    for t in writers + readers:
+        t.join(timeout=30)
+    stop_event.set()
+
+    if errors:
+        failures.append(f"composite concurrent stress: {errors[0]}")
+
+    # 清理
+    send_sql(sock, "DROP TABLE IF EXISTS cs_probe;")
     return failures
 
 
