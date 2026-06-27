@@ -169,12 +169,7 @@ class IndexScanExecutor : public AbstractExecutor {
             return;
         }
 
-        if (index_meta_.col_num > 1) {
-            materialize_index_scan(ih_->leaf_begin(), ih_->leaf_end());
-            finish_materialized_scan();
-            return;
-        }
-
+        // 1. 尝试全列精确匹配
         auto exact_key = build_exact_match_key();
         if (exact_key.has_value()) {
             std::vector<Rid> result;
@@ -191,6 +186,30 @@ class IndexScanExecutor : public AbstractExecutor {
             return;
         }
 
+        // 2. 复合索引：找最长等值前缀 + 下一列范围条件，构建精确上下界
+        if (index_meta_.col_num > 1) {
+            auto bounds = build_prefix_range_bounds();
+            if (bounds.has_value()) {
+                auto &[lower, upper] = *bounds;
+                Iid lower_iid = lower.has_value()
+                    ? (lower->inclusive ? ih_->lower_bound(lower->key.data())
+                                       : ih_->upper_bound(lower->key.data()))
+                    : ih_->leaf_begin();
+                Iid upper_iid = upper.has_value()
+                    ? (upper->inclusive ? ih_->upper_bound(upper->key.data())
+                                       : ih_->lower_bound(upper->key.data()))
+                    : ih_->leaf_end();
+                materialize_index_scan(lower_iid, upper_iid);
+                finish_materialized_scan();
+                return;
+            }
+            // 无法构建有效范围，回退到全索引扫描
+            materialize_index_scan(ih_->leaf_begin(), ih_->leaf_end());
+            finish_materialized_scan();
+            return;
+        }
+
+        // 3. 单列索引范围扫描
         std::optional<Bound> lower_bound;
         std::optional<Bound> upper_bound;
         auto &first_col = index_meta_.cols[0];
@@ -199,7 +218,7 @@ class IndexScanExecutor : public AbstractExecutor {
                 continue;
             }
 
-            auto key = make_first_col_key(cond.rhs_val);
+            auto key = make_col_key(cond.rhs_val, 0);
             switch (cond.op) {
                 case OP_EQ:
                     update_lower_bound(lower_bound, Bound{key, true});
@@ -230,7 +249,7 @@ class IndexScanExecutor : public AbstractExecutor {
                         ? (lower_bound->inclusive ? ih_->lower_bound(lower_bound->key.data())
                                                   : ih_->upper_bound(lower_bound->key.data()))
                         : ih_->leaf_begin();
-        Iid upper = upper_bound.has_value() && index_meta_.col_num == 1
+        Iid upper = upper_bound.has_value()
                         ? (upper_bound->inclusive ? ih_->upper_bound(upper_bound->key.data())
                                                   : ih_->lower_bound(upper_bound->key.data()))
                         : ih_->leaf_end();
@@ -383,11 +402,116 @@ class IndexScanExecutor : public AbstractExecutor {
         return key;
     }
 
-    std::vector<char> make_first_col_key(const Value &value) {
+    std::vector<char> make_col_key(const Value &value, size_t col_idx) {
         std::vector<char> key(index_meta_.col_tot_len, 0);
-        memcpy(key.data(), value.raw->data, index_meta_.cols[0].len);
-        fill_suffix_with_min_key(key, 1);
+        int offset = 0;
+        for (size_t i = 0; i < col_idx; ++i) offset += index_meta_.cols[i].len;
+        memcpy(key.data() + offset, value.raw->data, index_meta_.cols[col_idx].len);
         return key;
+    }
+
+    // 构建复合索引的前缀范围上下界
+    // 策略：找最长等值前缀（前N列都有EQ），再用第N列的范围条件构建上下界
+    std::optional<std::pair<std::optional<Bound>, std::optional<Bound>>> build_prefix_range_bounds() {
+        // 第一步：找最长等值前缀
+        int prefix_len = 0;
+        std::vector<std::vector<char>> eq_keys;  // 每个前缀列的 EQ 值
+        for (size_t ci = 0; ci < index_meta_.cols.size(); ++ci) {
+            auto &col = index_meta_.cols[ci];
+            bool found_eq = false;
+            for (auto &cond : conds_) {
+                if (cond.is_rhs_val && cond.lhs_col.tab_name == tab_name_ &&
+                    cond.lhs_col.col_name == col.name && cond.op == OP_EQ) {
+                    eq_keys.push_back(std::vector<char>(col.len, 0));
+                    memcpy(eq_keys.back().data(), cond.rhs_val.raw->data, col.len);
+                    found_eq = true;
+                    break;
+                }
+            }
+            if (!found_eq) break;
+            prefix_len++;
+        }
+
+        // 第二步：检查第 prefix_len 列是否有范围条件
+        if (prefix_len < static_cast<int>(index_meta_.cols.size())) {
+            auto &range_col = index_meta_.cols[prefix_len];
+            std::optional<Bound> lower, upper;
+
+            // 先用前缀构建基础 key（前缀列 + min 填充）
+            for (auto &cond : conds_) {
+                if (!cond.is_rhs_val || cond.lhs_col.tab_name != tab_name_ ||
+                    cond.lhs_col.col_name != range_col.name) {
+                    continue;
+                }
+
+                // 构建完整 key：前缀 + 范围列值
+                std::vector<char> key(index_meta_.col_tot_len, 0);
+                int offset = 0;
+                for (int i = 0; i < prefix_len; ++i) {
+                    memcpy(key.data() + offset, eq_keys[i].data(), index_meta_.cols[i].len);
+                    offset += index_meta_.cols[i].len;
+                }
+                memcpy(key.data() + offset, cond.rhs_val.raw->data, range_col.len);
+
+                switch (cond.op) {
+                    case OP_EQ:
+                        update_lower_bound(lower, Bound{key, true});
+                        update_upper_bound(upper, Bound{key, true});
+                        break;
+                    case OP_GT:
+                        update_lower_bound(lower, Bound{key, false});
+                        break;
+                    case OP_GE:
+                        update_lower_bound(lower, Bound{key, true});
+                        break;
+                    case OP_LT:
+                        update_upper_bound(upper, Bound{key, false});
+                        break;
+                    case OP_LE:
+                        update_upper_bound(upper, Bound{key, true});
+                        break;
+                    default:
+                        break;
+                }
+            }
+
+            if (lower.has_value() || upper.has_value() || prefix_len > 0) {
+                // 如果只有前缀没有范围条件，用前缀作为精确下界和上界
+                if (!lower.has_value() && !upper.has_value() && prefix_len > 0) {
+                    // 构建前缀 + min 作为下界
+                    std::vector<char> lower_key(index_meta_.col_tot_len, 0);
+                    int offset = 0;
+                    for (int i = 0; i < prefix_len; ++i) {
+                        memcpy(lower_key.data() + offset, eq_keys[i].data(), index_meta_.cols[i].len);
+                        offset += index_meta_.cols[i].len;
+                    }
+                    lower = Bound{lower_key, true};
+
+                    // 构建前缀 + max 作为上界
+                    std::vector<char> upper_key(index_meta_.col_tot_len, 0);
+                    offset = 0;
+                    for (int i = 0; i < prefix_len; ++i) {
+                        memcpy(upper_key.data() + offset, eq_keys[i].data(), index_meta_.cols[i].len);
+                        offset += index_meta_.cols[i].len;
+                    }
+                    // 填充 max 值
+                    for (size_t i = prefix_len; i < index_meta_.cols.size(); ++i) {
+                        int col_off = 0;
+                        for (size_t j = 0; j < i; ++j) col_off += index_meta_.cols[j].len;
+                        fill_max_key_part(upper_key.data() + col_off, index_meta_.cols[i]);
+                    }
+                    upper = Bound{upper_key, true};
+                }
+
+                if (!bounds_are_empty(lower, upper)) {
+                    return std::make_pair(std::move(lower), std::move(upper));
+                }
+            }
+        }
+
+        // 如果有完整前缀但没有范围列条件（所有列都有EQ），应该已经被 exact_match 处理
+        // 这里返回 nullopt 表示无法构建有效范围
+        return std::nullopt;
     }
 
     void fill_suffix_with_min_key(std::vector<char> &key, size_t begin_col) {
@@ -415,6 +539,24 @@ class IndexScanExecutor : public AbstractExecutor {
             }
             case TYPE_STRING:
                 memset(dest, 0, col.len);
+                break;
+        }
+    }
+
+    void fill_max_key_part(char *dest, const ColMeta &col) {
+        switch (col.type) {
+            case TYPE_INT: {
+                int value = std::numeric_limits<int>::max();
+                memcpy(dest, &value, sizeof(value));
+                break;
+            }
+            case TYPE_FLOAT: {
+                float value = std::numeric_limits<float>::max();
+                memcpy(dest, &value, sizeof(value));
+                break;
+            }
+            case TYPE_STRING:
+                memset(dest, 0xFF, col.len);
                 break;
         }
     }
