@@ -60,7 +60,11 @@ inline IxIndexHandle *get_index_handle(SmManager *sm_manager, const std::string 
 }
 
 inline bool is_mvcc_txn(Context *context) {
-    return context != nullptr && context->txn_ != nullptr;
+    if (context == nullptr || context->txn_ == nullptr) {
+        return false;
+    }
+    auto level = context->txn_->get_isolation_level();
+    return level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE;
 }
 
 inline bool is_snapshot_txn(Context *context) {
@@ -249,13 +253,6 @@ inline void check_unique_conflict(SmManager *sm_manager, const std::string &tab_
         }
 
         if (!mvcc) {
-            if (context != nullptr && context->txn_ != nullptr) {
-                auto fh = sm_manager->get_table_fh(tab_name);
-                auto visible = fh->get_record(rid, context);
-                if (visible == nullptr || !visible_record_matches_key(index, visible.get(), key)) {
-                    continue;
-                }
-            }
             throw UniqueIndexConflictError(tab_name, index_col_names(index));
         }
 

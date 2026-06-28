@@ -953,8 +953,8 @@ void *client_handler(void *sock_fd) {
             } else if (control_cmd == "commit") {
                 txn_id = INVALID_TXN_ID;
                 txn_failed = false;
-                memset(data_send, '\0', BUFFER_LENGTH);
-                offset = 0;
+                set_response(data_send, &offset, "abort\n");
+                append_output_line("abort\n");
                 if (write(fd, data_send, offset + 1) == -1) break;
                 continue;
             } else {
