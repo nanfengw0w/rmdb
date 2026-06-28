@@ -225,6 +225,7 @@
 
 ### 已确认失败的优化
 - 快速 UPDATE 路径（绕过 parser）→ 唯一索引冲突，性能降到 60 tpmC
+- 快速 SELECT 路径（绕过 parser）→ MVCC 可见性问题，导致唯一索引冲突
 - 移除 SNAPSHOT ISOLATION 的 explicit_txn_mutex_ → 单线程提升到 1140 tpmC，但多线程 abort 率极高（stock 表共享冲突）
 - 移除 do_analyze 的 buffer_mutex → 数据竞争（VERSIONS.md 记录）
 
