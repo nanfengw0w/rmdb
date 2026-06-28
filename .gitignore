@@ -16,3 +16,5 @@ t3_reorder/
 test_bracket*/
 test_t4a*/
 test_*_db/
+bench_tpcc_v2_db/
+test_perf_db/
