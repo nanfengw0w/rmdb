@@ -96,29 +96,65 @@ inline void check_logical_key_write_conflict(SmManager *sm_manager, const TabMet
     auto fh = sm_manager->get_table_fh(tab_name);
     auto &vm = VersionManager::instance();
 
-    RmScan scan(fh);
-    while (!scan.is_end()) {
-        Rid rid = scan.rid();
-        scan.next();
-
-        if (self.has_value() && same_rid(rid, *self)) {
+    // 优化：如果第一列有索引，使用索引查找匹配记录，避免全表扫描
+    // 对于TPCC等使用主键的场景，第一列通常是主键的一部分，索引查找远快于全表扫描
+    bool used_index = false;
+    for (const auto &index : tab.indexes) {
+        if (index.cols.empty()) continue;
+        // 检查索引的第一列是否与表的第一列匹配
+        if (index.cols[0].name != key_col.name || index.cols[0].tab_name != key_col.tab_name) {
             continue;
         }
 
-        auto physical = fh->get_record(rid, nullptr);
-        if (physical == nullptr) {
-            continue;
-        }
+        // 使用索引查找匹配的记录
+        auto ih = get_index_handle(sm_manager, tab_name, index);
+        if (ih == nullptr) continue;
 
-        auto visible = fh->get_record(rid, context);
-        if (!record_matches_col_key(key_col, physical.get(), key) &&
-            !record_matches_col_key(key_col, visible.get(), key)) {
-            continue;
-        }
+        std::vector<char> index_key(index.col_tot_len, 0);
+        memcpy(index_key.data(), key, key_col.len);
 
-        if (!vm.check_write_conflict(fh->GetFd(), rid, context->txn_)) {
-            throw TransactionAbortException(context->txn_->get_transaction_id(),
-                AbortReason::DEADLOCK_PREVENTION);
+        std::vector<Rid> result;
+        if (ih->get_value(index_key.data(), &result, nullptr)) {
+            for (const auto &rid : result) {
+                if (self.has_value() && same_rid(rid, *self)) {
+                    continue;
+                }
+                if (!vm.check_write_conflict(fh->GetFd(), rid, context->txn_)) {
+                    throw TransactionAbortException(context->txn_->get_transaction_id(),
+                        AbortReason::DEADLOCK_PREVENTION);
+                }
+            }
+        }
+        used_index = true;
+        break;
+    }
+
+    // 如果没有可用的索引，回退到全表扫描
+    if (!used_index) {
+        RmScan scan(fh);
+        while (!scan.is_end()) {
+            Rid rid = scan.rid();
+            scan.next();
+
+            if (self.has_value() && same_rid(rid, *self)) {
+                continue;
+            }
+
+            auto physical = fh->get_record(rid, nullptr);
+            if (physical == nullptr) {
+                continue;
+            }
+
+            auto visible = fh->get_record(rid, context);
+            if (!record_matches_col_key(key_col, physical.get(), key) &&
+                !record_matches_col_key(key_col, visible.get(), key)) {
+                continue;
+            }
+
+            if (!vm.check_write_conflict(fh->GetFd(), rid, context->txn_)) {
+                throw TransactionAbortException(context->txn_->get_transaction_id(),
+                    AbortReason::DEADLOCK_PREVENTION);
+            }
         }
     }
 }
@@ -128,6 +164,42 @@ inline void check_unique_conflict_by_scan(SmManager *sm_manager, const std::stri
                                           std::optional<Rid> self, Context *context) {
     auto fh = sm_manager->get_table_fh(tab_name);
     auto &vm = VersionManager::instance();
+
+    // 优化：先使用索引查找匹配的记录，避免全表扫描
+    auto ih = get_index_handle(sm_manager, tab_name, index);
+    if (ih != nullptr) {
+        std::vector<Rid> existing;
+        if (ih->get_value(key, &existing, nullptr)) {
+            for (const auto &rid : existing) {
+                if (self.has_value() && same_rid(rid, *self)) {
+                    continue;
+                }
+
+                auto visible = fh->get_record(rid, context);
+                bool visible_matches = visible_record_matches_key(index, visible.get(), key);
+                bool write_conflict = !vm.check_write_conflict(fh->GetFd(), rid, context->txn_);
+
+                if (visible_matches) {
+                    if (write_conflict) {
+                        throw TransactionAbortException(context->txn_->get_transaction_id(),
+                            AbortReason::DEADLOCK_PREVENTION);
+                    }
+                    throw UniqueIndexConflictError(tab_name, index_col_names(index));
+                }
+
+                if (write_conflict) {
+                    auto physical = fh->get_record(rid, nullptr);
+                    if (physical != nullptr && visible_record_matches_key(index, physical.get(), key)) {
+                        throw TransactionAbortException(context->txn_->get_transaction_id(),
+                            AbortReason::DEADLOCK_PREVENTION);
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    // 回退：无索引时全表扫描
     RmScan scan(fh);
     while (!scan.is_end()) {
         Rid rid = scan.rid();
