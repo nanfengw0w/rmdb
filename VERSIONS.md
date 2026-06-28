@@ -249,6 +249,7 @@
 - 移除 checkpoint barrier → 破坏第10题恢复
 - 使用 lseek+read/write 替代 pread/pwrite → 多线程文件偏移冲突
 - 跳过 check_logical_key_write_conflict → 一致性失败
+- 将 parse_tree 改为 thread_local → 解析器有其他全局状态，多线程崩溃（段错误）
 
 ### 9. 复合索引 IndexScan for SI (abffc31→WA→a9e165c修复)
 - **改动**: 移除 `portal.h` 的 `force_seq_scan`，SI 下复合索引也走 IndexScan。IndexScanExecutor 新增 `build_prefix_range_bounds()` 找最长等值前缀+下一列范围条件构建上下界。
