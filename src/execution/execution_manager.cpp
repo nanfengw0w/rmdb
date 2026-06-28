@@ -1152,6 +1152,89 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
             // 检查是否是简单的 MIN/MAX(col) 或 MIN/MAX(col) as alias
             bool is_min = (sel_lower.find("min(") == 0);
             bool is_max = (sel_lower.find("max(") == 0);
+            // 检查是否是 COUNT(*) 或 COUNT(col)
+            bool is_count = (sel_lower.find("count(") == 0);
+            if (is_count) {
+                size_t lp = sel_part.find('(');
+                size_t rp = sel_part.find(')');
+                if (lp != std::string::npos && rp != std::string::npos && rp > lp) {
+                    std::string inner = trim_str(sel_part.substr(lp + 1, rp - lp - 1));
+                    bool has_group = sql_lower.find(" group by ") != std::string::npos;
+                    bool has_having = sql_lower.find(" having ") != std::string::npos;
+                    bool has_join = sql_lower.find(",") != std::string::npos || sql_lower.find(" join ") != std::string::npos;
+
+                    if (!has_group && !has_having && !has_join) {
+                        // 提取 WHERE 子句
+                        std::string where_part;
+                        size_t wp = sql_lower.find(" where ");
+                        if (wp != std::string::npos) {
+                            size_t we = sql.length();
+                            for (auto &kw : {" group by ", " having ", " order by ", " limit "}) {
+                                size_t p = sql_lower.find(kw, wp);
+                                if (p != std::string::npos) we = std::min(we, p);
+                            }
+                            where_part = " " + sql.substr(wp + 1, we - wp - 1);
+                        }
+                        size_t table_start = from_pos + 6;
+                        size_t table_end = sql_lower.find(" where ", table_start);
+                        if (table_end == std::string::npos) table_end = sql.length();
+                        std::string table_name = trim_str(sql.substr(table_start, table_end - table_start));
+
+                        // 转换为 SELECT 1 FROM table WHERE ... 使用索引
+                        std::string converted = "SELECT 1 FROM " + table_name;
+                        if (!where_part.empty()) converted += where_part;
+                        converted += ";";
+
+                        auto local_analyze = std::make_unique<Analyze>(sm_manager_);
+                        auto local_planner = std::make_unique<Planner>(sm_manager_);
+                        auto local_optimizer = std::make_unique<Optimizer>(sm_manager_, local_planner.get());
+
+                        ast::parse_tree = nullptr;
+                        YY_BUFFER_STATE buf = yy_scan_string(converted.c_str());
+                        int parse_ok = yyparse();
+                        yy_delete_buffer(buf);
+                        if (parse_ok == 0 && ast::parse_tree != nullptr) {
+                            auto query = local_analyze->do_analyze(ast::parse_tree);
+                            auto plan = local_optimizer->plan_query(query, context);
+
+                            // 计数
+                            auto exec = build_executor_tree(sm_manager_, plan, context);
+                            size_t count = 0;
+                            for (exec->beginTuple(); !exec->is_end(); exec->nextTuple()) {
+                                exec->Next();
+                                count++;
+                            }
+
+                            // 输出结果
+                            std::string alias = sel_part;
+                            size_t as_pos = to_lower_str(sel_part).find(" as ");
+                            if (as_pos != std::string::npos) alias = trim_str(sel_part.substr(as_pos + 4));
+                            else alias = sel_lower;
+
+                            bool write_output_file = enable_output_file.load();
+                            std::fstream outfile;
+                            if (write_output_file) {
+                                outfile.open("output.txt", std::ios::out | std::ios::app);
+                            }
+                            RecordPrinter rec_printer(1);
+                            rec_printer.print_separator(context);
+                            rec_printer.print_record({alias}, context);
+                            rec_printer.print_separator(context);
+                            std::string val = std::to_string(count);
+                            rec_printer.print_record({val}, context);
+                            if (write_output_file) {
+                                outfile << "| " << alias << " |\n";
+                                outfile << "| " << val << " |\n";
+                            }
+                            if (write_output_file) outfile.close();
+                            rec_printer.print_separator(context);
+                            RecordPrinter::print_record_count(1, context);
+                            return;
+                        }
+                    }
+                }
+            }
+
             if (is_min || is_max) {
                 size_t lp = sel_part.find('(');
                 size_t rp = sel_part.find(')');
