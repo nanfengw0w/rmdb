@@ -209,16 +209,15 @@ public:
 
         auto& chain = it->second;
 
-        // Track the last visible entry and the oldest invisible entry after it.
-        const VersionEntry* last_visible = nullptr;
-        bool has_invisible_after_visible = false;
-        bool invisible_after_deleted = false;
-        std::shared_ptr<RmRecord> invisible_after_data;
+        bool has_invisible_before_image = false;
+        bool invisible_before_deleted = false;
+        std::shared_ptr<RmRecord> invisible_before_data;
 
+        // 从最新版本开始查找。磁盘保存最新物理值，版本链保存每次写入前的旧值；
+        // 如果快照看不到多个较新的写入，需要一直回退到最早的不可见写入前。
         for (auto rit = chain.rbegin(); rit != chain.rend(); ++rit) {
             auto& entry = *rit;
 
-            // Own transaction's entry: return current on-disk value (own writes overlay snapshot)
             if (entry.txn_id_ == txn->get_transaction_id()) {
                 if (entry.new_deleted_) {
                     is_deleted = true;
@@ -230,35 +229,32 @@ public:
 
             bool invisible = (entry.commit_ts_ == 0 || entry.commit_ts_ > txn->get_start_ts());
             if (invisible) {
-                // Keep scanning to find the oldest invisible entry after the last visible one
-                has_invisible_after_visible = true;
-                invisible_after_deleted = entry.is_deleted_;
-                invisible_after_data = entry.old_data_;
-            } else {
-                // This entry is visible; remember it but keep scanning for older invisible entries
-                last_visible = &entry;
+                has_invisible_before_image = true;
+                invisible_before_deleted = entry.is_deleted_;
+                invisible_before_data = entry.old_data_;
+                continue;
             }
+
+            // commit_ts <= start_ts，这个写入在快照中可见。若它是删除，
+            // 且没有更晚的不可见写入需要回退，则该记录对本事务不存在。
+            if (!has_invisible_before_image && entry.new_deleted_) {
+                is_deleted = true;
+                return 0;
+            }
+            break;
         }
 
-        // If there are invisible writes after the last visible entry, the snapshot
-        // should see the state before those writes (the oldest invisible entry's before-image).
-        if (has_invisible_after_visible) {
-            if (invisible_after_deleted) {
+        if (has_invisible_before_image) {
+            if (invisible_before_deleted) {
                 is_deleted = true;
                 return 0;
             }
             is_deleted = false;
-            if (invisible_after_data == nullptr) {
+            if (invisible_before_data == nullptr) {
                 return 0;
             }
-            result = std::make_unique<RmRecord>(*invisible_after_data);
+            result = std::make_unique<RmRecord>(*invisible_before_data);
             return 1;
-        }
-
-        // No invisible entries after the last visible one; read current on-disk value.
-        if (last_visible != nullptr && last_visible->new_deleted_) {
-            is_deleted = true;
-            return 0;
         }
 
         is_deleted = false;
