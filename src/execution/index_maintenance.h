@@ -97,16 +97,12 @@ inline void check_logical_key_write_conflict(SmManager *sm_manager, const TabMet
     auto &vm = VersionManager::instance();
 
     // 优化：如果第一列有索引，使用索引查找匹配记录，避免全表扫描
-    // 对于TPCC等使用主键的场景，第一列通常是主键的一部分，索引查找远快于全表扫描
-    bool used_index = false;
     for (const auto &index : tab.indexes) {
         if (index.cols.empty()) continue;
-        // 检查索引的第一列是否与表的第一列匹配
         if (index.cols[0].name != key_col.name || index.cols[0].tab_name != key_col.tab_name) {
             continue;
         }
 
-        // 使用索引查找匹配的记录
         auto ih = get_index_handle(sm_manager, tab_name, index);
         if (ih == nullptr) continue;
 
@@ -125,36 +121,33 @@ inline void check_logical_key_write_conflict(SmManager *sm_manager, const TabMet
                 }
             }
         }
-        used_index = true;
-        break;
+        return;
     }
 
-    // 如果没有可用的索引，回退到全表扫描
-    if (!used_index) {
-        RmScan scan(fh);
-        while (!scan.is_end()) {
-            Rid rid = scan.rid();
-            scan.next();
+    // 无索引时回退到全表扫描
+    RmScan scan(fh);
+    while (!scan.is_end()) {
+        Rid rid = scan.rid();
+        scan.next();
 
-            if (self.has_value() && same_rid(rid, *self)) {
-                continue;
-            }
+        if (self.has_value() && same_rid(rid, *self)) {
+            continue;
+        }
 
-            auto physical = fh->get_record(rid, nullptr);
-            if (physical == nullptr) {
-                continue;
-            }
+        auto physical = fh->get_record(rid, nullptr);
+        if (physical == nullptr) {
+            continue;
+        }
 
-            auto visible = fh->get_record(rid, context);
-            if (!record_matches_col_key(key_col, physical.get(), key) &&
-                !record_matches_col_key(key_col, visible.get(), key)) {
-                continue;
-            }
+        auto visible = fh->get_record(rid, context);
+        if (!record_matches_col_key(key_col, physical.get(), key) &&
+            !record_matches_col_key(key_col, visible.get(), key)) {
+            continue;
+        }
 
-            if (!vm.check_write_conflict(fh->GetFd(), rid, context->txn_)) {
-                throw TransactionAbortException(context->txn_->get_transaction_id(),
-                    AbortReason::DEADLOCK_PREVENTION);
-            }
+        if (!vm.check_write_conflict(fh->GetFd(), rid, context->txn_)) {
+            throw TransactionAbortException(context->txn_->get_transaction_id(),
+                AbortReason::DEADLOCK_PREVENTION);
         }
     }
 }
