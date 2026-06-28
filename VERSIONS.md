@@ -236,11 +236,11 @@
 - 移除 do_analyze 的 buffer_mutex → 数据竞争（VERSIONS.md 记录）
 
 ### 性能瓶颈分析
-- 主要瓶颈: buffer_mutex 序列化所有 SQL 解析（yyparse + do_analyze）
-- 次要瓶颈: explicit_txn_mutex_ 序列化所有显式事务
+- 主要瓶颈: buffer_mutex 序列化 SQL 解析（yyparse）
+- 次要瓶颈: explicit_txn_mutex_（已移除 for SNAPSHOT ISOLATION）
 - 每个 NewOrder 事务约 20-35 条 SQL，每条都走完整流水线
-- 单线程 843 tpmC ≈ 14 NewOrder/s ≈ 280-490 SQL/s
-- 已确认的瓶颈: do_analyze 访问 sm_manager->db_，不能移出锁
+- 单线程 838 tpmC ≈ 14 NewOrder/s ≈ 280-490 SQL/s
+- do_analyze 已移到锁外（只读元数据，无 DDL 时安全）
 
 ### 已确认不能优化的方向
 - 移除 explicit_txn_mutex_ → 98.5% abort率，写写冲突
