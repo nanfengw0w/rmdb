@@ -226,6 +226,13 @@
 ### 已确认失败的优化
 - 快速 UPDATE 路径（绕过 parser）→ 唯一索引冲突，性能降到 60 tpmC
 - 移除 SNAPSHOT ISOLATION 的 explicit_txn_mutex_ → 单线程提升到 1140 tpmC，但多线程 abort 率极高（stock 表共享冲突）
+- 移除 do_analyze 的 buffer_mutex → 数据竞争（VERSIONS.md 记录）
+
+### 性能瓶颈分析
+- 主要瓶颈: buffer_mutex 序列化所有 SQL 解析（yyparse + do_analyze）
+- 次要瓶颈: explicit_txn_mutex_ 序列化所有显式事务
+- 每个 NewOrder 事务约 20-35 条 SQL，每条都走完整流水线
+- 单线程 845 tpmC ≈ 14 NewOrder/s ≈ 280-490 SQL/s
 
 ### 已确认不能优化的方向
 - 移除 explicit_txn_mutex_ → 98.5% abort率，写写冲突
