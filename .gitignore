@@ -17,3 +17,5 @@ test_bracket*/
 test_t4a*/
 test_*_db/
 __pycache__/
+fmt_db/
+test_topic*.py
