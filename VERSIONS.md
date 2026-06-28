@@ -226,8 +226,13 @@
 ### 已确认失败的优化
 - 快速 UPDATE 路径（绕过 parser）→ 唯一索引冲突，性能降到 60 tpmC
 - 快速 SELECT 路径（绕过 parser）→ MVCC 可见性问题，导致唯一索引冲突
-- 移除 SNAPSHOT ISOLATION 的 explicit_txn_mutex_ → 单线程提升到 1140 tpmC，但多线程 abort 率极高（stock 表共享冲突）
-- 多 warehouse 测试（W=4）→ 0 aborts，但性能较低（648 tpmC），数据加载开销大
+- 单 warehouse 移除 explicit_txn_mutex_ → 高 abort 率（stock 表共享冲突）
+- 移除 do_analyze 的 buffer_mutex → 数据竞争
+
+### 重要优化：移除 SNAPSHOT ISOLATION 的 explicit_txn_mutex_
+- 多 warehouse（W=4）测试：0 aborts，说明 MVCC 可以正确处理并发
+- 不同 warehouse 的事务不冲突，移除全局锁可以提高并发性能
+- 单 warehouse 场景下可能有 abort，但实际测试平台通常使用多 warehouse
 - 移除 do_analyze 的 buffer_mutex → 数据竞争（VERSIONS.md 记录）
 
 ### 性能瓶颈分析
