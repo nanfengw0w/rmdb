@@ -221,7 +221,9 @@
 
 ### 本地性能测试结果
 - 单线程 TPCC NewOrder: 845 tpmC（142 NewOrders/10s）
-- 瓶颈: explicit_txn_mutex_ 串行化所有显式事务，buffer_mutex 串行化 SQL 解析
+- 4线程（W=4, 30s）: 232 tpmC（116 NewOrders），0 aborts
+- 瓶颈: buffer_mutex 序列化 SQL 解析（yyparse 使用全局 ast::parse_tree）
+- 解析器使用全局状态，无法并行化，这是根本瓶颈
 
 ### 已确认失败的优化
 - 快速 UPDATE 路径（绕过 parser）→ 唯一索引冲突，性能降到 60 tpmC
