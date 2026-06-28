@@ -60,11 +60,7 @@ inline IxIndexHandle *get_index_handle(SmManager *sm_manager, const std::string 
 }
 
 inline bool is_mvcc_txn(Context *context) {
-    if (context == nullptr || context->txn_ == nullptr) {
-        return false;
-    }
-    auto level = context->txn_->get_isolation_level();
-    return level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE;
+    return context != nullptr && context->txn_ != nullptr;
 }
 
 inline bool is_snapshot_txn(Context *context) {

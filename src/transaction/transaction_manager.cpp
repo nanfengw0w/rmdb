@@ -143,11 +143,9 @@ Transaction * TransactionManager::begin(Transaction* txn, LogManager* log_manage
 
     txn->set_state(TransactionState::GROWING);
 
-    // MVCC: 分配开始时间戳
-    IsolationLevel level = txn->get_isolation_level();
-    if (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE) {
-        txn->set_start_ts(get_next_timestamp());
-    }
+    // MVCC: every transaction gets a timestamp so SI readers can reconstruct
+    // versions written by autocommit/READ_COMMITTED statements as well.
+    txn->set_start_ts(get_next_timestamp());
 
     txn_map[txn->get_transaction_id()] = txn;
 
@@ -190,16 +188,17 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     }
 
     IsolationLevel level = txn->get_isolation_level();
-    if (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE) {
-        // MVCC: 分配提交时间戳和提交顺序
-        timestamp_t commit_ts = get_next_timestamp();
-        txn->set_commit_ts(commit_ts);
-        txn->commit_order_ = global_commit_order_++;
+    // MVCC: assign commit timestamp for all transactions. Even READ_COMMITTED
+    // writers must publish committed versions for concurrent SI snapshots.
+    timestamp_t commit_ts = get_next_timestamp();
+    txn->set_commit_ts(commit_ts);
 
-        // 提交版本管理器中的所有写操作
-        auto& vm = VersionManager::instance();
-        vm.commit_transaction(txn->get_transaction_id(), commit_ts);
+    if (level == IsolationLevel::SERIALIZABLE) {
+        txn->commit_order_ = global_commit_order_++;
     }
+
+    auto& vm = VersionManager::instance();
+    vm.commit_transaction(txn->get_transaction_id(), commit_ts);
 
     txn->set_state(TransactionState::COMMITTED);
 
@@ -234,8 +233,7 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
 void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
     if (txn == nullptr) return;
 
-    IsolationLevel level = txn->get_isolation_level();
-    bool mvcc_abort = (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE);
+    bool mvcc_abort = true;
     if (mvcc_abort) {
         // MVCC: 先恢复磁盘数据，再删除版本链条目
         // 顺序至关重要：必须先恢复磁盘数据，否则在删除版本链和恢复磁盘之间的
