@@ -12,7 +12,6 @@ See the Mulan PSL v2 for more details. */
 
 #include <algorithm>
 #include <mutex>
-#include <shared_mutex>
 #include <unordered_map>
 #include <vector>
 #include <memory>
@@ -22,12 +21,24 @@ See the Mulan PSL v2 for more details. */
 
 class Transaction;
 
+/**
+ * @brief 版本条目 - 保存写操作前的旧数据
+ *
+ * 当事务修改记录时：
+ * 1. 将旧数据保存到版本链
+ * 2. 将新数据写入磁盘
+ *
+ * 当其他事务读取时：
+ * 1. 检查是否有未提交的版本（其他事务的写操作）
+ * 2. 如果有，从版本链读取旧数据（避免脏读）
+ * 3. 如果没有，从磁盘读取（最新数据）
+ */
 struct VersionEntry {
-    txn_id_t txn_id_{INVALID_TXN_ID};
-    timestamp_t commit_ts_{0};
-    bool is_deleted_{false};
-    bool new_deleted_{false};
-    std::shared_ptr<RmRecord> old_data_;
+    txn_id_t txn_id_{INVALID_TXN_ID};  // 执行此写操作的事务ID
+    timestamp_t commit_ts_{0};          // 提交时间戳（0表示未提交）
+    bool is_deleted_{false};            // 写操作前该记录是否已删除
+    bool new_deleted_{false};           // 写操作后该记录是否被删除
+    std::shared_ptr<RmRecord> old_data_;// 写操作前的旧数据
 };
 
 class VersionManager {
@@ -55,27 +66,37 @@ public:
         }
     };
 
+    /**
+     * @brief 检查写操作是否可以执行（写写冲突检测）
+     *
+     * 规则：
+     * 1. 如果记录有另一个未提交事务的版本，冲突
+     * 2. 如果记录的最新已提交版本在本事务开始之后提交，冲突
+     */
     bool check_write_conflict(int fd, const Rid& rid, Transaction* txn) {
         VersionKey key{fd, rid.page_no, rid.slot_no};
         auto& bucket = get_bucket(key);
-        std::lock_guard<std::shared_mutex> lock(bucket.mutex_);
+        std::lock_guard<std::mutex> lock(bucket.mutex_);
 
         auto it = bucket.chains_.find(key);
         if (it == bucket.chains_.end() || it->second.empty()) {
-            return true;
+            return true;  // 没有版本信息，可以写
         }
 
         auto& chain = it->second;
         auto& latest = chain.back();
 
+        // 如果最新版本是自己创建的，可以写（重复写）
         if (latest.txn_id_ == txn->get_transaction_id()) {
             return true;
         }
 
+        // 如果最新版本未提交（由其他事务创建），冲突
         if (latest.commit_ts_ == 0) {
             return false;
         }
 
+        // 如果最新已提交版本在本事务开始之后提交，冲突
         if (latest.commit_ts_ > txn->get_start_ts()) {
             return false;
         }
@@ -83,18 +104,23 @@ public:
         return true;
     }
 
+    /**
+     * @brief 记录写操作前的旧数据
+     * @param old_data 写操作前的数据
+     * @param was_deleted 写操作前记录是否已删除
+     */
     void save_old_data(int fd, const Rid& rid, Transaction* txn,
                        const RmRecord* old_data, bool was_deleted,
                        bool new_deleted = false) {
         VersionKey key{fd, rid.page_no, rid.slot_no};
         auto& bucket = get_bucket(key);
-        std::lock_guard<std::shared_mutex> lock(bucket.mutex_);
+        std::lock_guard<std::mutex> lock(bucket.mutex_);
 
         auto& chain = bucket.chains_[key];
 
         VersionEntry entry;
         entry.txn_id_ = txn->get_transaction_id();
-        entry.commit_ts_ = 0;
+        entry.commit_ts_ = 0;  // 未提交
         entry.is_deleted_ = was_deleted;
         entry.new_deleted_ = new_deleted;
         if (old_data && !was_deleted) {
@@ -102,89 +128,83 @@ public:
         }
 
         chain.push_back(std::move(entry));
-
-        // Track which keys this transaction touched
-        txn_keys_[txn->get_transaction_id()].push_back(key);
     }
 
-    // Optimized commit: only iterate keys touched by this transaction
+    /**
+     * @brief 提交事务的所有写操作
+     */
     void commit_transaction(txn_id_t txn_id, timestamp_t commit_ts) {
-        std::vector<VersionKey> keys;
-        {
-            std::lock_guard<std::mutex> lock(txn_keys_mutex_);
-            auto it = txn_keys_.find(txn_id);
-            if (it == txn_keys_.end()) return;
-            keys = std::move(it->second);
-            txn_keys_.erase(it);
-        }
-
-        for (auto& key : keys) {
-            auto& bucket = get_bucket(key);
-            std::lock_guard<std::shared_mutex> lock(bucket.mutex_);
-            auto chain_it = bucket.chains_.find(key);
-            if (chain_it == bucket.chains_.end()) continue;
-            for (auto& entry : chain_it->second) {
-                if (entry.txn_id_ == txn_id && entry.commit_ts_ == 0) {
-                    entry.commit_ts_ = commit_ts;
+        for (size_t i = 0; i < NUM_SHARDS; ++i) {
+            std::lock_guard<std::mutex> lock(shards_[i].mutex_);
+            for (auto& [key, chain] : shards_[i].chains_) {
+                for (auto& entry : chain) {
+                    if (entry.txn_id_ == txn_id && entry.commit_ts_ == 0) {
+                        entry.commit_ts_ = commit_ts;
+                    }
                 }
             }
         }
     }
 
-    // Optimized abort: only iterate keys touched by this transaction
+    /**
+     * @brief 回滚事务的所有写操作
+     * @return 需要恢复的记录列表 (fd, rid, old_data, is_deleted)
+     */
     std::vector<std::tuple<int, Rid, std::shared_ptr<RmRecord>, bool>> abort_transaction(txn_id_t txn_id) {
         std::vector<std::tuple<int, Rid, std::shared_ptr<RmRecord>, bool>> to_restore;
-        std::vector<VersionKey> keys;
-        {
-            std::lock_guard<std::mutex> lock(txn_keys_mutex_);
-            auto it = txn_keys_.find(txn_id);
-            if (it == txn_keys_.end()) return to_restore;
-            keys = std::move(it->second);
-            txn_keys_.erase(it);
-        }
 
-        for (auto& key : keys) {
-            auto& bucket = get_bucket(key);
-            std::lock_guard<std::shared_mutex> lock(bucket.mutex_);
-            auto chain_it = bucket.chains_.find(key);
-            if (chain_it == bucket.chains_.end()) continue;
+        for (size_t i = 0; i < NUM_SHARDS; ++i) {
+            std::lock_guard<std::mutex> lock(shards_[i].mutex_);
+            auto& chains = shards_[i].chains_;
 
-            auto& chain = chain_it->second;
-            for (auto& entry : chain) {
-                if (entry.txn_id_ == txn_id) {
-                    to_restore.push_back({key.fd,
-                                          Rid{key.page_no, key.slot_no},
-                                          entry.old_data_,
-                                          entry.is_deleted_});
+            for (auto it = chains.begin(); it != chains.end(); ) {
+                auto& chain = it->second;
+
+                // 找到该事务的版本条目，恢复旧数据
+                for (auto& entry : chain) {
+                    if (entry.txn_id_ == txn_id) {
+                        to_restore.push_back({it->first.fd,
+                                              Rid{it->first.page_no, it->first.slot_no},
+                                              entry.old_data_,
+                                              entry.is_deleted_});
+                    }
                 }
-            }
 
-            chain.erase(
-                std::remove_if(chain.begin(), chain.end(),
-                    [txn_id](const VersionEntry& entry) {
-                        return entry.txn_id_ == txn_id;
-                    }),
-                chain.end()
-            );
+                // 移除该事务的版本条目
+                chain.erase(
+                    std::remove_if(chain.begin(), chain.end(),
+                        [txn_id](const VersionEntry& entry) {
+                            return entry.txn_id_ == txn_id;
+                        }),
+                    chain.end()
+                );
 
-            if (chain.empty()) {
-                bucket.chains_.erase(chain_it);
+                if (chain.empty()) {
+                    it = chains.erase(it);
+                } else {
+                    ++it;
+                }
             }
         }
 
         return to_restore;
     }
 
+    /**
+     * @brief 检查记录是否对事务可见
+     *
+     * @return -1: 从磁盘读取, 0: 记录不存在, 1: 从old_data读取
+     */
     int get_visible_data(int fd, const Rid& rid, Transaction* txn, RmRecord*& result, bool& is_deleted) {
         VersionKey key{fd, rid.page_no, rid.slot_no};
         auto& bucket = get_bucket(key);
-        std::shared_lock<std::shared_mutex> lock(bucket.mutex_);
+        std::lock_guard<std::mutex> lock(bucket.mutex_);
 
         auto it = bucket.chains_.find(key);
         if (it == bucket.chains_.end() || it->second.empty()) {
             is_deleted = false;
             result = nullptr;
-            return -1;
+            return -1;  // 没有版本信息，从磁盘读取
         }
 
         auto& chain = it->second;
@@ -193,6 +213,8 @@ public:
         bool invisible_before_deleted = false;
         RmRecord* invisible_before_data = nullptr;
 
+        // 从最新版本开始查找。磁盘保存最新物理值，版本链保存每次写入前的旧值；
+        // 如果快照看不到多个较新的写入，需要一直回退到最早的不可见写入前。
         for (auto rit = chain.rbegin(); rit != chain.rend(); ++rit) {
             auto& entry = *rit;
 
@@ -215,6 +237,8 @@ public:
                 continue;
             }
 
+            // commit_ts <= start_ts，这个写入在快照中可见。若它是删除，
+            // 且没有更晚的不可见写入需要回退，则该记录对本事务不存在。
             if (!has_invisible_before_image && entry.new_deleted_) {
                 is_deleted = true;
                 result = nullptr;
@@ -236,13 +260,13 @@ public:
 
         is_deleted = false;
         result = nullptr;
-        return -1;
+        return -1;  // 从磁盘读取
     }
 
     int get_read_committed_data(int fd, const Rid& rid, RmRecord*& result, bool& is_deleted) {
         VersionKey key{fd, rid.page_no, rid.slot_no};
         auto& bucket = get_bucket(key);
-        std::shared_lock<std::shared_mutex> lock(bucket.mutex_);
+        std::lock_guard<std::mutex> lock(bucket.mutex_);
 
         auto it = bucket.chains_.find(key);
         if (it == bucket.chains_.end() || it->second.empty()) {
@@ -284,7 +308,7 @@ public:
     bool latest_is_deleted_for_txn(int fd, const Rid& rid, txn_id_t txn_id) {
         VersionKey key{fd, rid.page_no, rid.slot_no};
         auto& bucket = get_bucket(key);
-        std::shared_lock<std::shared_mutex> lock(bucket.mutex_);
+        std::lock_guard<std::mutex> lock(bucket.mutex_);
 
         auto it = bucket.chains_.find(key);
         if (it == bucket.chains_.end() || it->second.empty()) {
@@ -304,15 +328,11 @@ private:
     static constexpr size_t NUM_SHARDS = 64;
 
     struct Shard {
-        std::shared_mutex mutex_;
+        std::mutex mutex_;
         std::unordered_map<VersionKey, std::vector<VersionEntry>, VersionKeyHash> chains_;
     };
 
     Shard shards_[NUM_SHARDS];
-
-    // Per-transaction tracking of version keys for fast commit/abort
-    std::mutex txn_keys_mutex_;
-    std::unordered_map<txn_id_t, std::vector<VersionKey>> txn_keys_;
 
     Shard& get_bucket(const VersionKey& key) {
         size_t hash = VersionKeyHash{}(key);
