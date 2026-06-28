@@ -1127,11 +1127,13 @@ void *client_handler(void *sock_fd) {
         if (yyparse() == 0) {
             if (ast::parse_tree != nullptr) {
                 try {
-                    // analyze and rewrite
-                    std::shared_ptr<Query> query = analyze->do_analyze(ast::parse_tree);
+                    // analyze and rewrite - do_analyze only reads metadata, safe to call outside lock
+                    auto parse_tree_copy = ast::parse_tree;
                     yy_delete_buffer(buf);
                     finish_analyze = true;
                     pthread_mutex_unlock(buffer_mutex);
+
+                    std::shared_ptr<Query> query = analyze->do_analyze(parse_tree_copy);
                     // 优化器
                     std::shared_ptr<Plan> plan = optimizer->plan_query(query, context.get());
                     // portal
