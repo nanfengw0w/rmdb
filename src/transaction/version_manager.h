@@ -75,11 +75,10 @@ public:
      */
     bool check_write_conflict(int fd, const Rid& rid, Transaction* txn) {
         VersionKey key{fd, rid.page_no, rid.slot_no};
-        auto& bucket = get_bucket(key);
-        std::lock_guard<std::mutex> lock(bucket.mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
 
-        auto it = bucket.chains_.find(key);
-        if (it == bucket.chains_.end() || it->second.empty()) {
+        auto it = version_chains_.find(key);
+        if (it == version_chains_.end() || it->second.empty()) {
             return true;  // 没有版本信息，可以写
         }
 
@@ -113,10 +112,9 @@ public:
                        const RmRecord* old_data, bool was_deleted,
                        bool new_deleted = false) {
         VersionKey key{fd, rid.page_no, rid.slot_no};
-        auto& bucket = get_bucket(key);
-        std::lock_guard<std::mutex> lock(bucket.mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
 
-        auto& chain = bucket.chains_[key];
+        auto& chain = version_chains_[key];
 
         VersionEntry entry;
         entry.txn_id_ = txn->get_transaction_id();
@@ -134,13 +132,12 @@ public:
      * @brief 提交事务的所有写操作
      */
     void commit_transaction(txn_id_t txn_id, timestamp_t commit_ts) {
-        for (size_t i = 0; i < NUM_SHARDS; ++i) {
-            std::lock_guard<std::mutex> lock(shards_[i].mutex_);
-            for (auto& [key, chain] : shards_[i].chains_) {
-                for (auto& entry : chain) {
-                    if (entry.txn_id_ == txn_id && entry.commit_ts_ == 0) {
-                        entry.commit_ts_ = commit_ts;
-                    }
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        for (auto& [key, chain] : version_chains_) {
+            for (auto& entry : chain) {
+                if (entry.txn_id_ == txn_id && entry.commit_ts_ == 0) {
+                    entry.commit_ts_ = commit_ts;
                 }
             }
         }
@@ -151,39 +148,36 @@ public:
      * @return 需要恢复的记录列表 (fd, rid, old_data, is_deleted)
      */
     std::vector<std::tuple<int, Rid, std::shared_ptr<RmRecord>, bool>> abort_transaction(txn_id_t txn_id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+
         std::vector<std::tuple<int, Rid, std::shared_ptr<RmRecord>, bool>> to_restore;
 
-        for (size_t i = 0; i < NUM_SHARDS; ++i) {
-            std::lock_guard<std::mutex> lock(shards_[i].mutex_);
-            auto& chains = shards_[i].chains_;
+        for (auto it = version_chains_.begin(); it != version_chains_.end(); ) {
+            auto& chain = it->second;
 
-            for (auto it = chains.begin(); it != chains.end(); ) {
-                auto& chain = it->second;
-
-                // 找到该事务的版本条目，恢复旧数据
-                for (auto& entry : chain) {
-                    if (entry.txn_id_ == txn_id) {
-                        to_restore.push_back({it->first.fd,
-                                              Rid{it->first.page_no, it->first.slot_no},
-                                              entry.old_data_,
-                                              entry.is_deleted_});
-                    }
+            // 找到该事务的版本条目，恢复旧数据
+            for (auto& entry : chain) {
+                if (entry.txn_id_ == txn_id) {
+                    to_restore.push_back({it->first.fd,
+                                          Rid{it->first.page_no, it->first.slot_no},
+                                          entry.old_data_,
+                                          entry.is_deleted_});
                 }
+            }
 
-                // 移除该事务的版本条目
-                chain.erase(
-                    std::remove_if(chain.begin(), chain.end(),
-                        [txn_id](const VersionEntry& entry) {
-                            return entry.txn_id_ == txn_id;
-                        }),
-                    chain.end()
-                );
+            // 移除该事务的版本条目
+            chain.erase(
+                std::remove_if(chain.begin(), chain.end(),
+                    [txn_id](const VersionEntry& entry) {
+                        return entry.txn_id_ == txn_id;
+                    }),
+                chain.end()
+            );
 
-                if (chain.empty()) {
-                    it = chains.erase(it);
-                } else {
-                    ++it;
-                }
+            if (chain.empty()) {
+                it = version_chains_.erase(it);
+            } else {
+                ++it;
             }
         }
 
@@ -195,15 +189,14 @@ public:
      *
      * @return -1: 从磁盘读取, 0: 记录不存在, 1: 从old_data读取
      */
-    int get_visible_data(int fd, const Rid& rid, Transaction* txn, std::unique_ptr<RmRecord>& result, bool& is_deleted) {
+    int get_visible_data(int fd, const Rid& rid, Transaction* txn, RmRecord*& result, bool& is_deleted) {
         VersionKey key{fd, rid.page_no, rid.slot_no};
-        auto& bucket = get_bucket(key);
-        std::lock_guard<std::mutex> lock(bucket.mutex_);
-        result.reset();
+        std::lock_guard<std::mutex> lock(mutex_);
 
-        auto it = bucket.chains_.find(key);
-        if (it == bucket.chains_.end() || it->second.empty()) {
+        auto it = version_chains_.find(key);
+        if (it == version_chains_.end() || it->second.empty()) {
             is_deleted = false;
+            result = nullptr;
             return -1;  // 没有版本信息，从磁盘读取
         }
 
@@ -211,7 +204,7 @@ public:
 
         bool has_invisible_before_image = false;
         bool invisible_before_deleted = false;
-        std::shared_ptr<RmRecord> invisible_before_data;
+        RmRecord* invisible_before_data = nullptr;
 
         // 从最新版本开始查找。磁盘保存最新物理值，版本链保存每次写入前的旧值；
         // 如果快照看不到多个较新的写入，需要一直回退到最早的不可见写入前。
@@ -221,9 +214,11 @@ public:
             if (entry.txn_id_ == txn->get_transaction_id()) {
                 if (entry.new_deleted_) {
                     is_deleted = true;
+                    result = nullptr;
                     return 0;
                 }
                 is_deleted = false;
+                result = nullptr;
                 return -1;
             }
 
@@ -231,7 +226,7 @@ public:
             if (invisible) {
                 has_invisible_before_image = true;
                 invisible_before_deleted = entry.is_deleted_;
-                invisible_before_data = entry.old_data_;
+                invisible_before_data = entry.old_data_.get();
                 continue;
             }
 
@@ -239,6 +234,7 @@ public:
             // 且没有更晚的不可见写入需要回退，则该记录对本事务不存在。
             if (!has_invisible_before_image && entry.new_deleted_) {
                 is_deleted = true;
+                result = nullptr;
                 return 0;
             }
             break;
@@ -247,78 +243,66 @@ public:
         if (has_invisible_before_image) {
             if (invisible_before_deleted) {
                 is_deleted = true;
+                result = nullptr;
                 return 0;
             }
             is_deleted = false;
-            if (invisible_before_data == nullptr) {
-                return 0;
-            }
-            result = std::make_unique<RmRecord>(*invisible_before_data);
+            result = invisible_before_data;
             return 1;
         }
 
         is_deleted = false;
+        result = nullptr;
         return -1;  // 从磁盘读取
     }
 
-    int get_read_committed_data(int fd, const Rid& rid, std::unique_ptr<RmRecord>& result, bool& is_deleted) {
+    int get_read_committed_data(int fd, const Rid& rid, RmRecord*& result, bool& is_deleted) {
         VersionKey key{fd, rid.page_no, rid.slot_no};
-        auto& bucket = get_bucket(key);
-        std::lock_guard<std::mutex> lock(bucket.mutex_);
-        result.reset();
+        std::lock_guard<std::mutex> lock(mutex_);
 
-        auto it = bucket.chains_.find(key);
-        if (it == bucket.chains_.end() || it->second.empty()) {
+        auto it = version_chains_.find(key);
+        if (it == version_chains_.end() || it->second.empty()) {
             is_deleted = false;
+            result = nullptr;
             return -1;
         }
-
-        bool has_uncommitted_before_image = false;
-        bool uncommitted_before_deleted = false;
-        std::shared_ptr<RmRecord> uncommitted_before_data;
 
         for (auto rit = it->second.rbegin(); rit != it->second.rend(); ++rit) {
             auto& entry = *rit;
 
             if (entry.commit_ts_ == 0) {
-                has_uncommitted_before_image = true;
-                uncommitted_before_deleted = entry.is_deleted_;
-                uncommitted_before_data = entry.old_data_;
-                continue;
+                if (entry.is_deleted_) {
+                    is_deleted = true;
+                    result = nullptr;
+                    return 0;
+                }
+                is_deleted = false;
+                result = entry.old_data_.get();
+                return 1;
             }
 
-            if (!has_uncommitted_before_image && entry.new_deleted_) {
+            if (entry.new_deleted_) {
                 is_deleted = true;
+                result = nullptr;
                 return 0;
             }
 
-            break;
-        }
-
-        if (has_uncommitted_before_image) {
-            if (uncommitted_before_deleted) {
-                is_deleted = true;
-                return 0;
-            }
             is_deleted = false;
-            if (uncommitted_before_data == nullptr) {
-                return 0;
-            }
-            result = std::make_unique<RmRecord>(*uncommitted_before_data);
-            return 1;
+            result = nullptr;
+            return -1;
         }
 
         is_deleted = false;
+        result = nullptr;
         return -1;
     }
 
     bool latest_is_deleted_for_txn(int fd, const Rid& rid, txn_id_t txn_id) {
         VersionKey key{fd, rid.page_no, rid.slot_no};
-        auto& bucket = get_bucket(key);
-        std::lock_guard<std::mutex> lock(bucket.mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
 
-        auto it = bucket.chains_.find(key);
-        if (it == bucket.chains_.end() || it->second.empty()) {
+        auto it = version_chains_.find(key);
+        if (it == version_chains_.end() || it->second.empty()) {
             return false;
         }
         for (auto rit = it->second.rbegin(); rit != it->second.rend(); ++rit) {
@@ -329,41 +313,8 @@ public:
         return false;
     }
 
-    void clear_fd(int fd) {
-        for (size_t i = 0; i < NUM_SHARDS; ++i) {
-            std::lock_guard<std::mutex> lock(shards_[i].mutex_);
-            auto& chains = shards_[i].chains_;
-            for (auto it = chains.begin(); it != chains.end(); ) {
-                if (it->first.fd == fd) {
-                    it = chains.erase(it);
-                } else {
-                    ++it;
-                }
-            }
-        }
-    }
-
-    void clear_all() {
-        for (size_t i = 0; i < NUM_SHARDS; ++i) {
-            std::lock_guard<std::mutex> lock(shards_[i].mutex_);
-            shards_[i].chains_.clear();
-        }
-    }
-
 private:
     VersionManager() = default;
-
-    static constexpr size_t NUM_SHARDS = 64;
-
-    struct Shard {
-        std::mutex mutex_;
-        std::unordered_map<VersionKey, std::vector<VersionEntry>, VersionKeyHash> chains_;
-    };
-
-    Shard shards_[NUM_SHARDS];
-
-    Shard& get_bucket(const VersionKey& key) {
-        size_t hash = VersionKeyHash{}(key);
-        return shards_[hash % NUM_SHARDS];
-    }
+    std::mutex mutex_;
+    std::unordered_map<VersionKey, std::vector<VersionEntry>, VersionKeyHash> version_chains_;
 };

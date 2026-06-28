@@ -29,7 +29,7 @@ std::unique_ptr<RmRecord> RmFileHandle::get_record(const Rid& rid, Context* cont
         if (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE) {
             auto& vm = VersionManager::instance();
             bool is_deleted = false;
-            std::unique_ptr<RmRecord> result;
+            RmRecord* result = nullptr;
             int vis = vm.get_visible_data(fd_, rid, context->txn_, result, is_deleted);
 
             if (vis == 0) {
@@ -40,13 +40,13 @@ std::unique_ptr<RmRecord> RmFileHandle::get_record(const Rid& rid, Context* cont
                 if (is_deleted) {
                     return nullptr;
                 }
-                return result;
+                return std::make_unique<RmRecord>(*result);
             }
             // vis == -1，从磁盘读取最新数据
         } else if (level == IsolationLevel::READ_COMMITTED) {
             auto& vm = VersionManager::instance();
             bool is_deleted = false;
-            std::unique_ptr<RmRecord> result;
+            RmRecord* result = nullptr;
             int vis = vm.get_read_committed_data(fd_, rid, result, is_deleted);
 
             if (vis == 0) {
@@ -55,7 +55,7 @@ std::unique_ptr<RmRecord> RmFileHandle::get_record(const Rid& rid, Context* cont
                 if (is_deleted) {
                     return nullptr;
                 }
-                return result;
+                return std::make_unique<RmRecord>(*result);
             }
         }
     }
@@ -70,16 +70,6 @@ Rid RmFileHandle::insert_record(char* buf, Context* context) {
 
     memcpy(page_handle.get_slot(slot_no), buf, file_hdr_.record_size);
 
-    int page_no = page_handle.page->get_page_id().page_no;
-    Rid rid{page_no, slot_no};
-
-    // MVCC: 必须在设置bitmap之前创建版本链条目。所有事务都写版本，
-    // 否则 SI 长事务会被并发 autocommit 写破坏快照重构。
-    if (context != nullptr && context->txn_ != nullptr) {
-        auto& vm = VersionManager::instance();
-        vm.save_old_data(fd_, rid, context->txn_, nullptr, true);  // 之前不存在
-    }
-
     Bitmap::set(page_handle.bitmap, slot_no);
 
     page_handle.page_hdr->num_records++;
@@ -90,7 +80,19 @@ Rid RmFileHandle::insert_record(char* buf, Context* context) {
 
     BufferPoolManager::mark_dirty(page_handle.page);
 
+    int page_no = page_handle.page->get_page_id().page_no;
     buffer_pool_manager_->unpin_page(PageId{fd_, page_no}, true);
+
+    Rid rid{page_no, slot_no};
+
+    // MVCC: 记录插入操作（旧数据为空，表示之前记录不存在）
+    if (context != nullptr && context->txn_ != nullptr) {
+        IsolationLevel level = context->txn_->get_isolation_level();
+        if (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE) {
+            auto& vm = VersionManager::instance();
+            vm.save_old_data(fd_, rid, context->txn_, nullptr, true);  // 之前不存在
+        }
+    }
 
     return rid;
 }
@@ -118,21 +120,23 @@ void RmFileHandle::delete_record(const Rid& rid, Context* context) {
     }
 
     bool mvcc_delete = false;
-    // MVCC: 检查写写冲突并保存旧数据。READ_COMMITTED 写也保留版本，
-    // 以支持并发 SI 事务重构旧快照。
+    // MVCC: 检查写写冲突并保存旧数据
     if (context != nullptr && context->txn_ != nullptr) {
-        mvcc_delete = true;
-        auto& vm = VersionManager::instance();
+        IsolationLevel level = context->txn_->get_isolation_level();
+        if (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE) {
+            mvcc_delete = true;
+            auto& vm = VersionManager::instance();
 
-        if (!vm.check_write_conflict(fd_, rid, context->txn_)) {
-            buffer_pool_manager_->unpin_page(PageId{fd_, rid.page_no}, false);
-            throw TransactionAbortException(context->txn_->get_transaction_id(),
-                AbortReason::DEADLOCK_PREVENTION);
+            if (!vm.check_write_conflict(fd_, rid, context->txn_)) {
+                buffer_pool_manager_->unpin_page(PageId{fd_, rid.page_no}, false);
+                throw TransactionAbortException(context->txn_->get_transaction_id(),
+                    AbortReason::DEADLOCK_PREVENTION);
+            }
+
+            // 保存旧数据
+            RmRecord old_data(file_hdr_.record_size, page_handle.get_slot(rid.slot_no));
+            vm.save_old_data(fd_, rid, context->txn_, &old_data, false, true);
         }
-
-        // 保存旧数据
-        RmRecord old_data(file_hdr_.record_size, page_handle.get_slot(rid.slot_no));
-        vm.save_old_data(fd_, rid, context->txn_, &old_data, false, true);
     }
 
     if (mvcc_delete) {
@@ -162,20 +166,22 @@ void RmFileHandle::update_record(const Rid& rid, char* buf, Context* context) {
         throw RecordNotFoundError(rid.page_no, rid.slot_no);
     }
 
-    // MVCC: 检查写写冲突并保存旧数据。READ_COMMITTED 写也保留版本，
-    // 以支持并发 SI 事务重构旧快照。
+    // MVCC: 检查写写冲突并保存旧数据
     if (context != nullptr && context->txn_ != nullptr) {
-        auto& vm = VersionManager::instance();
+        IsolationLevel level = context->txn_->get_isolation_level();
+        if (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE) {
+            auto& vm = VersionManager::instance();
 
-        if (!vm.check_write_conflict(fd_, rid, context->txn_)) {
-            buffer_pool_manager_->unpin_page(PageId{fd_, rid.page_no}, false);
-            throw TransactionAbortException(context->txn_->get_transaction_id(),
-                AbortReason::DEADLOCK_PREVENTION);
+            if (!vm.check_write_conflict(fd_, rid, context->txn_)) {
+                buffer_pool_manager_->unpin_page(PageId{fd_, rid.page_no}, false);
+                throw TransactionAbortException(context->txn_->get_transaction_id(),
+                    AbortReason::DEADLOCK_PREVENTION);
+            }
+
+            // 保存旧数据
+            RmRecord old_data(file_hdr_.record_size, page_handle.get_slot(rid.slot_no));
+            vm.save_old_data(fd_, rid, context->txn_, &old_data, false);
         }
-
-        // 保存旧数据
-        RmRecord old_data(file_hdr_.record_size, page_handle.get_slot(rid.slot_no));
-        vm.save_old_data(fd_, rid, context->txn_, &old_data, false);
     }
 
     memcpy(page_handle.get_slot(rid.slot_no), buf, file_hdr_.record_size);

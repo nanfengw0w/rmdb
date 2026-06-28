@@ -19,7 +19,6 @@ See the Mulan PSL v2 for more details. */
 #include "index/ix.h"
 #include "record/rm.h"
 #include "record_printer.h"
-#include "transaction/version_manager.h"
 
 namespace {
 
@@ -182,11 +181,9 @@ void SmManager::close_db() {
     ihs_.clear();
     // Close all record file handles
     for (auto &entry : fhs_) {
-        VersionManager::instance().clear_fd(entry.second->GetFd());
         rm_manager_->close_file(entry.second.get());
     }
     fhs_.clear();
-    VersionManager::instance().clear_all();
 }
 
 /**
@@ -309,7 +306,6 @@ void SmManager::drop_table(const std::string& tab_name, Context* context) {
     }
     // Close file handle first before destroying
     if (fhs_.count(tab_name)) {
-        VersionManager::instance().clear_fd(fhs_.at(tab_name)->GetFd());
         rm_manager_->close_file(fhs_.at(tab_name).get());
         fhs_.erase(tab_name);
     }
