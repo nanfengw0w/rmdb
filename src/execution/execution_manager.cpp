@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution_manager.h"
 
 #include <cctype>
+#include <functional>
 #include <map>
 #include <sstream>
 #include <set>
@@ -131,6 +132,14 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t *txn_id, Co
             case T_Transaction_begin:
             {
                 // 显示开启一个事务
+                txn_mgr_->acquire_explicit_txn_lock(context->txn_);
+                if (context->txn_->get_isolation_level() == IsolationLevel::READ_COMMITTED) {
+                    context->txn_->set_isolation_level(IsolationLevel::SNAPSHOT_ISOLATION);
+                }
+                if (context->txn_->get_isolation_level() == IsolationLevel::SNAPSHOT_ISOLATION ||
+                    context->txn_->get_isolation_level() == IsolationLevel::SERIALIZABLE) {
+                    context->txn_->set_start_ts(txn_mgr_->get_next_timestamp());
+                }
                 context->txn_->set_txn_mode(true);
                 break;
             }  
@@ -299,6 +308,46 @@ static std::vector<std::string> split_str(const std::string &s, const std::strin
     return result;
 }
 
+static std::vector<std::string> split_conditions_by_and(const std::string &clause) {
+    std::vector<std::string> result;
+    std::string lower = to_lower_str(clause);
+    bool in_string = false;
+    int paren_depth = 0;
+    size_t start = 0;
+    for (size_t i = 0; i < clause.length(); i++) {
+        if (clause[i] == '\'') {
+            in_string = !in_string;
+            continue;
+        }
+        if (in_string) {
+            continue;
+        }
+        if (clause[i] == '(') {
+            paren_depth++;
+            continue;
+        }
+        if (clause[i] == ')' && paren_depth > 0) {
+            paren_depth--;
+            continue;
+        }
+        if (paren_depth == 0 && i + 3 <= clause.length() &&
+            lower[i] == 'a' && lower[i + 1] == 'n' && lower[i + 2] == 'd') {
+            bool left_ok = (i == 0 || !isalpha(static_cast<unsigned char>(lower[i - 1])));
+            if (!left_ok) {
+                continue;
+            }
+            result.push_back(trim_str(clause.substr(start, i - start)));
+            i += 2;
+            start = i + 1;
+            while (start < clause.length() && isspace(static_cast<unsigned char>(clause[start]))) {
+                start++;
+            }
+        }
+    }
+    result.push_back(trim_str(clause.substr(start)));
+    return result;
+}
+
 // 聚合类型
 enum AggType { AGG_NONE, AGG_COUNT_STAR, AGG_COUNT, AGG_MAX, AGG_MIN, AGG_SUM, AGG_AVG };
 
@@ -311,13 +360,26 @@ struct AggCol {
     ColType col_type;      // 列类型
     int col_len;           // 列长度
     int col_offset;        // 列偏移
+    bool distinct = false;
 };
 
 // 排序列信息
 struct OrderCol {
     int col_idx;  // 在输出结果中的列索引
     bool is_desc;
+    bool is_extra_agg = false;
+    AggType agg_type = AGG_NONE;
+    std::string agg_col_name;
 };
+
+// 执行一个SELECT子查询，返回结果行（每行是字符串向量）和列元数据
+struct SubQueryResult {
+    std::vector<std::vector<std::string>> rows;
+    std::vector<ColMeta> cols;
+    std::vector<std::string> col_names;
+};
+
+static SubQueryResult execute_sub_select(SmManager *sm_manager, const std::string &select_sql, Context *context);
 
 // 解析聚合函数
 static AggType parse_agg_func(const std::string &col_expr, std::string &inner_col) {
@@ -345,6 +407,691 @@ static AggType parse_agg_func(const std::string &col_expr, std::string &inner_co
     return AGG_NONE;
 }
 
+static bool strip_distinct_col(std::string &inner_col) {
+    std::string col = trim_str(inner_col);
+    std::string lower = to_lower_str(col);
+    if (lower.rfind("distinct", 0) != 0) {
+        inner_col = unqualify_col_name(col);
+        return false;
+    }
+    std::string rest = trim_str(col.substr(8));
+    if (rest.size() >= 2 && rest.front() == '(' && rest.back() == ')') {
+        rest = trim_str(rest.substr(1, rest.size() - 2));
+    }
+    inner_col = unqualify_col_name(rest);
+    return true;
+}
+
+static int find_subquery_col(const SubQueryResult &sub, const std::string &expr) {
+    std::string target = to_lower_str(trim_str(expr));
+    std::string target_unqualified = to_lower_str(unqualify_col_name(target));
+    for (size_t i = 0; i < sub.cols.size(); ++i) {
+        std::string qualified = to_lower_str(sub.cols[i].tab_name + "." + sub.cols[i].name);
+        if (qualified == target) {
+            return static_cast<int>(i);
+        }
+    }
+    for (size_t i = 0; i < sub.cols.size(); ++i) {
+        if (to_lower_str(sub.cols[i].name) == target ||
+            to_lower_str(sub.cols[i].name) == target_unqualified) {
+            return static_cast<int>(i);
+        }
+    }
+    throw ColumnNotFoundError(expr);
+}
+
+static bool parse_select_item_for_subquery(std::string item, const SubQueryResult &sub, AggCol &ac) {
+    item = trim_str(item);
+    std::string item_lower = to_lower_str(item);
+    size_t as_pos = item_lower.find(" as ");
+    if (as_pos != std::string::npos) {
+        ac.alias = trim_str(item.substr(as_pos + 4));
+        item = trim_str(item.substr(0, as_pos));
+    } else {
+        size_t rp = item.rfind(')');
+        if (rp != std::string::npos) {
+            std::string trailing = trim_str(item.substr(rp + 1));
+            if (!trailing.empty() && trailing.find(' ') == std::string::npos &&
+                trailing.find('\t') == std::string::npos) {
+                ac.alias = trailing;
+                item = trim_str(item.substr(0, rp + 1));
+            }
+        }
+        if (ac.alias.empty()) {
+            std::istringstream item_iss(item);
+            std::vector<std::string> tokens;
+            std::string token;
+            while (item_iss >> token) tokens.push_back(token);
+            if (tokens.size() == 2) {
+                item = tokens[0];
+                ac.alias = tokens[1];
+            }
+        }
+    }
+
+    std::string inner_col;
+    ac.type = parse_agg_func(item, inner_col);
+    ac.col_idx = -1;
+    ac.col_type = TYPE_INT;
+    ac.col_len = sizeof(int);
+    ac.col_offset = 0;
+    if (ac.type == AGG_COUNT_STAR) {
+        ac.col_name = "*";
+        if (ac.alias.empty()) ac.alias = "count(*)";
+        return true;
+    }
+    if (ac.type != AGG_NONE) {
+        ac.distinct = strip_distinct_col(inner_col);
+        ac.col_name = inner_col;
+        ac.col_idx = find_subquery_col(sub, inner_col);
+        ac.col_type = sub.cols[ac.col_idx].type;
+        ac.col_len = sub.cols[ac.col_idx].len;
+        if (ac.alias.empty()) ac.alias = to_lower_str(item);
+        return true;
+    }
+    if (item == "*") {
+        return false;
+    }
+    ac.col_name = unqualify_col_name(item);
+    ac.col_idx = find_subquery_col(sub, item);
+    ac.col_type = sub.cols[ac.col_idx].type;
+    ac.col_len = sub.cols[ac.col_idx].len;
+    if (ac.alias.empty()) ac.alias = item;
+    return true;
+}
+
+static std::string format_subquery_agg_value(const AggCol &ac, double value) {
+    if (ac.type == AGG_COUNT || ac.type == AGG_COUNT_STAR) {
+        return std::to_string(static_cast<int>(value));
+    }
+    if (ac.type == AGG_AVG) {
+        return std::to_string(value);
+    }
+    if (ac.col_type == TYPE_INT) {
+        return std::to_string(static_cast<int>(value));
+    }
+    return std::to_string(value);
+}
+
+static double numeric_subquery_value(const std::string &value) {
+    if (value.empty()) {
+        return 0;
+    }
+    return std::stod(value);
+}
+
+static bool handle_multi_table_aggregate_query(SmManager *sm_manager, const std::string &sql, Context *context) {
+    std::string sql_lower = to_lower_str(sql);
+    size_t sel_start = sql_lower.find("select ");
+    size_t from_start = sql_lower.find(" from ");
+    if (sel_start == std::string::npos || from_start == std::string::npos) {
+        return false;
+    }
+
+    std::string select_part = trim_str(sql.substr(sel_start + 7, from_start - sel_start - 7));
+    std::vector<std::string> keywords = {" where ", " group by ", " having ", " order by ", " limit "};
+    size_t from_end = sql.length();
+    for (auto &kw : keywords) {
+        size_t pos = sql_lower.find(kw, from_start);
+        if (pos != std::string::npos) from_end = std::min(from_end, pos);
+    }
+    std::string from_part = trim_str(sql.substr(from_start + 6, from_end - from_start - 6));
+    std::string from_lower = to_lower_str(from_part);
+    if (from_part.find(',') == std::string::npos && from_lower.find(" join ") == std::string::npos) {
+        return false;
+    }
+
+    std::string where_clause;
+    size_t wp = sql_lower.find(" where ");
+    if (wp != std::string::npos) {
+        size_t where_end = sql.length();
+        for (auto &kw : {" group by ", " having ", " order by ", " limit "}) {
+            size_t pos = sql_lower.find(kw, wp);
+            if (pos != std::string::npos) where_end = std::min(where_end, pos);
+        }
+        where_clause = trim_str(sql.substr(wp + 7, where_end - wp - 7));
+    }
+
+    std::string sub_sql = "select * from " + from_part;
+    if (!where_clause.empty()) {
+        sub_sql += " where " + where_clause;
+    }
+    sub_sql += ";";
+    SubQueryResult sub = execute_sub_select(sm_manager, sub_sql, context);
+
+    std::vector<int> group_col_idxs;
+    size_t gb_pos = sql_lower.find(" group by ");
+    if (gb_pos != std::string::npos) {
+        size_t gb_end = sql.length();
+        for (auto &kw : {" having ", " order by ", " limit "}) {
+            size_t pos = sql_lower.find(kw, gb_pos);
+            if (pos != std::string::npos) gb_end = std::min(gb_end, pos);
+        }
+        for (auto &p : split_str(trim_str(sql.substr(gb_pos + 10, gb_end - gb_pos - 10)), ",")) {
+            group_col_idxs.push_back(find_subquery_col(sub, p));
+        }
+    }
+
+    std::vector<AggCol> agg_cols;
+    if (trim_str(select_part) == "*") {
+        for (size_t i = 0; i < sub.cols.size(); ++i) {
+            AggCol ac;
+            ac.type = AGG_NONE;
+            ac.col_name = sub.cols[i].name;
+            ac.alias = sub.cols[i].name;
+            ac.col_idx = static_cast<int>(i);
+            ac.col_type = sub.cols[i].type;
+            ac.col_len = sub.cols[i].len;
+            agg_cols.push_back(ac);
+        }
+    } else {
+        for (auto item : split_str(select_part, ",")) {
+            AggCol ac;
+            if (parse_select_item_for_subquery(item, sub, ac)) {
+                agg_cols.push_back(ac);
+            }
+        }
+    }
+
+    bool has_agg_func = false;
+    for (auto &ac : agg_cols) {
+        if (ac.type != AGG_NONE) {
+            has_agg_func = true;
+            break;
+        }
+    }
+    if (has_agg_func && group_col_idxs.empty()) {
+        for (auto &ac : agg_cols) {
+            if (ac.type == AGG_NONE) {
+                throw InternalError("failure");
+            }
+        }
+    }
+    if (!group_col_idxs.empty()) {
+        for (auto &ac : agg_cols) {
+            if (ac.type != AGG_NONE) continue;
+            bool in_group = false;
+            for (int gi : group_col_idxs) {
+                if (gi == ac.col_idx) {
+                    in_group = true;
+                    break;
+                }
+            }
+            if (!in_group) {
+                throw InternalError("failure");
+            }
+        }
+    }
+
+    struct MultiGroupResult {
+        std::vector<std::string> agg_strs;
+        std::vector<double> agg_nums;
+        std::vector<bool> agg_is_str;
+        std::vector<int> rows;
+        int count = 0;
+    };
+    std::vector<MultiGroupResult> results;
+
+    auto compute_group = [&](const std::vector<int> &row_idxs) {
+        MultiGroupResult gr;
+        gr.rows = row_idxs;
+        gr.count = static_cast<int>(row_idxs.size());
+        for (auto &ac : agg_cols) {
+            if (ac.type == AGG_COUNT_STAR) {
+                gr.agg_strs.push_back(std::to_string(gr.count));
+                gr.agg_nums.push_back(gr.count);
+                gr.agg_is_str.push_back(false);
+            } else if (ac.type == AGG_COUNT) {
+                if (ac.distinct) {
+                    std::set<std::string> values;
+                    for (int ri : row_idxs) values.insert(sub.rows[ri][ac.col_idx]);
+                    gr.agg_strs.push_back(std::to_string(static_cast<int>(values.size())));
+                    gr.agg_nums.push_back(values.size());
+                } else {
+                    gr.agg_strs.push_back(std::to_string(gr.count));
+                    gr.agg_nums.push_back(gr.count);
+                }
+                gr.agg_is_str.push_back(false);
+            } else if (ac.type == AGG_MAX || ac.type == AGG_MIN || ac.type == AGG_SUM || ac.type == AGG_AVG) {
+                if (ac.col_type == TYPE_STRING && (ac.type == AGG_MAX || ac.type == AGG_MIN)) {
+                    std::string val;
+                    bool initialized = false;
+                    for (int ri : row_idxs) {
+                        const std::string &cur = sub.rows[ri][ac.col_idx];
+                        if (!initialized || (ac.type == AGG_MIN ? cur < val : cur > val)) {
+                            val = cur;
+                            initialized = true;
+                        }
+                    }
+                    gr.agg_strs.push_back(val);
+                    gr.agg_nums.push_back(0);
+                    gr.agg_is_str.push_back(true);
+                    continue;
+                }
+                double sum = 0, min_v = 0, max_v = 0;
+                int cnt = 0;
+                std::set<std::string> seen;
+                for (int ri : row_idxs) {
+                    const std::string &cell = sub.rows[ri][ac.col_idx];
+                    if (ac.distinct && !seen.insert(cell).second) {
+                        continue;
+                    }
+                    double v = numeric_subquery_value(cell);
+                    if (cnt == 0) {
+                        min_v = max_v = sum = v;
+                    } else {
+                        min_v = std::min(min_v, v);
+                        max_v = std::max(max_v, v);
+                        sum += v;
+                    }
+                    cnt++;
+                }
+                double out = 0;
+                if (ac.type == AGG_MAX) out = max_v;
+                else if (ac.type == AGG_MIN) out = min_v;
+                else if (ac.type == AGG_SUM) out = sum;
+                else out = cnt > 0 ? sum / cnt : 0;
+                gr.agg_strs.push_back(format_subquery_agg_value(ac, out));
+                gr.agg_nums.push_back(out);
+                gr.agg_is_str.push_back(false);
+            } else {
+                const std::string val = row_idxs.empty() ? "" : sub.rows[row_idxs[0]][ac.col_idx];
+                gr.agg_strs.push_back(val);
+                gr.agg_nums.push_back(ac.col_type == TYPE_STRING || val.empty() ? 0 : numeric_subquery_value(val));
+                gr.agg_is_str.push_back(ac.col_type == TYPE_STRING);
+            }
+        }
+        results.push_back(std::move(gr));
+    };
+
+    bool suppress_empty_non_count_agg = false;
+    if (group_col_idxs.empty() && !has_agg_func) {
+        for (size_t i = 0; i < sub.rows.size(); ++i) {
+            compute_group({static_cast<int>(i)});
+        }
+    } else if (group_col_idxs.empty()) {
+        bool has_non_count_agg = false;
+        for (auto &ac : agg_cols) {
+            if (ac.type != AGG_COUNT && ac.type != AGG_COUNT_STAR) {
+                has_non_count_agg = true;
+                break;
+            }
+        }
+        if (!sub.rows.empty() || !has_non_count_agg) {
+            std::vector<int> rows;
+            for (size_t i = 0; i < sub.rows.size(); ++i) rows.push_back(static_cast<int>(i));
+            compute_group(rows);
+        } else {
+            suppress_empty_non_count_agg = true;
+        }
+    } else {
+        std::vector<std::pair<std::string, std::vector<int>>> group_list;
+        std::map<std::string, int> key_to_idx;
+        for (size_t ri = 0; ri < sub.rows.size(); ++ri) {
+            std::string key;
+            for (int gi : group_col_idxs) {
+                key += sub.rows[ri][gi];
+                key.push_back('\0');
+            }
+            auto it = key_to_idx.find(key);
+            if (it == key_to_idx.end()) {
+                key_to_idx[key] = static_cast<int>(group_list.size());
+                group_list.push_back({key, {static_cast<int>(ri)}});
+            } else {
+                group_list[it->second].second.push_back(static_cast<int>(ri));
+            }
+        }
+        for (auto &entry : group_list) {
+            compute_group(entry.second);
+        }
+    }
+
+    size_t hv_pos = sql_lower.find(" having ");
+    if (hv_pos != std::string::npos) {
+        size_t hv_end = sql.length();
+        for (auto &kw : {" order by ", " limit "}) {
+            size_t pos = sql_lower.find(kw, hv_pos);
+            if (pos != std::string::npos) hv_end = std::min(hv_end, pos);
+        }
+        std::string having_clause = trim_str(sql.substr(hv_pos + 8, hv_end - hv_pos - 8));
+        std::vector<std::string> hv_conds = split_conditions_by_and(having_clause);
+
+        struct HavingValue {
+            bool is_str = false;
+            std::string str;
+            double num = 0;
+        };
+
+        auto compute_extra_agg = [&](const MultiGroupResult &gr, AggType type, std::string inner_col,
+                                     bool distinct) -> HavingValue {
+            HavingValue value;
+            if (type == AGG_COUNT_STAR || type == AGG_COUNT) {
+                if (type == AGG_COUNT_STAR || !distinct) {
+                    value.num = static_cast<double>(gr.count);
+                    return value;
+                }
+                int col_idx = find_subquery_col(sub, inner_col);
+                std::set<std::string> seen;
+                for (int ri : gr.rows) seen.insert(sub.rows[ri][col_idx]);
+                value.num = static_cast<double>(seen.size());
+                return value;
+            }
+
+            int col_idx = find_subquery_col(sub, inner_col);
+            ColType col_type = sub.cols[col_idx].type;
+            if (col_type == TYPE_STRING && (type == AGG_MAX || type == AGG_MIN)) {
+                bool initialized = false;
+                for (int ri : gr.rows) {
+                    const std::string &cur = sub.rows[ri][col_idx];
+                    if (!initialized || (type == AGG_MIN ? cur < value.str : cur > value.str)) {
+                        value.str = cur;
+                        initialized = true;
+                    }
+                }
+                value.is_str = true;
+                return value;
+            }
+
+            double sum = 0, min_v = 0, max_v = 0;
+            int cnt = 0;
+            std::set<std::string> seen;
+            for (int ri : gr.rows) {
+                const std::string &cell = sub.rows[ri][col_idx];
+                if (distinct && !seen.insert(cell).second) {
+                    continue;
+                }
+                double v = numeric_subquery_value(cell);
+                if (cnt == 0) {
+                    min_v = max_v = sum = v;
+                } else {
+                    min_v = std::min(min_v, v);
+                    max_v = std::max(max_v, v);
+                    sum += v;
+                }
+                cnt++;
+            }
+            if (type == AGG_MAX) value.num = max_v;
+            else if (type == AGG_MIN) value.num = min_v;
+            else if (type == AGG_SUM) value.num = sum;
+            else value.num = cnt > 0 ? sum / cnt : 0;
+            return value;
+        };
+
+        std::function<HavingValue(const MultiGroupResult&, std::string)> resolve_having_expr;
+        resolve_having_expr = [&](const MultiGroupResult &gr, std::string expr) -> HavingValue {
+            expr = trim_str(expr);
+            if (expr.size() >= 2 && expr.front() == '\'' && expr.back() == '\'') {
+                HavingValue value;
+                value.is_str = true;
+                value.str = expr.substr(1, expr.size() - 2);
+                return value;
+            }
+            auto find_top_level_add_sub = [](const std::string &text) -> size_t {
+                bool in_string = false;
+                int paren_depth = 0;
+                for (size_t i = text.size(); i > 0; --i) {
+                    size_t pos = i - 1;
+                    char c = text[pos];
+                    if (c == '\'') {
+                        in_string = !in_string;
+                        continue;
+                    }
+                    if (in_string) {
+                        continue;
+                    }
+                    if (c == ')') {
+                        paren_depth++;
+                        continue;
+                    }
+                    if (c == '(') {
+                        paren_depth--;
+                        continue;
+                    }
+                    if (paren_depth != 0 || (c != '+' && c != '-')) {
+                        continue;
+                    }
+                    if (pos == 0) {
+                        continue;
+                    }
+                    char prev = text[pos - 1];
+                    if (prev == 'e' || prev == 'E' || prev == '<' || prev == '>' || prev == '=' || prev == '!') {
+                        continue;
+                    }
+                    return pos;
+                }
+                return std::string::npos;
+            };
+            size_t arith_pos = find_top_level_add_sub(expr);
+            if (arith_pos != std::string::npos) {
+                HavingValue lhs = resolve_having_expr(gr, expr.substr(0, arith_pos));
+                HavingValue rhs = resolve_having_expr(gr, expr.substr(arith_pos + 1));
+                HavingValue value;
+                value.num = expr[arith_pos] == '+' ? lhs.num + rhs.num : lhs.num - rhs.num;
+                return value;
+            }
+            try {
+                size_t consumed = 0;
+                double parsed = std::stod(expr, &consumed);
+                if (consumed == expr.size()) {
+                    HavingValue value;
+                    value.num = parsed;
+                    return value;
+                }
+            } catch (...) {
+            }
+
+            std::string inner_col;
+            AggType agg_type = parse_agg_func(expr, inner_col);
+            if (agg_type != AGG_NONE) {
+                bool distinct = false;
+                if (agg_type != AGG_COUNT_STAR) {
+                    distinct = strip_distinct_col(inner_col);
+                }
+                for (size_t ai = 0; ai < agg_cols.size(); ++ai) {
+                    if (agg_cols[ai].type != agg_type) continue;
+                    if ((agg_type == AGG_COUNT_STAR && inner_col == "*") ||
+                        (agg_type != AGG_COUNT_STAR &&
+                         to_lower_str(agg_cols[ai].col_name) == to_lower_str(inner_col) &&
+                         agg_cols[ai].distinct == distinct)) {
+                        HavingValue value;
+                        value.is_str = gr.agg_is_str[ai];
+                        value.str = gr.agg_strs[ai];
+                        value.num = gr.agg_nums[ai];
+                        return value;
+                    }
+                }
+                return compute_extra_agg(gr, agg_type, inner_col, distinct);
+            }
+
+            std::string unqualified = unqualify_col_name(expr);
+            for (size_t ai = 0; ai < agg_cols.size(); ++ai) {
+                if (to_lower_str(agg_cols[ai].alias) == to_lower_str(expr) ||
+                    to_lower_str(agg_cols[ai].col_name) == to_lower_str(expr) ||
+                    to_lower_str(agg_cols[ai].col_name) == to_lower_str(unqualified)) {
+                    HavingValue value;
+                    value.is_str = gr.agg_is_str[ai];
+                    value.str = gr.agg_strs[ai];
+                    value.num = gr.agg_nums[ai];
+                    return value;
+                }
+            }
+
+            int col_idx = find_subquery_col(sub, expr);
+            HavingValue value;
+            if (gr.rows.empty()) {
+                return value;
+            }
+            value.str = sub.rows[gr.rows[0]][col_idx];
+            value.is_str = sub.cols[col_idx].type == TYPE_STRING;
+            if (!value.is_str && !value.str.empty()) {
+                value.num = numeric_subquery_value(value.str);
+            }
+            return value;
+        };
+
+        auto eval_having_cmp = [](const HavingValue &lhs, const HavingValue &rhs, CompOp op) {
+            int cmp = 0;
+            if (lhs.is_str || rhs.is_str) {
+                cmp = lhs.str.compare(rhs.str);
+            } else {
+                cmp = lhs.num > rhs.num ? 1 : (lhs.num < rhs.num ? -1 : 0);
+            }
+            switch (op) {
+                case OP_EQ: return cmp == 0;
+                case OP_NE: return cmp != 0;
+                case OP_LT: return cmp < 0;
+                case OP_GT: return cmp > 0;
+                case OP_LE: return cmp <= 0;
+                case OP_GE: return cmp >= 0;
+                default: return false;
+            }
+        };
+
+        auto it = results.begin();
+        while (it != results.end()) {
+            bool pass_all = true;
+            for (auto &hv_cond : hv_conds) {
+                int paren_depth = 0;
+                size_t op_pos = std::string::npos;
+                size_t op_len = 0;
+                std::string op_str;
+                for (size_t ci = 0; ci < hv_cond.length(); ci++) {
+                    if (hv_cond[ci] == '(') paren_depth++;
+                    else if (hv_cond[ci] == ')') paren_depth--;
+                    else if (paren_depth == 0) {
+                        if (ci + 1 < hv_cond.length()) {
+                            std::string two = hv_cond.substr(ci, 2);
+                            if (two == "<=" || two == ">=" || two == "<>" || two == "!=") {
+                                op_pos = ci;
+                                op_len = 2;
+                                op_str = two;
+                                break;
+                            }
+                        }
+                        if (hv_cond[ci] == '=' || hv_cond[ci] == '<' || hv_cond[ci] == '>') {
+                            op_pos = ci;
+                            op_len = 1;
+                            op_str = hv_cond.substr(ci, 1);
+                            break;
+                        }
+                    }
+                }
+                if (op_pos == std::string::npos) {
+                    pass_all = false;
+                    break;
+                }
+                CompOp cop;
+                if (op_str == "=") cop = OP_EQ;
+                else if (op_str == "<>" || op_str == "!=") cop = OP_NE;
+                else if (op_str == "<") cop = OP_LT;
+                else if (op_str == ">") cop = OP_GT;
+                else if (op_str == "<=") cop = OP_LE;
+                else if (op_str == ">=") cop = OP_GE;
+                else {
+                    pass_all = false;
+                    break;
+                }
+                HavingValue lhs = resolve_having_expr(*it, hv_cond.substr(0, op_pos));
+                HavingValue rhs = resolve_having_expr(*it, hv_cond.substr(op_pos + op_len));
+                if (!eval_having_cmp(lhs, rhs, cop)) {
+                    pass_all = false;
+                    break;
+                }
+            }
+            if (pass_all) {
+                ++it;
+            } else {
+                it = results.erase(it);
+            }
+        }
+    }
+
+    size_t ob_pos = sql_lower.find(" order by ");
+    if (ob_pos != std::string::npos) {
+        size_t ob_end = sql.length();
+        size_t lim_pos = sql_lower.find(" limit ", ob_pos);
+        if (lim_pos != std::string::npos) ob_end = lim_pos;
+        std::string ob_cols = trim_str(sql.substr(ob_pos + 10, ob_end - ob_pos - 10));
+        std::vector<OrderCol> order_cols;
+        for (auto p : split_str(ob_cols, ",")) {
+            p = trim_str(p);
+            OrderCol oc;
+            oc.is_desc = false;
+            std::string p_lower = to_lower_str(p);
+            if (p_lower.find(" desc") != std::string::npos) {
+                oc.is_desc = true;
+                p = trim_str(p.substr(0, p.length() - 5));
+            } else if (p_lower.find(" asc") != std::string::npos) {
+                p = trim_str(p.substr(0, p.length() - 4));
+            }
+            oc.col_idx = -1;
+            std::string p_col = unqualify_col_name(p);
+            for (size_t i = 0; i < agg_cols.size(); i++) {
+                if (to_lower_str(agg_cols[i].alias) == to_lower_str(p) ||
+                    to_lower_str(agg_cols[i].col_name) == to_lower_str(p) ||
+                    to_lower_str(agg_cols[i].col_name) == to_lower_str(p_col)) {
+                    oc.col_idx = static_cast<int>(i);
+                    break;
+                }
+            }
+            order_cols.push_back(oc);
+        }
+        std::sort(results.begin(), results.end(), [&](const MultiGroupResult &a, const MultiGroupResult &b) {
+            for (auto &oc : order_cols) {
+                if (oc.col_idx < 0 || oc.col_idx >= static_cast<int>(a.agg_nums.size())) continue;
+                if (a.agg_is_str[oc.col_idx] && b.agg_is_str[oc.col_idx]) {
+                    int cmp = a.agg_strs[oc.col_idx].compare(b.agg_strs[oc.col_idx]);
+                    if (cmp != 0) return oc.is_desc ? cmp > 0 : cmp < 0;
+                } else {
+                    double va = a.agg_nums[oc.col_idx], vb = b.agg_nums[oc.col_idx];
+                    if (va != vb) return oc.is_desc ? va > vb : va < vb;
+                }
+            }
+            return false;
+        });
+    }
+
+    int limit_n = -1;
+    size_t lim_pos = sql_lower.find(" limit ");
+    if (lim_pos != std::string::npos) {
+        limit_n = std::stoi(trim_str(sql.substr(lim_pos + 7)));
+    }
+    if (limit_n >= 0 && static_cast<int>(results.size()) > limit_n) {
+        results.resize(limit_n);
+    }
+    if (suppress_empty_non_count_agg) {
+        return true;
+    }
+
+    std::vector<std::string> captions;
+    for (auto &ac : agg_cols) captions.push_back(ac.alias);
+    bool write_output_file = enable_output_file.load();
+    std::fstream outfile;
+    if (write_output_file) {
+        outfile.open("output.txt", std::ios::out | std::ios::app);
+        outfile << "|";
+        for (auto &c : captions) outfile << " " << c << " |";
+        outfile << "\n";
+    }
+    RecordPrinter rec_printer(captions.size());
+    rec_printer.print_separator(context);
+    rec_printer.print_record(captions, context);
+    rec_printer.print_separator(context);
+    for (auto &gr : results) {
+        rec_printer.print_record(gr.agg_strs, context);
+        if (write_output_file) {
+            outfile << "|";
+            for (auto &c : gr.agg_strs) outfile << " " << c << " |";
+            outfile << "\n";
+        }
+    }
+    if (write_output_file) {
+        outfile.close();
+    }
+    rec_printer.print_separator(context);
+    return true;
+}
+
 // 计算聚合值
 static void compute_agg(AggType type, const char *data, int len, ColType col_type,
                         double &sum_val, double &min_val, double &max_val, int &count_val) {
@@ -365,6 +1112,28 @@ static void compute_agg(AggType type, const char *data, int len, ColType col_typ
     count_val++;
 }
 
+static std::string read_char_value(const char *data, int len) {
+    std::string value(data, len);
+    value.resize(strlen(value.c_str()));
+    return value;
+}
+
+static std::string compute_string_minmax(AggType type, const std::vector<std::vector<char>*> &rows,
+                                         int offset, int len) {
+    std::string result;
+    bool initialized = false;
+    for (auto row : rows) {
+        std::string value = read_char_value(row->data() + offset, len);
+        if (!initialized) {
+            result = value;
+            initialized = true;
+        } else if ((type == AGG_MIN && value < result) || (type == AGG_MAX && value > result)) {
+            result = value;
+        }
+    }
+    return result;
+}
+
 void QlManager::handle_aggregate(const std::string &sql, Context *context) {
     std::string sql_lower = to_lower_str(sql);
 
@@ -373,6 +1142,9 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
     size_t from_start = sql_lower.find(" from ");
     if (sel_start == std::string::npos || from_start == std::string::npos)
         throw InternalError("Invalid SQL");
+    if (handle_multi_table_aggregate_query(sm_manager_, sql, context)) {
+        return;
+    }
     std::string select_part = trim_str(sql.substr(sel_start + 7, from_start - sel_start - 7));
 
     // 2. 提取FROM表名
@@ -433,20 +1205,7 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
     auto eval_where = [&](RmRecord *rec) -> bool {
         if (where_clause.empty()) return true;
         std::string wc = where_clause;
-        std::vector<std::string> conds;
-        {
-            std::string wc_lower = to_lower_str(wc);
-            size_t pos = 0;
-            while (true) {
-                size_t and_pos = wc_lower.find(" and ", pos);
-                if (and_pos == std::string::npos) {
-                    conds.push_back(trim_str(wc.substr(pos)));
-                    break;
-                }
-                conds.push_back(trim_str(wc.substr(pos, and_pos - pos)));
-                pos = and_pos + 5;
-            }
-        }
+        std::vector<std::string> conds = split_conditions_by_and(wc);
         for (auto &cond : conds) {
             CompOp op;
             std::string col_name, op_str, val_str;
@@ -612,6 +1371,10 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
     RmScan scan(fh);
     while (!scan.is_end()) {
         auto rec = fh->get_record(scan.rid(), context);
+        if (rec == nullptr) {
+            scan.next();
+            continue;
+        }
         if (eval_where(rec.get())) {
             std::vector<char> row(rec->data, rec->data + fh->get_file_hdr().record_size);
             raw_records.push_back(row);
@@ -647,6 +1410,12 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
                 gr.agg_nums.push_back((double)rows.size());
                 gr.agg_is_str.push_back(false);
             } else if (ac.type == AGG_MAX || ac.type == AGG_MIN || ac.type == AGG_SUM || ac.type == AGG_AVG) {
+                if (ac.col_type == TYPE_STRING && (ac.type == AGG_MAX || ac.type == AGG_MIN)) {
+                    gr.agg_strs.push_back(compute_string_minmax(ac.type, rows, ac.col_offset, ac.col_len));
+                    gr.agg_nums.push_back(0);
+                    gr.agg_is_str.push_back(true);
+                    continue;
+                }
                 double sum_v = 0, min_v = 0, max_v = 0;
                 int cnt = 0;
                 for (auto &row : rows) {
@@ -770,45 +1539,7 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
             std::string having_clause = trim_str(sql.substr(hv_pos + 8, hv_end - hv_pos - 8));
 
             // 解析HAVING条件: agg_func(col) op value [AND ...]
-            std::vector<std::string> hv_conds;
-            {
-                std::string hc = having_clause;
-                std::string hc_lower = to_lower_str(hc);
-                size_t pos = 0;
-                while (pos < hc.length()) {
-                    size_t and_pos = std::string::npos;
-                    size_t and_len = 0;
-                    for (size_t i = pos; i < hc.length(); i++) {
-                        if (hc[i] == '(') {
-                            int pd = 1; i++;
-                            while (i < hc.length() && pd > 0) {
-                                if (hc[i] == '(') pd++;
-                                if (hc[i] == ')') pd--;
-                                i++;
-                            }
-                            if (i < hc.length()) i--;
-                            continue;
-                        }
-                        if (i + 3 > hc.length()) continue;
-                        if (hc_lower[i] != 'a' || hc_lower[i+1] != 'n' || hc_lower[i+2] != 'd') continue;
-                        // 边界检查: 前面不能是字母 (避免匹配band/brand等)
-                        bool left_ok = (i == 0 || !isalpha(hc_lower[i-1]));
-                        if (left_ok) {
-                            and_pos = i;
-                            and_len = 3;
-                            if (and_pos > 0 && hc[and_pos-1] == ' ') { and_pos--; and_len++; }
-                            if (and_pos + and_len < hc.length() && hc[and_pos+and_len] == ' ') { and_len++; }
-                            break;
-                        }
-                    }
-                    if (and_pos == std::string::npos) {
-                        hv_conds.push_back(trim_str(hc.substr(pos)));
-                        break;
-                    }
-                    hv_conds.push_back(trim_str(hc.substr(pos, and_pos - pos)));
-                    pos = and_pos + and_len;
-                }
-            }
+            std::vector<std::string> hv_conds = split_conditions_by_and(having_clause);
 
             auto it = results.begin();
             while (it != results.end()) {
@@ -873,9 +1604,16 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
                         }
                     }
 
+                    bool lhs_is_str = false;
+                    std::string lhs_str;
                     double col_val = 0;
                     if (agg_idx >= 0 && agg_idx < (int)it->agg_nums.size()) {
-                        col_val = it->agg_nums[agg_idx];
+                        if (it->agg_is_str[agg_idx]) {
+                            lhs_is_str = true;
+                            lhs_str = it->agg_strs[agg_idx];
+                        } else {
+                            col_val = it->agg_nums[agg_idx];
+                        }
                     } else {
                         // HAVING引用了SELECT中没有的聚合函数，直接从组数据计算
                         if (agg_type == AGG_COUNT_STAR || agg_type == AGG_COUNT) {
@@ -883,24 +1621,52 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
                         } else if (agg_type == AGG_MAX || agg_type == AGG_MIN ||
                                    agg_type == AGG_SUM || agg_type == AGG_AVG) {
                             auto col_it = tab.get_col(unqualify_col_name(inner_col));
-                            double sum_v = 0, min_v = 0, max_v = 0;
-                            int cnt = 0;
-                            for (auto row : it->rows) {
-                                compute_agg(agg_type, row->data() + col_it->offset, col_it->len,
-                                            col_it->type, sum_v, min_v, max_v, cnt);
+                            if (col_it->type == TYPE_STRING &&
+                                (agg_type == AGG_MAX || agg_type == AGG_MIN)) {
+                                lhs_is_str = true;
+                                lhs_str = compute_string_minmax(agg_type, it->rows, col_it->offset, col_it->len);
+                            } else {
+                                double sum_v = 0, min_v = 0, max_v = 0;
+                                int cnt = 0;
+                                for (auto row : it->rows) {
+                                    compute_agg(agg_type, row->data() + col_it->offset, col_it->len,
+                                                col_it->type, sum_v, min_v, max_v, cnt);
+                                }
+                                if (agg_type == AGG_MAX) col_val = max_v;
+                                else if (agg_type == AGG_MIN) col_val = min_v;
+                                else if (agg_type == AGG_SUM) col_val = sum_v;
+                                else col_val = cnt > 0 ? sum_v / cnt : 0;
                             }
-                            if (agg_type == AGG_MAX) col_val = max_v;
-                            else if (agg_type == AGG_MIN) col_val = min_v;
-                            else if (agg_type == AGG_SUM) col_val = sum_v;
-                            else col_val = cnt > 0 ? sum_v / cnt : 0;
+                        } else if (agg_type == AGG_NONE) {
+                            auto col_it = tab.get_col(unqualify_col_name(left_expr));
+                            int col_idx = col_it - tab.cols.begin();
+                            bool in_group = false;
+                            for (int gi : group_col_idxs) {
+                                if (gi == col_idx) {
+                                    in_group = true;
+                                    break;
+                                }
+                            }
+                            if (!in_group || it->rows.empty()) {
+                                pass_all = false; break;
+                            }
+                            char *data = it->rows[0]->data() + col_it->offset;
+                            if (col_it->type == TYPE_STRING) {
+                                lhs_is_str = true;
+                                lhs_str.assign(data, col_it->len);
+                                lhs_str.resize(strlen(lhs_str.c_str()));
+                            } else if (col_it->type == TYPE_INT) {
+                                col_val = *(int*)data;
+                            } else if (col_it->type == TYPE_FLOAT) {
+                                col_val = *(float*)data;
+                            }
                         } else {
                             pass_all = false; break;
                         }
                     }
-                    double cmp_val = 0;
-                    try {
-                        cmp_val = std::stod(val_str);
-                    } catch (...) { pass_all = false; break; }
+                    if (!val_str.empty() && val_str.front() == '\'' && val_str.back() == '\'') {
+                        val_str = val_str.substr(1, val_str.length() - 2);
+                    }
 
                     CompOp cop;
                     if (op_str == "=") cop = OP_EQ;
@@ -913,14 +1679,31 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
                     else { pass_all = false; break; }
 
                     bool cond_pass = false;
-                    switch (cop) {
-                        case OP_EQ: cond_pass = (col_val == cmp_val); break;
-                        case OP_NE: cond_pass = (col_val != cmp_val); break;
-                        case OP_LT: cond_pass = (col_val < cmp_val); break;
-                        case OP_GT: cond_pass = (col_val > cmp_val); break;
-                        case OP_LE: cond_pass = (col_val <= cmp_val); break;
-                        case OP_GE: cond_pass = (col_val >= cmp_val); break;
-                        default: cond_pass = true;
+                    if (lhs_is_str) {
+                        int cmp = lhs_str.compare(val_str);
+                        switch (cop) {
+                            case OP_EQ: cond_pass = (cmp == 0); break;
+                            case OP_NE: cond_pass = (cmp != 0); break;
+                            case OP_LT: cond_pass = (cmp < 0); break;
+                            case OP_GT: cond_pass = (cmp > 0); break;
+                            case OP_LE: cond_pass = (cmp <= 0); break;
+                            case OP_GE: cond_pass = (cmp >= 0); break;
+                            default: cond_pass = true;
+                        }
+                    } else {
+                        double cmp_val = 0;
+                        try {
+                            cmp_val = std::stod(val_str);
+                        } catch (...) { pass_all = false; break; }
+                        switch (cop) {
+                            case OP_EQ: cond_pass = (col_val == cmp_val); break;
+                            case OP_NE: cond_pass = (col_val != cmp_val); break;
+                            case OP_LT: cond_pass = (col_val < cmp_val); break;
+                            case OP_GT: cond_pass = (col_val > cmp_val); break;
+                            case OP_LE: cond_pass = (col_val <= cmp_val); break;
+                            case OP_GE: cond_pass = (col_val >= cmp_val); break;
+                            default: cond_pass = true;
+                        }
                     }
                     if (!cond_pass) { pass_all = false; break; }
                 }
@@ -980,11 +1763,75 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
                         }
                     }
                 }
+                if (oc.col_idx == -1) {
+                    std::string order_inner_col;
+                    AggType order_agg = parse_agg_func(p, order_inner_col);
+                    for (size_t i = 0; i < agg_cols.size(); i++) {
+                        if (agg_cols[i].type != order_agg) {
+                            continue;
+                        }
+                        if ((order_agg == AGG_COUNT_STAR && order_inner_col == "*") ||
+                            (order_agg != AGG_NONE && agg_cols[i].col_name == order_inner_col)) {
+                            oc.col_idx = i;
+                            break;
+                        }
+                    }
+                    if (oc.col_idx == -1 && order_agg != AGG_NONE) {
+                        oc.is_extra_agg = true;
+                        oc.agg_type = order_agg;
+                        oc.agg_col_name = order_inner_col;
+                    }
+                }
                 order_cols.push_back(oc);
             }
+            auto eval_extra_agg_order = [&](const GroupResult &gr, const OrderCol &oc) {
+                if (oc.agg_type == AGG_COUNT_STAR || oc.agg_type == AGG_COUNT) {
+                    return static_cast<double>(gr.count);
+                }
+                auto col_it = tab.get_col(unqualify_col_name(oc.agg_col_name));
+                double sum_v = 0, min_v = 0, max_v = 0;
+                int cnt = 0;
+                for (auto row : gr.rows) {
+                    compute_agg(oc.agg_type, row->data() + col_it->offset, col_it->len,
+                                col_it->type, sum_v, min_v, max_v, cnt);
+                }
+                if (oc.agg_type == AGG_MAX) return max_v;
+                if (oc.agg_type == AGG_MIN) return min_v;
+                if (oc.agg_type == AGG_SUM) return sum_v;
+                if (oc.agg_type == AGG_AVG) return cnt > 0 ? sum_v / cnt : 0;
+                return 0.0;
+            };
+            auto extra_agg_order_is_string = [&](const OrderCol &oc) {
+                if (!oc.is_extra_agg || (oc.agg_type != AGG_MAX && oc.agg_type != AGG_MIN)) {
+                    return false;
+                }
+                auto col_it = tab.get_col(unqualify_col_name(oc.agg_col_name));
+                return col_it->type == TYPE_STRING;
+            };
+            auto eval_extra_agg_order_str = [&](const GroupResult &gr, const OrderCol &oc) {
+                auto col_it = tab.get_col(unqualify_col_name(oc.agg_col_name));
+                return compute_string_minmax(oc.agg_type, gr.rows, col_it->offset, col_it->len);
+            };
             std::sort(results.begin(), results.end(), [&](const GroupResult &a, const GroupResult &b) {
                 for (auto &oc : order_cols) {
-                    if (oc.col_idx < 0 || oc.col_idx >= (int)a.agg_nums.size()) continue;
+                    if (oc.col_idx < 0 || oc.col_idx >= (int)a.agg_nums.size()) {
+                        if (!oc.is_extra_agg) continue;
+                        if (extra_agg_order_is_string(oc)) {
+                            std::string va = eval_extra_agg_order_str(a, oc);
+                            std::string vb = eval_extra_agg_order_str(b, oc);
+                            int cmp = va.compare(vb);
+                            if (cmp != 0) {
+                                return oc.is_desc ? (cmp > 0) : (cmp < 0);
+                            }
+                            continue;
+                        }
+                        double va = eval_extra_agg_order(a, oc);
+                        double vb = eval_extra_agg_order(b, oc);
+                        if (va != vb) {
+                            return oc.is_desc ? (va > vb) : (va < vb);
+                        }
+                        continue;
+                    }
                     if (a.agg_is_str[oc.col_idx] && b.agg_is_str[oc.col_idx]) {
                         // 字符串比较
                         int cmp = a.agg_strs[oc.col_idx].compare(b.agg_strs[oc.col_idx]);
@@ -1059,13 +1906,6 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
     rec_printer.print_separator(context);
 }
 
-// 执行一个SELECT子查询，返回结果行（每行是字符串向量）和列元数据
-struct SubQueryResult {
-    std::vector<std::vector<std::string>> rows;
-    std::vector<ColMeta> cols;
-    std::vector<std::string> col_names;
-};
-
 // 递归构建执行器
 static std::unique_ptr<AbstractExecutor> build_executor_tree(SmManager *sm_manager, std::shared_ptr<Plan> plan, Context *context) {
     if (auto x = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
@@ -1093,7 +1933,19 @@ static SubQueryResult execute_sub_select(SmManager *sm_manager, const std::strin
     ast::parse_tree = nullptr;
     std::string sql_with_semi = select_sql;
     if (!sql_with_semi.empty() && sql_with_semi.back() != ';') sql_with_semi += ';';
-    YY_BUFFER_STATE buf = yy_scan_string(sql_with_semi.c_str());
+    auto rewrite_result = rewrite_sql_for_parser(sql_with_semi);
+    SmTableAliasGuard alias_guard(sm_manager, rewrite_result.query_aliases);
+    std::string processed_sql = expand_qualified_stars(
+        rewrite_result.sql,
+        [&](const std::string &tab_name) {
+            std::vector<std::string> col_names;
+            for (auto &col : sm_manager->get_query_cols(tab_name)) {
+                col_names.push_back(col.name);
+            }
+            return col_names;
+        });
+    processed_sql = strip_select_aliases_for_parser(processed_sql);
+    YY_BUFFER_STATE buf = yy_scan_string(processed_sql.c_str());
     int parse_ok = yyparse();
     yy_delete_buffer(buf);
 
@@ -1123,6 +1975,7 @@ static SubQueryResult execute_sub_select(SmManager *sm_manager, const std::strin
     for (auto &col : executor_cols) {
         result.col_names.push_back(col.name);
         ColMeta cm;
+        cm.tab_name = col.tab_name;
         cm.name = col.name;
         cm.type = col.type;
         cm.len = col.len;

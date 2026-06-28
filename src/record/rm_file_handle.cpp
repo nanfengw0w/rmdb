@@ -43,6 +43,20 @@ std::unique_ptr<RmRecord> RmFileHandle::get_record(const Rid& rid, Context* cont
                 return std::make_unique<RmRecord>(*result);
             }
             // vis == -1，从磁盘读取最新数据
+        } else if (level == IsolationLevel::READ_COMMITTED) {
+            auto& vm = VersionManager::instance();
+            bool is_deleted = false;
+            RmRecord* result = nullptr;
+            int vis = vm.get_read_committed_data(fd_, rid, result, is_deleted);
+
+            if (vis == 0) {
+                return nullptr;
+            } else if (vis == 1) {
+                if (is_deleted) {
+                    return nullptr;
+                }
+                return std::make_unique<RmRecord>(*result);
+            }
         }
     }
 
