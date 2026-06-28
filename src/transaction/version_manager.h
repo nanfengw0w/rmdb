@@ -275,29 +275,38 @@ public:
             return -1;
         }
 
+        bool has_uncommitted_before_image = false;
+        bool uncommitted_before_deleted = false;
+        RmRecord* uncommitted_before_data = nullptr;
+
         for (auto rit = it->second.rbegin(); rit != it->second.rend(); ++rit) {
             auto& entry = *rit;
 
             if (entry.commit_ts_ == 0) {
-                if (entry.is_deleted_) {
-                    is_deleted = true;
-                    result = nullptr;
-                    return 0;
-                }
-                is_deleted = false;
-                result = entry.old_data_.get();
-                return 1;
+                has_uncommitted_before_image = true;
+                uncommitted_before_deleted = entry.is_deleted_;
+                uncommitted_before_data = entry.old_data_.get();
+                continue;
             }
 
-            if (entry.new_deleted_) {
+            if (!has_uncommitted_before_image && entry.new_deleted_) {
                 is_deleted = true;
                 result = nullptr;
                 return 0;
             }
 
+            break;
+        }
+
+        if (has_uncommitted_before_image) {
+            if (uncommitted_before_deleted) {
+                is_deleted = true;
+                result = nullptr;
+                return 0;
+            }
             is_deleted = false;
-            result = nullptr;
-            return -1;
+            result = uncommitted_before_data;
+            return 1;
         }
 
         is_deleted = false;
