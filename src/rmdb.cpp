@@ -407,6 +407,7 @@ auto ix_manager = std::make_unique<IxManager>(disk_manager.get(), buffer_pool_ma
 auto sm_manager = std::make_unique<SmManager>(disk_manager.get(), buffer_pool_manager.get(), rm_manager.get(), ix_manager.get());
 auto lock_manager = std::make_unique<LockManager>();
 auto txn_manager = std::make_unique<TransactionManager>(lock_manager.get(), sm_manager.get());
+
 TransactionManager* g_txn_manager = txn_manager.get();
 auto planner = std::make_unique<Planner>(sm_manager.get());
 auto optimizer = std::make_unique<Optimizer>(sm_manager.get(), planner.get());
