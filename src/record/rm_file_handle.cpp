@@ -29,7 +29,7 @@ std::unique_ptr<RmRecord> RmFileHandle::get_record(const Rid& rid, Context* cont
         if (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE) {
             auto& vm = VersionManager::instance();
             bool is_deleted = false;
-            RmRecord* result = nullptr;
+            std::unique_ptr<RmRecord> result;
             int vis = vm.get_visible_data(fd_, rid, context->txn_, result, is_deleted);
 
             if (vis == 0) {
@@ -40,13 +40,13 @@ std::unique_ptr<RmRecord> RmFileHandle::get_record(const Rid& rid, Context* cont
                 if (is_deleted) {
                     return nullptr;
                 }
-                return std::make_unique<RmRecord>(*result);
+                return result;
             }
             // vis == -1，从磁盘读取最新数据
         } else if (level == IsolationLevel::READ_COMMITTED) {
             auto& vm = VersionManager::instance();
             bool is_deleted = false;
-            RmRecord* result = nullptr;
+            std::unique_ptr<RmRecord> result;
             int vis = vm.get_read_committed_data(fd_, rid, result, is_deleted);
 
             if (vis == 0) {
@@ -55,7 +55,7 @@ std::unique_ptr<RmRecord> RmFileHandle::get_record(const Rid& rid, Context* cont
                 if (is_deleted) {
                     return nullptr;
                 }
-                return std::make_unique<RmRecord>(*result);
+                return result;
             }
         }
     }
@@ -73,14 +73,11 @@ Rid RmFileHandle::insert_record(char* buf, Context* context) {
     int page_no = page_handle.page->get_page_id().page_no;
     Rid rid{page_no, slot_no};
 
-    // MVCC: 必须在设置bitmap之前创建版本链条目
-    // 否则在bitmap设置后、版本链创建前的窗口期，其他事务会读到未提交的插入数据
+    // MVCC: 必须在设置bitmap之前创建版本链条目。所有事务都写版本，
+    // 否则 SI 长事务会被并发 autocommit 写破坏快照重构。
     if (context != nullptr && context->txn_ != nullptr) {
-        IsolationLevel level = context->txn_->get_isolation_level();
-        if (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE) {
-            auto& vm = VersionManager::instance();
-            vm.save_old_data(fd_, rid, context->txn_, nullptr, true);  // 之前不存在
-        }
+        auto& vm = VersionManager::instance();
+        vm.save_old_data(fd_, rid, context->txn_, nullptr, true);  // 之前不存在
     }
 
     Bitmap::set(page_handle.bitmap, slot_no);
@@ -121,23 +118,21 @@ void RmFileHandle::delete_record(const Rid& rid, Context* context) {
     }
 
     bool mvcc_delete = false;
-    // MVCC: 检查写写冲突并保存旧数据
+    // MVCC: 检查写写冲突并保存旧数据。READ_COMMITTED 写也保留版本，
+    // 以支持并发 SI 事务重构旧快照。
     if (context != nullptr && context->txn_ != nullptr) {
-        IsolationLevel level = context->txn_->get_isolation_level();
-        if (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE) {
-            mvcc_delete = true;
-            auto& vm = VersionManager::instance();
+        mvcc_delete = true;
+        auto& vm = VersionManager::instance();
 
-            if (!vm.check_write_conflict(fd_, rid, context->txn_)) {
-                buffer_pool_manager_->unpin_page(PageId{fd_, rid.page_no}, false);
-                throw TransactionAbortException(context->txn_->get_transaction_id(),
-                    AbortReason::DEADLOCK_PREVENTION);
-            }
-
-            // 保存旧数据
-            RmRecord old_data(file_hdr_.record_size, page_handle.get_slot(rid.slot_no));
-            vm.save_old_data(fd_, rid, context->txn_, &old_data, false, true);
+        if (!vm.check_write_conflict(fd_, rid, context->txn_)) {
+            buffer_pool_manager_->unpin_page(PageId{fd_, rid.page_no}, false);
+            throw TransactionAbortException(context->txn_->get_transaction_id(),
+                AbortReason::DEADLOCK_PREVENTION);
         }
+
+        // 保存旧数据
+        RmRecord old_data(file_hdr_.record_size, page_handle.get_slot(rid.slot_no));
+        vm.save_old_data(fd_, rid, context->txn_, &old_data, false, true);
     }
 
     if (mvcc_delete) {
@@ -167,22 +162,20 @@ void RmFileHandle::update_record(const Rid& rid, char* buf, Context* context) {
         throw RecordNotFoundError(rid.page_no, rid.slot_no);
     }
 
-    // MVCC: 检查写写冲突并保存旧数据
+    // MVCC: 检查写写冲突并保存旧数据。READ_COMMITTED 写也保留版本，
+    // 以支持并发 SI 事务重构旧快照。
     if (context != nullptr && context->txn_ != nullptr) {
-        IsolationLevel level = context->txn_->get_isolation_level();
-        if (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE) {
-            auto& vm = VersionManager::instance();
+        auto& vm = VersionManager::instance();
 
-            if (!vm.check_write_conflict(fd_, rid, context->txn_)) {
-                buffer_pool_manager_->unpin_page(PageId{fd_, rid.page_no}, false);
-                throw TransactionAbortException(context->txn_->get_transaction_id(),
-                    AbortReason::DEADLOCK_PREVENTION);
-            }
-
-            // 保存旧数据
-            RmRecord old_data(file_hdr_.record_size, page_handle.get_slot(rid.slot_no));
-            vm.save_old_data(fd_, rid, context->txn_, &old_data, false);
+        if (!vm.check_write_conflict(fd_, rid, context->txn_)) {
+            buffer_pool_manager_->unpin_page(PageId{fd_, rid.page_no}, false);
+            throw TransactionAbortException(context->txn_->get_transaction_id(),
+                AbortReason::DEADLOCK_PREVENTION);
         }
+
+        // 保存旧数据
+        RmRecord old_data(file_hdr_.record_size, page_handle.get_slot(rid.slot_no));
+        vm.save_old_data(fd_, rid, context->txn_, &old_data, false);
     }
 
     memcpy(page_handle.get_slot(rid.slot_no), buf, file_hdr_.record_size);
