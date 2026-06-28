@@ -96,6 +96,35 @@ inline void check_logical_key_write_conflict(SmManager *sm_manager, const TabMet
     auto fh = sm_manager->get_table_fh(tab_name);
     auto &vm = VersionManager::instance();
 
+    // 优化：如果第一列有索引，使用索引查找匹配记录，避免全表扫描
+    for (const auto &index : tab.indexes) {
+        if (index.cols.empty()) continue;
+        if (index.cols[0].name != key_col.name || index.cols[0].tab_name != key_col.tab_name) {
+            continue;
+        }
+
+        auto ih = get_index_handle(sm_manager, tab_name, index);
+        if (ih == nullptr) continue;
+
+        std::vector<char> index_key(index.col_tot_len, 0);
+        memcpy(index_key.data(), key, key_col.len);
+
+        std::vector<Rid> result;
+        if (ih->get_value(index_key.data(), &result, nullptr)) {
+            for (const auto &rid : result) {
+                if (self.has_value() && same_rid(rid, *self)) {
+                    continue;
+                }
+                if (!vm.check_write_conflict(fh->GetFd(), rid, context->txn_)) {
+                    throw TransactionAbortException(context->txn_->get_transaction_id(),
+                        AbortReason::DEADLOCK_PREVENTION);
+                }
+            }
+        }
+        return;
+    }
+
+    // 无索引时回退到全表扫描
     RmScan scan(fh);
     while (!scan.is_end()) {
         Rid rid = scan.rid();
