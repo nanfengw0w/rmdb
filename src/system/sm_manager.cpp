@@ -15,7 +15,6 @@ See the Mulan PSL v2 for more details. */
 
 #include <fstream>
 
-#include "common/config.h"
 #include "index/ix.h"
 #include "record/rm.h"
 #include "record_printer.h"
@@ -191,12 +190,9 @@ void SmManager::close_db() {
  * @param {Context*} context 
  */
 void SmManager::show_tables(Context* context) {
-    bool write_output_file = enable_output_file.load();
     std::fstream outfile;
-    if (write_output_file) {
-        outfile.open("output.txt", std::ios::out | std::ios::app);
-        outfile << "| Tables |\n";
-    }
+    outfile.open("output.txt", std::ios::out | std::ios::app);
+    outfile << "| Tables |\n";
     RecordPrinter printer(1);
     printer.print_separator(context);
     printer.print_record({"Tables"}, context);
@@ -204,14 +200,10 @@ void SmManager::show_tables(Context* context) {
     for (auto &entry : db_.tabs_) {
         auto &tab = entry.second;
         printer.print_record({tab.name}, context);
-        if (write_output_file) {
-            outfile << "| " << tab.name << " |\n";
-        }
+        outfile << "| " << tab.name << " |\n";
     }
     printer.print_separator(context);
-    if (write_output_file) {
-        outfile.close();
-    }
+    outfile.close();
 }
 
 /**
@@ -221,11 +213,8 @@ void SmManager::show_tables(Context* context) {
  */
 void SmManager::show_index(const std::string& tab_name, Context* context) {
     TabMeta &tab = db_.get_table(tab_name);
-    bool write_output_file = enable_output_file.load();
     std::fstream outfile;
-    if (write_output_file) {
-        outfile.open("output.txt", std::ios::out | std::ios::app);
-    }
+    outfile.open("output.txt", std::ios::out | std::ios::app);
     for (auto &index : tab.indexes) {
         std::string col_str = "(";
         for (int i = 0; i < index.col_num; i++) {
@@ -234,13 +223,9 @@ void SmManager::show_index(const std::string& tab_name, Context* context) {
         }
         col_str += ")";
         std::string line = "| " + tab_name + " | unique | " + col_str + " |";
-        if (write_output_file) {
-            outfile << line << "\n";
-        }
+        outfile << line << "\n";
     }
-    if (write_output_file) {
-        outfile.close();
-    }
+    outfile.close();
 }
 
 void SmManager::desc_table(const std::string& tab_name, Context* context) {

@@ -15,18 +15,11 @@ See the Mulan PSL v2 for more details. */
 #include <algorithm>
 #include <atomic>
 #include <cctype>
-#include <cstring>
-#include <deque>
-#include <fstream>
-#include <iostream>
 #include <memory>
 #include <sstream>
-#include <stdexcept>
 
 #include "errors.h"
-#include "common/config.h"
 #include "common/sql_rewrite.h"
-#include "execution/index_maintenance.h"
 #include "optimizer/optimizer.h"
 #include "recovery/log_recovery.h"
 #include "optimizer/plan.h"
@@ -38,17 +31,6 @@ See the Mulan PSL v2 for more details. */
 #define MAX_CONN_LIMIT 8
 
 static bool should_exit = false;
-std::atomic<bool> enable_output_file{true};
-
-static void append_output_line(const std::string &line) {
-    if (!enable_output_file.load()) {
-        return;
-    }
-    std::fstream outfile;
-    outfile.open("output.txt", std::ios::out | std::ios::app);
-    outfile << line;
-    outfile.close();
-}
 
 static void set_response(char *data_send, int *offset, const std::string &msg) {
     if (data_send == nullptr || offset == nullptr) {
@@ -89,31 +71,6 @@ static std::string strip_sql_line_comments(const std::string &sql) {
 
 static bool is_blank_sql(const std::string &sql) {
     return sql.find_first_not_of(" \t\r\n;") == std::string::npos;
-}
-
-static std::vector<std::string> split_sql_requests(const std::string &sql) {
-    std::vector<std::string> requests;
-    bool in_string = false;
-    size_t start = 0;
-    for (size_t i = 0; i < sql.size(); ++i) {
-        if (sql[i] == '\'') {
-            in_string = !in_string;
-            continue;
-        }
-        if (!in_string && sql[i] == ';') {
-            std::string part = sql.substr(start, i - start + 1);
-            if (!is_blank_sql(part)) {
-                requests.push_back(part);
-            }
-            start = i + 1;
-        }
-    }
-
-    std::string tail = sql.substr(start);
-    if (!is_blank_sql(tail)) {
-        requests.push_back(tail);
-    }
-    return requests;
 }
 
 static std::string trim_local(std::string s) {
@@ -204,85 +161,6 @@ static std::string value_to_update_sql_local(const Value &value) {
     return std::to_string(value.int_val);
 }
 
-static bool parse_lhs_arithmetic_terms_local(const std::string &rhs, const std::string &lhs,
-                                             std::vector<std::pair<ArithOp, Value>> &terms) {
-    terms.clear();
-
-    std::string rhs_lower = lower_local(rhs);
-    std::string lhs_lower = lower_local(lhs);
-    size_t pos = 0;
-    while (pos < rhs_lower.size() && std::isspace(static_cast<unsigned char>(rhs_lower[pos]))) {
-        pos++;
-    }
-
-    if (rhs_lower.compare(pos, lhs_lower.size(), lhs_lower) != 0) {
-        return false;
-    }
-    pos += lhs_lower.size();
-    if (pos < rhs_lower.size() &&
-        (std::isalnum(static_cast<unsigned char>(rhs_lower[pos])) || rhs_lower[pos] == '_')) {
-        return false;
-    }
-
-    while (true) {
-        while (pos < rhs.size() && std::isspace(static_cast<unsigned char>(rhs[pos]))) {
-            pos++;
-        }
-        if (pos == rhs.size()) {
-            break;
-        }
-
-        char op_char = rhs[pos];
-        if (op_char != '+' && op_char != '-' && op_char != '*' && op_char != '/') {
-            return false;
-        }
-        pos++;
-
-        while (pos < rhs.size() && std::isspace(static_cast<unsigned char>(rhs[pos]))) {
-            pos++;
-        }
-        size_t value_start = pos;
-        bool in_string = false;
-        while (pos < rhs.size()) {
-            char ch = rhs[pos];
-            if (ch == '\'') {
-                in_string = !in_string;
-                pos++;
-                continue;
-            }
-            if (!in_string && (ch == '+' || ch == '-' || ch == '*' || ch == '/') && pos > value_start) {
-                char prev = rhs[pos - 1];
-                if ((ch == '+' || ch == '-') && (prev == 'e' || prev == 'E')) {
-                    pos++;
-                    continue;
-                }
-                break;
-            }
-            pos++;
-        }
-
-        std::string value_text = trim_local(rhs.substr(value_start, pos - value_start));
-        if (value_text.empty()) {
-            return false;
-        }
-
-        Value value;
-        if (!parse_literal_local(value_text, value)) {
-            return false;
-        }
-        if (value.type != TYPE_INT && value.type != TYPE_FLOAT) {
-            return false;
-        }
-
-        ArithOp op = op_char == '+' ? ArithOp::ADD :
-                     op_char == '-' ? ArithOp::SUB :
-                     op_char == '*' ? ArithOp::MUL : ArithOp::DIV;
-        terms.emplace_back(op, std::move(value));
-    }
-
-    return !terms.empty();
-}
-
 static bool try_parse_arithmetic_update(const std::string &sql, std::string &dummy_sql,
                                         std::vector<SetClause> &set_clauses) {
     std::string raw = trim_local(sql);
@@ -317,27 +195,7 @@ static bool try_parse_arithmetic_update(const std::string &sql, std::string &dum
         if (eq_pos == std::string::npos) {
             return false;
         }
-        bool compound_assignment = false;
-        ArithOp compound_op = ArithOp::NO_OP;
-        size_t lhs_end = eq_pos;
-        if (eq_pos > 0) {
-            size_t op_pos = eq_pos;
-            while (op_pos > 0 && std::isspace(static_cast<unsigned char>(assignment[op_pos - 1]))) {
-                op_pos--;
-            }
-            if (op_pos > 0) {
-                char op_ch = assignment[op_pos - 1];
-                if (op_ch == '+' || op_ch == '-' || op_ch == '*' || op_ch == '/') {
-                    compound_assignment = true;
-                    compound_op = op_ch == '+' ? ArithOp::ADD :
-                                  op_ch == '-' ? ArithOp::SUB :
-                                  op_ch == '*' ? ArithOp::MUL : ArithOp::DIV;
-                    lhs_end = op_pos - 1;
-                }
-            }
-        }
-
-        std::string lhs = trim_local(assignment.substr(0, lhs_end));
+        std::string lhs = trim_local(assignment.substr(0, eq_pos));
         std::string rhs = trim_local(assignment.substr(eq_pos + 1));
         if (lhs.empty() || rhs.empty()) {
             return false;
@@ -347,38 +205,42 @@ static bool try_parse_arithmetic_update(const std::string &sql, std::string &dum
         clause.lhs = {.tab_name = tab_name, .col_name = lhs};
         clause.op = ArithOp::NO_OP;
 
-        bool parsed_arith = false;
-        if (compound_assignment) {
-            if (!parse_literal_local(rhs, clause.rhs)) {
-                return false;
-            }
-            if (clause.rhs.type != TYPE_INT && clause.rhs.type != TYPE_FLOAT) {
-                return false;
-            }
-            clause.op = compound_op;
-            parsed.push_back(clause);
-            has_arith = true;
-            parsed_arith = true;
+        std::string rhs_lower = lower_local(rhs);
+        std::string lhs_lower = lower_local(lhs);
+        size_t pos = 0;
+        while (pos < rhs_lower.size() && std::isspace(static_cast<unsigned char>(rhs_lower[pos]))) {
+            pos++;
         }
-
-        std::vector<std::pair<ArithOp, Value>> arithmetic_terms;
-        if (!parsed_arith && parse_lhs_arithmetic_terms_local(rhs, lhs, arithmetic_terms)) {
-            for (auto &term : arithmetic_terms) {
-                SetClause arithmetic_clause = clause;
-                arithmetic_clause.op = term.first;
-                arithmetic_clause.rhs = std::move(term.second);
-                parsed.push_back(std::move(arithmetic_clause));
+        bool parsed_arith = false;
+        if (rhs_lower.compare(pos, lhs_lower.size(), lhs_lower) == 0) {
+            size_t op_pos = pos + lhs_lower.size();
+            while (op_pos < rhs_lower.size() && std::isspace(static_cast<unsigned char>(rhs_lower[op_pos]))) {
+                op_pos++;
             }
-            has_arith = true;
-            parsed_arith = true;
+            if (op_pos < rhs_lower.size()) {
+                char op = rhs_lower[op_pos];
+                if (op == '+' || op == '-' || op == '*' || op == '/') {
+                    std::string val_text = trim_local(rhs.substr(op_pos + 1));
+                    if (parse_literal_local(val_text, clause.rhs)) {
+                        if (clause.rhs.type != TYPE_INT && clause.rhs.type != TYPE_FLOAT) {
+                            return false;
+                        }
+                        clause.op = op == '+' ? ArithOp::ADD :
+                                    op == '-' ? ArithOp::SUB :
+                                    op == '*' ? ArithOp::MUL : ArithOp::DIV;
+                        has_arith = true;
+                        parsed_arith = true;
+                    }
+                }
+            }
         }
 
         if (!parsed_arith) {
             if (!parse_literal_local(rhs, clause.rhs)) {
                 return false;
             }
-            parsed.push_back(clause);
         }
+        parsed.push_back(clause);
         dummy_assigns.push_back(lhs + "=" + (parsed_arith ? "0" : value_to_update_sql_local(clause.rhs)));
     }
 
@@ -582,183 +444,6 @@ static void execute_fast_insert_direct(const std::string &tab_name, std::vector<
     }
 }
 
-static bool try_parse_load_command_local(const std::string &sql, std::string &file_name,
-                                         std::string &tab_name) {
-    std::string raw = trim_local(sql);
-    while (!raw.empty() && raw.back() == ';') {
-        raw.pop_back();
-        raw = trim_local(raw);
-    }
-
-    std::string lower = lower_local(raw);
-    const std::string prefix = "load ";
-    if (lower.rfind(prefix, 0) != 0) {
-        return false;
-    }
-
-    size_t into_pos = find_keyword_local(lower, " into ", prefix.size());
-    if (into_pos == std::string::npos) {
-        return false;
-    }
-
-    file_name = trim_local(raw.substr(prefix.size(), into_pos - prefix.size()));
-    tab_name = trim_local(raw.substr(into_pos + 6));
-    if (file_name.size() >= 2 &&
-        ((file_name.front() == '\'' && file_name.back() == '\'') ||
-         (file_name.front() == '"' && file_name.back() == '"'))) {
-        file_name = file_name.substr(1, file_name.size() - 2);
-    }
-    return !file_name.empty() && !tab_name.empty();
-}
-
-static std::string strip_csv_quotes_local(std::string value) {
-    value = trim_local(std::move(value));
-    if (value.size() >= 2 &&
-        ((value.front() == '\'' && value.back() == '\'') ||
-         (value.front() == '"' && value.back() == '"'))) {
-        return value.substr(1, value.size() - 2);
-    }
-    return value;
-}
-
-static int parse_int_csv_local(const std::string &text) {
-    std::string value = trim_local(text);
-    size_t consumed = 0;
-    int result = std::stoi(value, &consumed);
-    if (consumed != value.size()) {
-        throw RMDBError("Invalid integer value in load file");
-    }
-    return result;
-}
-
-static float parse_float_csv_local(const std::string &text) {
-    std::string value = trim_local(text);
-    size_t consumed = 0;
-    float result = std::stof(value, &consumed);
-    if (consumed != value.size()) {
-        throw RMDBError("Invalid float value in load file");
-    }
-    return result;
-}
-
-static void fill_record_from_csv_tokens_local(const TabMeta &tab, const std::vector<std::string> &tokens,
-                                              RmRecord &rec) {
-    if (tokens.size() != tab.cols.size()) {
-        throw InvalidValueCountError();
-    }
-    memset(rec.data, 0, rec.size);
-    for (size_t i = 0; i < tab.cols.size(); ++i) {
-        const auto &col = tab.cols[i];
-        char *dst = rec.data + col.offset;
-        if (col.type == TYPE_INT) {
-            *reinterpret_cast<int *>(dst) = parse_int_csv_local(tokens[i]);
-        } else if (col.type == TYPE_FLOAT) {
-            *reinterpret_cast<float *>(dst) = parse_float_csv_local(tokens[i]);
-        } else if (col.type == TYPE_STRING) {
-            std::string value = strip_csv_quotes_local(tokens[i]);
-            if (col.len < static_cast<int>(value.size())) {
-                throw StringOverflowError();
-            }
-            memset(dst, 0, col.len);
-            memcpy(dst, value.data(), value.size());
-        } else {
-            throw InternalError("Unexpected field type");
-        }
-    }
-}
-
-static void flush_loaded_table_local(const std::string &tab_name) {
-    auto fh = sm_manager->fhs_.at(tab_name).get();
-    int table_fd = fh->GetFd();
-    disk_manager->write_page(table_fd, RM_FILE_HDR_PAGE,
-                             reinterpret_cast<const char *>(&fh->get_file_hdr_ref()), sizeof(RmFileHdr));
-    buffer_pool_manager->flush_all_pages(table_fd);
-
-    TabMeta &tab = sm_manager->db_.get_table(tab_name);
-    for (const auto &index : tab.indexes) {
-        auto ix_name = sm_manager->get_ix_manager()->get_index_name(tab_name, index.cols);
-        auto ih = sm_manager->ihs_.at(ix_name).get();
-        ih->flush_file_header();
-        buffer_pool_manager->flush_all_pages(ih->GetFd());
-    }
-    sm_manager->flush_meta();
-    log_manager->flush_log_to_disk();
-}
-
-static size_t execute_load_file_direct(const std::string &file_name, const std::string &tab_name) {
-    TabMeta &tab = sm_manager->db_.get_table(tab_name);
-    RmFileHandle *fh = sm_manager->fhs_.at(tab_name).get();
-
-    std::ifstream input(file_name);
-    if (!input.is_open()) {
-        throw RMDBError("Cannot open load file: " + file_name);
-    }
-
-    std::string line;
-    std::getline(input, line);  // header
-    size_t loaded_rows = 0;
-    while (std::getline(input, line)) {
-        if (!line.empty() && line.back() == '\r') {
-            line.pop_back();
-        }
-        if (trim_local(line).empty()) {
-            continue;
-        }
-
-        std::vector<std::string> tokens = split_commas_local(line);
-        RmRecord rec(fh->get_file_hdr().record_size);
-        fill_record_from_csv_tokens_local(tab, tokens, rec);
-
-        std::vector<std::vector<char>> index_keys;
-        index_keys.reserve(tab.indexes.size());
-        for (const auto &index : tab.indexes) {
-            auto key = index_maintenance::build_key(index, rec.data);
-            index_maintenance::check_unique_conflict(sm_manager.get(), tab_name, index, key.data(),
-                                                     std::nullopt, nullptr);
-            index_keys.emplace_back(std::move(key));
-        }
-
-        Rid rid = fh->insert_record(rec.data, nullptr);
-        for (size_t i = 0; i < tab.indexes.size(); ++i) {
-            auto ih = index_maintenance::get_index_handle(sm_manager.get(), tab_name, tab.indexes[i]);
-            ih->insert_entry(index_keys[i].data(), rid, nullptr);
-        }
-        loaded_rows++;
-    }
-
-    flush_loaded_table_local(tab_name);
-    return loaded_rows;
-}
-
-static bool try_handle_load_command(const std::string &sql, char *data_send, int *offset, int fd) {
-    std::string file_name;
-    std::string tab_name;
-    if (!try_parse_load_command_local(sql, file_name, tab_name)) {
-        return false;
-    }
-
-    memset(data_send, '\0', BUFFER_LENGTH);
-    *offset = 0;
-    try {
-        execute_load_file_direct(file_name, tab_name);
-    } catch (RMDBError &e) {
-        std::cerr << e.what() << std::endl;
-        set_response(data_send, offset, std::string(e.what()) + "\n");
-        append_output_line("failure\n");
-    } catch (std::exception &e) {
-        std::cerr << "Load error: " << e.what() << std::endl;
-        set_response(data_send, offset, std::string("Error: ") + e.what() + "\n");
-        append_output_line("failure\n");
-    } catch (...) {
-        std::cerr << "Unknown load error" << std::endl;
-        set_response(data_send, offset, "Error: Unknown error\n");
-        append_output_line("failure\n");
-    }
-
-    write(fd, data_send, *offset + 1);
-    return true;
-}
-
 static void clear_fast_autocommit_state(Transaction *txn) {
     if (txn == nullptr || txn->get_txn_mode() ||
         txn->get_state() != TransactionState::COMMITTED ||
@@ -773,30 +458,8 @@ static void clear_fast_autocommit_state(Transaction *txn) {
     write_set->clear();
 }
 
-static void abort_active_transaction(Context *context) {
-    if (context == nullptr || context->txn_ == nullptr) {
-        return;
-    }
-    auto state = context->txn_->get_state();
-    if (state == TransactionState::COMMITTED || state == TransactionState::ABORTED) {
-        return;
-    }
-    txn_manager->abort(context->txn_, context->log_mgr_);
-}
-
-static bool is_explicit_active_txn(Context *context) {
-    return context != nullptr && context->txn_ != nullptr && context->txn_->get_txn_mode();
-}
-
-static void mark_failed_if_explicit(Context *context, bool *txn_failed) {
-    if (txn_failed != nullptr && is_explicit_active_txn(context)) {
-        *txn_failed = true;
-    }
-}
-
 static bool try_handle_fast_insert(const std::string &sql, txn_id_t *txn_id,
-                                   char *data_send, int *offset, int fd,
-                                   bool *txn_failed) {
+                                   char *data_send, int *offset, int fd) {
     std::string tab_name;
     std::vector<Value> values;
     if (!try_parse_simple_insert_local(sql, tab_name, values)) {
@@ -818,32 +481,37 @@ static bool try_handle_fast_insert(const std::string &sql, txn_id_t *txn_id,
         }
     } catch (TransactionAbortException &e) {
         set_response(data_send, offset, "abort\n");
-        mark_failed_if_explicit(context.get(), txn_failed);
         txn_manager->abort(context->txn_, log_manager.get());
         std::cout << e.GetInfo() << std::endl;
 
-        append_output_line("abort\n");
+        std::fstream outfile;
+        outfile.open("output.txt", std::ios::out | std::ios::app);
+        outfile << "abort\n";
+        outfile.close();
     } catch (RMDBError &e) {
-        mark_failed_if_explicit(context.get(), txn_failed);
-        abort_active_transaction(context.get());
         std::cerr << e.what() << std::endl;
         set_response(data_send, offset, std::string(e.what()) + "\n");
 
-        append_output_line("failure\n");
+        std::fstream outfile;
+        outfile.open("output.txt", std::ios::out | std::ios::app);
+        outfile << "failure\n";
+        outfile.close();
     } catch (std::exception &e) {
-        mark_failed_if_explicit(context.get(), txn_failed);
-        abort_active_transaction(context.get());
         std::cerr << "Standard exception: " << e.what() << std::endl;
         set_response(data_send, offset, std::string("Error: ") + e.what() + "\n");
 
-        append_output_line("failure\n");
+        std::fstream outfile;
+        outfile.open("output.txt", std::ios::out | std::ios::app);
+        outfile << "failure\n";
+        outfile.close();
     } catch (...) {
-        mark_failed_if_explicit(context.get(), txn_failed);
-        abort_active_transaction(context.get());
         std::cerr << "Unknown exception caught" << std::endl;
         set_response(data_send, offset, "Error: Unknown error\n");
 
-        append_output_line("failure\n");
+        std::fstream outfile;
+        outfile.open("output.txt", std::ios::out | std::ios::app);
+        outfile << "failure\n";
+        outfile.close();
     }
 
     write(fd, data_send, *offset + 1);
@@ -863,8 +531,6 @@ void *client_handler(void *sock_fd) {
     int offset = 0;
     // 记录客户端当前正在执行的事务ID
     txn_id_t txn_id = INVALID_TXN_ID;
-    bool txn_failed = false;
-    std::deque<std::string> pending_requests;
 
     std::string output = "establish client connection, sockfd: " + std::to_string(fd) + "\n";
     std::cout << output;
@@ -872,38 +538,29 @@ void *client_handler(void *sock_fd) {
     while (true) {
         memset(data_recv, 0, BUFFER_LENGTH);
 
-        if (pending_requests.empty()) {
-            i_recvBytes = read(fd, data_recv, BUFFER_LENGTH);
+        i_recvBytes = read(fd, data_recv, BUFFER_LENGTH);
 
-            if (i_recvBytes == 0) {
-                std::cout << "Maybe the client has closed" << std::endl;
-                break;
-            }
-            if (i_recvBytes == -1) {
-                std::cout << "Client read error!" << std::endl;
-                break;
-            }
-
-            std::string sanitized_sql = strip_sql_line_comments(std::string(data_recv));
-            auto requests = split_sql_requests(sanitized_sql);
-            if (requests.empty()) {
-                memset(data_send, '\0', BUFFER_LENGTH);
-                offset = 0;
-                if (write(fd, data_send, 1) == -1) {
-                    break;
-                }
-                continue;
-            }
-            for (auto &request : requests) {
-                pending_requests.push_back(std::move(request));
-            }
+        if (i_recvBytes == 0) {
+            std::cout << "Maybe the client has closed" << std::endl;
+            break;
         }
-
-        std::string current_sql = pending_requests.front();
-        pending_requests.pop_front();
+        if (i_recvBytes == -1) {
+            std::cout << "Client read error!" << std::endl;
+            break;
+        }
+        
+        std::string sanitized_sql = strip_sql_line_comments(std::string(data_recv));
+        if (is_blank_sql(sanitized_sql)) {
+            memset(data_send, '\0', BUFFER_LENGTH);
+            offset = 0;
+            if (write(fd, data_send, 1) == -1) {
+                break;
+            }
+            continue;
+        }
         memset(data_recv, 0, BUFFER_LENGTH);
-        size_t sanitized_len = std::min(current_sql.size(), static_cast<size_t>(BUFFER_LENGTH - 1));
-        memcpy(data_recv, current_sql.data(), sanitized_len);
+        size_t sanitized_len = std::min(sanitized_sql.size(), static_cast<size_t>(BUFFER_LENGTH - 1));
+        memcpy(data_recv, sanitized_sql.data(), sanitized_len);
 
         std::string control_cmd(data_recv);
         size_t ctrl_start = control_cmd.find_first_not_of(" \t\r\n");
@@ -923,46 +580,6 @@ void *client_handler(void *sock_fd) {
             std::cout << "Crash command received. Simulating process failure." << std::endl;
             log_manager->flush_log_to_disk();
             _exit(1);
-        }
-        if (control_cmd == "set output_file off") {
-            enable_output_file.store(false);
-            memset(data_send, '\0', BUFFER_LENGTH);
-            offset = 0;
-            if (write(fd, data_send, offset + 1) == -1) break;
-            continue;
-        }
-        if (control_cmd == "set output_file on") {
-            enable_output_file.store(true);
-            memset(data_send, '\0', BUFFER_LENGTH);
-            offset = 0;
-            if (write(fd, data_send, offset + 1) == -1) break;
-            continue;
-        }
-
-        if (txn_failed) {
-            if (control_cmd == "begin") {
-                txn_id = INVALID_TXN_ID;
-                txn_failed = false;
-            } else if (control_cmd == "abort" || control_cmd == "rollback") {
-                txn_id = INVALID_TXN_ID;
-                txn_failed = false;
-                memset(data_send, '\0', BUFFER_LENGTH);
-                offset = 0;
-                if (write(fd, data_send, offset + 1) == -1) break;
-                continue;
-            } else if (control_cmd == "commit") {
-                txn_id = INVALID_TXN_ID;
-                txn_failed = false;
-                set_response(data_send, &offset, "abort\n");
-                append_output_line("abort\n");
-                if (write(fd, data_send, offset + 1) == -1) break;
-                continue;
-            } else {
-                set_response(data_send, &offset, "abort\n");
-                append_output_line("abort\n");
-                if (write(fd, data_send, offset + 1) == -1) break;
-                continue;
-            }
         }
 
         // Handle create static_checkpoint
@@ -995,17 +612,8 @@ void *client_handler(void *sock_fd) {
 
                     // (3) Flush all dirty pages to disk
                     for (auto &entry : sm_manager->fhs_) {
-                        auto fh = entry.second.get();
-                        int fd_table = fh->GetFd();
-                        disk_manager->write_page(fd_table, RM_FILE_HDR_PAGE,
-                                                 reinterpret_cast<const char *>(&fh->get_file_hdr_ref()),
-                                                 sizeof(RmFileHdr));
+                        int fd_table = entry.second->GetFd();
                         buffer_pool_manager->flush_all_pages(fd_table);
-                    }
-                    for (auto &entry : sm_manager->ihs_) {
-                        auto ih = entry.second.get();
-                        ih->flush_file_header();
-                        buffer_pool_manager->flush_all_pages(ih->GetFd());
                     }
 
                     // (4) Write checkpoint byte offset to restart file
@@ -1020,10 +628,6 @@ void *client_handler(void *sock_fd) {
                 if (write(fd, data_send, offset + 1) == -1) break;
                 continue;
             }
-        }
-
-        if (try_handle_load_command(std::string(data_recv), data_send, &offset, fd)) {
-            continue;
         }
 
         // 检查是否是 SET TRANSACTION ISOLATION LEVEL 命令（必须在aggregate处理之前）
@@ -1046,7 +650,7 @@ void *client_handler(void *sock_fd) {
             }
         }
 
-        if (try_handle_fast_insert(std::string(data_recv), &txn_id, data_send, &offset, fd, &txn_failed)) {
+        if (try_handle_fast_insert(std::string(data_recv), &txn_id, data_send, &offset, fd)) {
             continue;
         }
 
@@ -1057,15 +661,16 @@ void *client_handler(void *sock_fd) {
                 sql_raw.pop_back();
             std::string sql_lower = sql_raw;
             for (auto &c : sql_lower) c = tolower(c);
-            auto has_agg_func_call = [&](const std::string &fn) -> bool {
+            // Check for aggregate functions - use word boundary to avoid false matches
+            auto has_word = [&](const std::string &word) -> bool {
                 size_t pos = 0;
-                while ((pos = sql_lower.find(fn, pos)) != std::string::npos) {
-                    bool left_ok = (pos == 0 || (!isalnum(static_cast<unsigned char>(sql_lower[pos - 1])) &&
-                                                 sql_lower[pos - 1] != '_'));
-                    size_t p = pos + fn.length();
-                    while (p < sql_lower.length() && isspace(static_cast<unsigned char>(sql_lower[p]))) p++;
-                    if (left_ok && p < sql_lower.length() && sql_lower[p] == '(') return true;
-                    pos += fn.length();
+                while ((pos = sql_lower.find(word, pos)) != std::string::npos) {
+                    // Check character before: should not be alphanumeric or underscore
+                    if (pos > 0 && (isalnum(sql_lower[pos-1]) || sql_lower[pos-1] == '_')) {
+                        pos += word.length();
+                        continue;
+                    }
+                    return true;
                 }
                 return false;
             };
@@ -1082,11 +687,11 @@ void *client_handler(void *sock_fd) {
             };
             bool has_agg = has_keyword("group by") ||
                            has_keyword("having") ||
-                           has_agg_func_call("count") ||
-                           has_agg_func_call("max") ||
-                           has_agg_func_call("min") ||
-                           has_agg_func_call("sum") ||
-                           has_agg_func_call("avg") ||
+                           has_word("count(") ||
+                           has_word("max(") ||
+                           has_word("min(") ||
+                           has_word("sum(") ||
+                           has_word("avg(") ||
                            sql_lower.find(" limit ") != std::string::npos;
             bool has_multi_orderby = false;
             if (has_keyword("order by")) {
@@ -1098,11 +703,10 @@ void *client_handler(void *sock_fd) {
             std::string sql_words = " " + normalize_sql_space(sql_lower) + " ";
             bool has_explain = sql_words.find(" explain analyze ") != std::string::npos;
             if (has_agg || has_multi_orderby || has_union || has_explain) {
-                std::unique_ptr<Context> context_agg;
                 try {
                     memset(data_send, '\0', BUFFER_LENGTH);
                     offset = 0;
-                    context_agg = std::make_unique<Context>(lock_manager.get(), log_manager.get(), nullptr, data_send, &offset);
+                    auto context_agg = std::make_unique<Context>(lock_manager.get(), log_manager.get(), nullptr, data_send, &offset);
                     SetTransaction(&txn_id, context_agg.get());
                     if (has_explain) {
                         ql_manager->handle_explain_analyze(sql_raw, context_agg.get());
@@ -1119,11 +723,12 @@ void *client_handler(void *sock_fd) {
                     }
                     continue;
                 } catch (std::exception &e) {
-                    mark_failed_if_explicit(context_agg.get(), &txn_failed);
-                    abort_active_transaction(context_agg.get());
                     std::cerr << "Aggregation error: " << e.what() << std::endl;
                     set_response(data_send, &offset, std::string(e.what()) + "\n");
-                    append_output_line("failure\n");
+                    std::fstream outfile;
+                    outfile.open("output.txt", std::ios::out | std::ios::app);
+                    outfile << "failure\n";
+                    outfile.close();
                     if (write(fd, data_send, offset + 1) == -1) break;
                     continue;
                 }
@@ -1150,7 +755,10 @@ void *client_handler(void *sock_fd) {
                 set_response(data_send, &offset, "OK\n");
             } catch (std::exception &e) {
                 set_response(data_send, &offset, std::string("failure\n"));
-                append_output_line("failure\n");
+                std::fstream outfile;
+                outfile.open("output.txt", std::ios::out | std::ios::app);
+                outfile << "failure\n";
+                outfile.close();
             }
             if (write(fd, data_send, offset + 1) == -1) break;
             continue;
@@ -1184,34 +792,37 @@ void *client_handler(void *sock_fd) {
                     portal->drop();
                 } catch (TransactionAbortException &e) {
                     set_response(data_send, &offset, "abort\n");
-                    mark_failed_if_explicit(context.get(), &txn_failed);
                     txn_manager->abort(context->txn_, log_manager.get());
                     std::cout << e.GetInfo() << std::endl;
 
-                    append_output_line("abort\n");
+                    std::fstream outfile;
+                    outfile.open("output.txt", std::ios::out | std::ios::app);
+                    outfile << "abort\n";
+                    outfile.close();
                 } catch (RMDBError &e) {
-                    mark_failed_if_explicit(context.get(), &txn_failed);
-                    abort_active_transaction(context.get());
                     std::cerr << e.what() << std::endl;
                     set_response(data_send, &offset, std::string(e.what()) + "\n");
 
-                    append_output_line("failure\n");
+                    std::fstream outfile;
+                    outfile.open("output.txt", std::ios::out | std::ios::app);
+                    outfile << "failure\n";
+                    outfile.close();
                 } catch (std::exception &e) {
-                    mark_failed_if_explicit(context.get(), &txn_failed);
-                    abort_active_transaction(context.get());
                     std::cerr << "Standard exception: " << e.what() << std::endl;
                     set_response(data_send, &offset, std::string("Error: ") + e.what() + "\n");
-                    append_output_line("failure\n");
+                    std::fstream outfile;
+                    outfile.open("output.txt", std::ios::out | std::ios::app);
+                    outfile << "failure\n";
+                    outfile.close();
                 } catch (...) {
-                    mark_failed_if_explicit(context.get(), &txn_failed);
-                    abort_active_transaction(context.get());
                     std::cerr << "Unknown exception caught" << std::endl;
                     set_response(data_send, &offset, "Error: Unknown error\n");
-                    append_output_line("failure\n");
+                    std::fstream outfile;
+                    outfile.open("output.txt", std::ios::out | std::ios::app);
+                    outfile << "failure\n";
+                    outfile.close();
                 }
             } else {
-                mark_failed_if_explicit(context.get(), &txn_failed);
-                abort_active_transaction(context.get());
                 set_response(data_send, &offset, "Error: parse failed\n");
             }
             if (finish_analyze == false) {
@@ -1272,46 +883,47 @@ void *client_handler(void *sock_fd) {
                 } catch (TransactionAbortException &e) {
                     // 事务需要回滚，需要把abort信息返回给客户端并写入output.txt文件中
                     set_response(data_send, &offset, "abort\n");
-                    mark_failed_if_explicit(context.get(), &txn_failed);
 
                     // 回滚事务
                     txn_manager->abort(context->txn_, log_manager.get());
                     std::cout << e.GetInfo() << std::endl;
 
-                    append_output_line("abort\n");
+                    std::fstream outfile;
+                    outfile.open("output.txt", std::ios::out | std::ios::app);
+                    outfile << "abort\n";
+                    outfile.close();
                 } catch (RMDBError &e) {
-                    mark_failed_if_explicit(context.get(), &txn_failed);
-                    abort_active_transaction(context.get());
                     // 遇到异常，需要打印failure到output.txt文件中，并发异常信息返回给客户端
                     std::cerr << e.what() << std::endl;
 
                     set_response(data_send, &offset, std::string(e.what()) + "\n");
 
                     // 将报错信息写入output.txt
-                    append_output_line("failure\n");
+                    std::fstream outfile;
+                    outfile.open("output.txt",std::ios::out | std::ios::app);
+                    outfile << "failure\n";
+                    outfile.close();
                 } catch (std::exception &e) {
-                    mark_failed_if_explicit(context.get(), &txn_failed);
-                    abort_active_transaction(context.get());
                     std::cerr << "Standard exception: " << e.what() << std::endl;
                     std::string err_msg = std::string("Error: ") + e.what();
                     set_response(data_send, &offset, err_msg + "\n");
-                    append_output_line("failure\n");
+                    std::fstream outfile;
+                    outfile.open("output.txt", std::ios::out | std::ios::app);
+                    outfile << "failure\n";
+                    outfile.close();
                 } catch (...) {
-                    mark_failed_if_explicit(context.get(), &txn_failed);
-                    abort_active_transaction(context.get());
                     std::cerr << "Unknown exception caught" << std::endl;
                     std::string err_msg = "Error: Unknown error";
                     set_response(data_send, &offset, err_msg + "\n");
-                    append_output_line("failure\n");
+                    std::fstream outfile;
+                    outfile.open("output.txt", std::ios::out | std::ios::app);
+                    outfile << "failure\n";
+                    outfile.close();
                 }
             } else {
-                mark_failed_if_explicit(context.get(), &txn_failed);
-                abort_active_transaction(context.get());
                 set_response(data_send, &offset, "Error: empty query\n");
             }
         } else {
-            mark_failed_if_explicit(context.get(), &txn_failed);
-            abort_active_transaction(context.get());
             set_response(data_send, &offset, "Error: parse failed\n");
         }
         if(finish_analyze == false) {
@@ -1339,12 +951,6 @@ void *client_handler(void *sock_fd) {
     }
 
     // Clear
-    if (txn_id != INVALID_TXN_ID) {
-        Transaction *txn = txn_manager->get_transaction(txn_id);
-        if (txn != nullptr && txn->get_state() == TransactionState::GROWING) {
-            txn_manager->abort(txn, log_manager.get());
-        }
-    }
     std::cout << "Terminating current client_connection..." << std::endl;
     delete[] data_send;
     close(fd);           // close a file descriptor.

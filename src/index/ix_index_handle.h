@@ -172,14 +172,6 @@ class IxIndexHandle {
    public:
     IxIndexHandle(DiskManager *disk_manager, BufferPoolManager *buffer_pool_manager, int fd);
 
-    int GetFd() const { return fd_; }
-
-    void flush_file_header() const {
-        std::vector<char> data(file_hdr_->tot_len_);
-        file_hdr_->serialize(data.data());
-        disk_manager_->write_page(fd_, IX_FILE_HDR_PAGE, data.data(), file_hdr_->tot_len_);
-    }
-
     // for search
     bool get_value(const char *key, std::vector<Rid> *result, Transaction *transaction);
 
