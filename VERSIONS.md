@@ -213,8 +213,14 @@
 - 当第一列有索引时，使用索引查找匹配记录，避免全表扫描
 - 性能从 774 tpmC 提升到 814 tpmC
 
+### Phase 6: 快速 INSERT 路径
+- 绕过 parser 直接执行简单 INSERT 语句
+- 添加 parse_insert_literal_local、try_parse_simple_insert_local
+- 添加 execute_fast_insert_direct 直接执行 INSERT
+- 性能从 814 tpmC 提升到 846 tpmC
+
 ### 本地性能测试结果
-- 单线程 TPCC NewOrder: 814 tpmC（136 NewOrders/10s）
+- 单线程 TPCC NewOrder: 846 tpmC（142 NewOrders/10s）
 - 瓶颈: explicit_txn_mutex_ 串行化所有显式事务，buffer_mutex 串行化 SQL 解析
 
 ### 已确认不能优化的方向
