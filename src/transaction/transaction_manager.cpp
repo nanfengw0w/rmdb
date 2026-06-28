@@ -15,119 +15,6 @@ See the Mulan PSL v2 for more details. */
 
 std::unordered_map<txn_id_t, Transaction *> TransactionManager::txn_map = {};
 
-namespace {
-
-std::vector<char> build_abort_index_key(const IndexMeta &index, const char *record_data) {
-    std::vector<char> key(index.col_tot_len);
-    int offset = 0;
-    for (const auto &col : index.cols) {
-        memcpy(key.data() + offset, record_data + col.offset, col.len);
-        offset += col.len;
-    }
-    return key;
-}
-
-IxIndexHandle *get_abort_index_handle(SmManager *sm_manager, const std::string &tab_name,
-                                      const IndexMeta &index) {
-    auto ix_name = sm_manager->get_ix_manager()->get_index_name(tab_name, index.cols);
-    return sm_manager->ihs_.at(ix_name).get();
-}
-
-void delete_abort_index_entries(SmManager *sm_manager, const std::string &tab_name,
-                                const TabMeta &tab, const char *record_data) {
-    for (const auto &index : tab.indexes) {
-        auto key = build_abort_index_key(index, record_data);
-        get_abort_index_handle(sm_manager, tab_name, index)->delete_entry(key.data(), nullptr);
-    }
-}
-
-void insert_abort_index_entries(SmManager *sm_manager, const std::string &tab_name,
-                                const TabMeta &tab, const char *record_data, const Rid &rid) {
-    for (const auto &index : tab.indexes) {
-        auto key = build_abort_index_key(index, record_data);
-        get_abort_index_handle(sm_manager, tab_name, index)->insert_entry(key.data(), rid, nullptr);
-    }
-}
-
-void rollback_update_index_entries(SmManager *sm_manager, const std::string &tab_name,
-                                   const TabMeta &tab, const RmRecord *current,
-                                   const RmRecord &old_record, const Rid &rid,
-                                   bool mvcc_abort) {
-    if (current == nullptr) {
-        if (!mvcc_abort) {
-            insert_abort_index_entries(sm_manager, tab_name, tab, old_record.data, rid);
-        }
-        return;
-    }
-
-    for (const auto &index : tab.indexes) {
-        auto current_key = build_abort_index_key(index, current->data);
-        auto old_key = build_abort_index_key(index, old_record.data);
-        if (current_key == old_key) {
-            continue;
-        }
-        auto ih = get_abort_index_handle(sm_manager, tab_name, index);
-        ih->delete_entry(current_key.data(), nullptr);
-        if (!mvcc_abort) {
-            ih->insert_entry(old_key.data(), rid, nullptr);
-        }
-    }
-}
-
-void cleanup_committed_mvcc_changes(SmManager *sm_manager, Transaction *txn) {
-    if (sm_manager == nullptr || txn == nullptr || !txn->get_serial_txn_lock_held()) {
-        return;
-    }
-
-    auto write_set = txn->get_write_set();
-    for (auto *wr : *write_set) {
-        auto &tab_name = wr->GetTableName();
-        auto &rid = wr->GetRid();
-        auto fh = sm_manager->fhs_.at(tab_name).get();
-        auto &tab = sm_manager->db_.get_table(tab_name);
-
-        switch (wr->GetWriteType()) {
-            case WType::DELETE_TUPLE: {
-                delete_abort_index_entries(sm_manager, tab_name, tab, wr->GetRecord().data);
-                auto current = fh->get_record(rid, nullptr);
-                if (current != nullptr) {
-                    fh->delete_record(rid, nullptr);
-                }
-                break;
-            }
-            case WType::UPDATE_TUPLE: {
-                auto current = fh->get_record(rid, nullptr);
-                if (current == nullptr) {
-                    break;
-                }
-                for (const auto &index : tab.indexes) {
-                    auto old_key = build_abort_index_key(index, wr->GetRecord().data);
-                    auto current_key = build_abort_index_key(index, current->data);
-                    if (old_key != current_key) {
-                        get_abort_index_handle(sm_manager, tab_name, index)->delete_entry(old_key.data(), nullptr);
-                    }
-                }
-                break;
-            }
-            case WType::INSERT_TUPLE:
-                break;
-        }
-    }
-}
-
-void clear_write_records(Transaction *txn) {
-    if (txn == nullptr) {
-        return;
-    }
-    auto write_set = txn->get_write_set();
-    for (auto *wr : *write_set) {
-        delete wr;
-    }
-    write_set->clear();
-}
-
-}  // namespace
-
 /**
  * @description: 事务的开始方法
  */
@@ -162,22 +49,6 @@ Transaction * TransactionManager::begin(Transaction* txn, LogManager* log_manage
     return txn;
 }
 
-void TransactionManager::acquire_explicit_txn_lock(Transaction* txn) {
-    if (txn == nullptr || txn->get_serial_txn_lock_held()) {
-        return;
-    }
-    explicit_txn_mutex_.lock();
-    txn->set_serial_txn_lock_held(true);
-}
-
-void TransactionManager::release_explicit_txn_lock(Transaction* txn) {
-    if (txn == nullptr || !txn->get_serial_txn_lock_held()) {
-        return;
-    }
-    txn->set_serial_txn_lock_held(false);
-    explicit_txn_mutex_.unlock();
-}
-
 /**
  * @description: 事务的提交方法
  */
@@ -185,7 +56,6 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     if (txn == nullptr) return;
     if (txn->get_state() == TransactionState::ABORTED ||
         txn->get_state() == TransactionState::COMMITTED) {
-        release_explicit_txn_lock(txn);
         return;
     }
 
@@ -212,20 +82,11 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
         log_manager->remove_active_txn(txn->get_transaction_id());
     }
 
-    if (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE) {
-        cleanup_committed_mvcc_changes(sm_manager_, txn);
-    }
-
     // Release all locks held by this transaction
     auto lock_set = txn->get_lock_set();
     for (auto &lock_data_id : *lock_set) {
         lock_manager_->unlock(txn, lock_data_id);
     }
-
-    if (level != IsolationLevel::SERIALIZABLE) {
-        clear_write_records(txn);
-    }
-    release_explicit_txn_lock(txn);
 }
 
 /**
@@ -235,8 +96,7 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
     if (txn == nullptr) return;
 
     IsolationLevel level = txn->get_isolation_level();
-    bool mvcc_abort = (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE);
-    if (mvcc_abort) {
+    if (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE) {
         // MVCC: 回滚版本管理器中的所有写操作
         auto& vm = VersionManager::instance();
         vm.abort_transaction(txn->get_transaction_id());
@@ -248,14 +108,9 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
             auto &tab_name = wr->GetTableName();
             auto &rid = wr->GetRid();
             auto fh = sm_manager_->fhs_.at(tab_name).get();
-            auto &tab = sm_manager_->db_.get_table(tab_name);
 
             switch (wr->GetWriteType()) {
                 case WType::INSERT_TUPLE: {
-                    auto current = fh->get_record(rid, nullptr);
-                    if (current != nullptr) {
-                        delete_abort_index_entries(sm_manager_, tab_name, tab, current->data);
-                    }
                     fh->delete_record(rid, nullptr);
                     break;
                 }
@@ -264,9 +119,6 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
                     break;
                 }
                 case WType::UPDATE_TUPLE: {
-                    auto current = fh->get_record(rid, nullptr);
-                    rollback_update_index_entries(sm_manager_, tab_name, tab, current.get(),
-                                                  wr->GetRecord(), rid, mvcc_abort);
                     fh->update_record(rid, wr->GetRecord().data, nullptr);
                     break;
                 }
@@ -280,26 +132,17 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
             auto &tab_name = wr->GetTableName();
             auto &rid = wr->GetRid();
             auto fh = sm_manager_->fhs_.at(tab_name).get();
-            auto &tab = sm_manager_->db_.get_table(tab_name);
 
             switch (wr->GetWriteType()) {
                 case WType::INSERT_TUPLE: {
-                    auto current = fh->get_record(rid, nullptr);
-                    if (current != nullptr) {
-                        delete_abort_index_entries(sm_manager_, tab_name, tab, current->data);
-                    }
                     fh->delete_record(rid, nullptr);
                     break;
                 }
                 case WType::DELETE_TUPLE: {
-                    insert_abort_index_entries(sm_manager_, tab_name, tab, wr->GetRecord().data, rid);
                     fh->insert_record(rid, wr->GetRecord().data);
                     break;
                 }
                 case WType::UPDATE_TUPLE: {
-                    auto current = fh->get_record(rid, nullptr);
-                    rollback_update_index_entries(sm_manager_, tab_name, tab, current.get(),
-                                                  wr->GetRecord(), rid, false);
                     fh->update_record(rid, wr->GetRecord().data, nullptr);
                     break;
                 }
@@ -329,8 +172,6 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
     }
 
     txn->set_state(TransactionState::ABORTED);
-    clear_write_records(txn);
-    release_explicit_txn_lock(txn);
 }
 
 /**
