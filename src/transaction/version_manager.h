@@ -209,15 +209,18 @@ public:
 
         auto& chain = it->second;
 
-        bool has_invisible_before_image = false;
-        bool invisible_before_deleted = false;
-        std::shared_ptr<RmRecord> invisible_before_data;
+        // Track the newest visible entry and any invisible entries after it.
+        // In the reverse scan (newest→oldest), invisible entries AFTER the newest
+        // visible entry are processed BEFORE we find the newest visible entry.
+        const VersionEntry* newest_visible = nullptr;
+        bool has_invisible_after_newest = false;
+        bool invisible_after_deleted = false;
+        std::shared_ptr<RmRecord> invisible_after_data;
 
-        // 从最新版本开始查找。磁盘保存最新物理值，版本链保存每次写入前的旧值；
-        // 如果快照看不到多个较新的写入，需要一直回退到最早的不可见写入前。
         for (auto rit = chain.rbegin(); rit != chain.rend(); ++rit) {
             auto& entry = *rit;
 
+            // Own transaction's entry: return current on-disk value
             if (entry.txn_id_ == txn->get_transaction_id()) {
                 if (entry.new_deleted_) {
                     is_deleted = true;
@@ -229,32 +232,39 @@ public:
 
             bool invisible = (entry.commit_ts_ == 0 || entry.commit_ts_ > txn->get_start_ts());
             if (invisible) {
-                has_invisible_before_image = true;
-                invisible_before_deleted = entry.is_deleted_;
-                invisible_before_data = entry.old_data_;
-                continue;
+                // Only save before-image from entries AFTER the newest visible entry
+                if (newest_visible == nullptr) {
+                    has_invisible_after_newest = true;
+                    invisible_after_deleted = entry.is_deleted_;
+                    invisible_after_data = entry.old_data_;
+                }
+            } else {
+                // Remember the newest visible entry (first visible in reverse scan)
+                if (newest_visible == nullptr) {
+                    newest_visible = &entry;
+                }
             }
-
-            // commit_ts <= start_ts，这个写入在快照中可见。若它是删除，
-            // 且没有更晚的不可见写入需要回退，则该记录对本事务不存在。
-            if (!has_invisible_before_image && entry.new_deleted_) {
-                is_deleted = true;
-                return 0;
-            }
-            break;
         }
 
-        if (has_invisible_before_image) {
-            if (invisible_before_deleted) {
+        // If there are invisible writes after the newest visible entry, the snapshot
+        // should see the state before those writes.
+        if (has_invisible_after_newest) {
+            if (invisible_after_deleted) {
                 is_deleted = true;
                 return 0;
             }
             is_deleted = false;
-            if (invisible_before_data == nullptr) {
+            if (invisible_after_data == nullptr) {
                 return 0;
             }
-            result = std::make_unique<RmRecord>(*invisible_before_data);
+            result = std::make_unique<RmRecord>(*invisible_after_data);
             return 1;
+        }
+
+        // No invisible entries after the newest visible one.
+        if (newest_visible != nullptr && newest_visible->new_deleted_) {
+            is_deleted = true;
+            return 0;
         }
 
         is_deleted = false;
