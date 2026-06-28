@@ -202,30 +202,19 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
 
     // Print header into buffer
     RecordPrinter rec_printer(sel_cols.size());
-    static constexpr size_t COL_WIDTH = 16;
     rec_printer.print_separator(context);
     rec_printer.print_record(captions, context);
     rec_printer.print_separator(context);
-    // print header into file (with borders)
+    // print header into file
     bool write_output_file = enable_output_file.load();
     std::fstream outfile;
     if (write_output_file) {
         outfile.open("output.txt", std::ios::out | std::ios::app);
-        // separator
-        for (size_t i = 0; i < sel_cols.size(); i++)
-            outfile << "+" << std::string(COL_WIDTH + 2, '-');
-        outfile << "+\n";
-        // header row
-        for (auto &cap : captions) {
-            std::stringstream ss;
-            ss << "| " << std::setw(COL_WIDTH) << cap << " ";
-            outfile << ss.str();
+        outfile << "|";
+        for(int i = 0; i < captions.size(); ++i) {
+            outfile << " " << captions[i] << " |";
         }
-        outfile << "|\n";
-        // separator
-        for (size_t i = 0; i < sel_cols.size(); i++)
-            outfile << "+" << std::string(COL_WIDTH + 2, '-');
-        outfile << "+\n";
+        outfile << "\n";
     }
 
     // Print records
@@ -249,26 +238,17 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
         }
         // print record into buffer
         rec_printer.print_record(columns, context);
-        // print record into file (with borders)
+        // print record into file
         if (write_output_file) {
-            for (auto &col_str : columns) {
-                std::stringstream ss;
-                std::string display = col_str;
-                if (display.size() > COL_WIDTH) display = display.substr(0, COL_WIDTH - 3) + "...";
-                ss << "| " << std::setw(COL_WIDTH) << display << " ";
-                outfile << ss.str();
+            outfile << "|";
+            for(int i = 0; i < columns.size(); ++i) {
+                outfile << " " << columns[i] << " |";
             }
-            outfile << "|\n";
+            outfile << "\n";
         }
         num_rec++;
     }
     if (write_output_file) {
-        // footer separator
-        for (size_t i = 0; i < sel_cols.size(); i++)
-            outfile << "+" << std::string(COL_WIDTH + 2, '-');
-        outfile << "+\n";
-        // record count
-        outfile << "Total record(s): " << num_rec << "\n";
         outfile.close();
     }
     // Print footer into buffer
@@ -1085,22 +1065,12 @@ static bool handle_multi_table_aggregate_query(SmManager *sm_manager, const std:
     std::vector<std::string> captions;
     for (auto &ac : agg_cols) captions.push_back(ac.alias);
     bool write_output_file = enable_output_file.load();
-    static constexpr size_t AGG_COL_WIDTH = 16;
     std::fstream outfile;
     if (write_output_file) {
         outfile.open("output.txt", std::ios::out | std::ios::app);
-        for (size_t i = 0; i < captions.size(); i++)
-            outfile << "+" << std::string(AGG_COL_WIDTH + 2, '-');
-        outfile << "+\n";
-        for (auto &c : captions) {
-            std::stringstream ss;
-            ss << "| " << std::setw(AGG_COL_WIDTH) << c << " ";
-            outfile << ss.str();
-        }
-        outfile << "|\n";
-        for (size_t i = 0; i < captions.size(); i++)
-            outfile << "+" << std::string(AGG_COL_WIDTH + 2, '-');
-        outfile << "+\n";
+        outfile << "|";
+        for (auto &c : captions) outfile << " " << c << " |";
+        outfile << "\n";
     }
     RecordPrinter rec_printer(captions.size());
     rec_printer.print_separator(context);
@@ -1109,21 +1079,12 @@ static bool handle_multi_table_aggregate_query(SmManager *sm_manager, const std:
     for (auto &gr : results) {
         rec_printer.print_record(gr.agg_strs, context);
         if (write_output_file) {
-            for (auto &c : gr.agg_strs) {
-                std::stringstream ss;
-                std::string display = c;
-                if (display.size() > AGG_COL_WIDTH) display = display.substr(0, AGG_COL_WIDTH - 3) + "...";
-                ss << "| " << std::setw(AGG_COL_WIDTH) << display << " ";
-                outfile << ss.str();
-            }
-            outfile << "|\n";
+            outfile << "|";
+            for (auto &c : gr.agg_strs) outfile << " " << c << " |";
+            outfile << "\n";
         }
     }
     if (write_output_file) {
-        for (size_t i = 0; i < captions.size(); i++)
-            outfile << "+" << std::string(AGG_COL_WIDTH + 2, '-');
-        outfile << "+\n";
-        outfile << "Total record(s): " << results.size() << "\n";
         outfile.close();
     }
     rec_printer.print_separator(context);
@@ -1911,22 +1872,12 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
     for (auto &ac : agg_cols) captions.push_back(ac.alias);
 
     bool write_output_file = enable_output_file.load();
-    static constexpr size_t AGG_COL_WIDTH2 = 16;
     std::fstream outfile;
     if (write_output_file) {
         outfile.open("output.txt", std::ios::out | std::ios::app);
-        for (size_t i = 0; i < captions.size(); i++)
-            outfile << "+" << std::string(AGG_COL_WIDTH2 + 2, '-');
-        outfile << "+\n";
-        for (auto &c : captions) {
-            std::stringstream ss;
-            ss << "| " << std::setw(AGG_COL_WIDTH2) << c << " ";
-            outfile << ss.str();
-        }
-        outfile << "|\n";
-        for (size_t i = 0; i < captions.size(); i++)
-            outfile << "+" << std::string(AGG_COL_WIDTH2 + 2, '-');
-        outfile << "+\n";
+        outfile << "|";
+        for (auto &c : captions) outfile << " " << c << " |";
+        outfile << "\n";
     }
 
     RecordPrinter rec_printer(captions.size());
@@ -1942,22 +1893,13 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
         }
         rec_printer.print_record(columns, context);
         if (write_output_file) {
-            for (auto &c : columns) {
-                std::stringstream ss;
-                std::string display = c;
-                if (display.size() > AGG_COL_WIDTH2) display = display.substr(0, AGG_COL_WIDTH2 - 3) + "...";
-                ss << "| " << std::setw(AGG_COL_WIDTH2) << display << " ";
-                outfile << ss.str();
-            }
-            outfile << "|\n";
+            outfile << "|";
+            for (auto &c : columns) outfile << " " << c << " |";
+            outfile << "\n";
         }
         num_rec++;
     }
     if (write_output_file) {
-        for (size_t i = 0; i < captions.size(); i++)
-            outfile << "+" << std::string(AGG_COL_WIDTH2 + 2, '-');
-        outfile << "+\n";
-        outfile << "Total record(s): " << num_rec << "\n";
         outfile.close();
     }
     rec_printer.print_separator(context);
@@ -2342,21 +2284,11 @@ void QlManager::handle_union(const std::string &sql, Context *context) {
     // 9. 输出
     bool write_output_file = enable_output_file.load();
     std::fstream outfile;
-    static constexpr size_t UNION_COL_WIDTH = 16;
     if (write_output_file) {
         outfile.open("output.txt", std::ios::out | std::ios::app);
-        for (size_t i = 0; i < out_names.size(); i++)
-            outfile << "+" << std::string(UNION_COL_WIDTH + 2, '-');
-        outfile << "+\n";
-        for (auto &name : out_names) {
-            std::stringstream ss;
-            ss << "| " << std::setw(UNION_COL_WIDTH) << name << " ";
-            outfile << ss.str();
-        }
-        outfile << "|\n";
-        for (size_t i = 0; i < out_names.size(); i++)
-            outfile << "+" << std::string(UNION_COL_WIDTH + 2, '-');
-        outfile << "+\n";
+        outfile << "|";
+        for (auto &name : out_names) outfile << " " << name << " |";
+        outfile << "\n";
     }
 
     RecordPrinter rec_printer(num_cols);
@@ -2368,22 +2300,13 @@ void QlManager::handle_union(const std::string &sql, Context *context) {
     for (auto &ur : all_rows) {
         rec_printer.print_record(ur.vals, context);
         if (write_output_file) {
-            for (auto &v : ur.vals) {
-                std::stringstream ss;
-                std::string display = v;
-                if (display.size() > UNION_COL_WIDTH) display = display.substr(0, UNION_COL_WIDTH - 3) + "...";
-                ss << "| " << std::setw(UNION_COL_WIDTH) << display << " ";
-                outfile << ss.str();
-            }
-            outfile << "|\n";
+            outfile << "|";
+            for (auto &v : ur.vals) outfile << " " << v << " |";
+            outfile << "\n";
         }
         num_rec++;
     }
     if (write_output_file) {
-        for (size_t i = 0; i < out_names.size(); i++)
-            outfile << "+" << std::string(UNION_COL_WIDTH + 2, '-');
-        outfile << "+\n";
-        outfile << "Total record(s): " << num_rec << "\n";
         outfile.close();
     }
     rec_printer.print_separator(context);
