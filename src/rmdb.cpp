@@ -1087,18 +1087,20 @@ void *client_handler(void *sock_fd) {
                            has_agg_func_call("max") ||
                            has_agg_func_call("min") ||
                            has_agg_func_call("sum") ||
-                           has_agg_func_call("avg") ||
-                           sql_lower.find(" limit ") != std::string::npos;
+                           has_agg_func_call("avg");
             bool has_multi_orderby = false;
             if (has_keyword("order by")) {
                 size_t ob_pos = sql_lower.find("order by");
                 std::string after_ob = sql_lower.substr(ob_pos + 8);
                 if (after_ob.find(',') != std::string::npos) has_multi_orderby = true;
             }
+            // LIMIT 单独处理：只有当有聚合函数或多列 ORDER BY 时才走 aggregate handler
+            bool has_limit = sql_lower.find(" limit ") != std::string::npos;
+            bool needs_agg = has_agg || (has_limit && has_multi_orderby);
             bool has_union = sql_lower.find(" union ") != std::string::npos;
             std::string sql_words = " " + normalize_sql_space(sql_lower) + " ";
             bool has_explain = sql_words.find(" explain analyze ") != std::string::npos;
-            if (has_agg || has_multi_orderby || has_union || has_explain) {
+            if (needs_agg || has_multi_orderby || has_union || has_explain) {
                 std::unique_ptr<Context> context_agg;
                 try {
                     memset(data_send, '\0', BUFFER_LENGTH);
