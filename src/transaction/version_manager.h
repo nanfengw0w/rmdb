@@ -195,15 +195,15 @@ public:
      *
      * @return -1: 从磁盘读取, 0: 记录不存在, 1: 从old_data读取
      */
-    int get_visible_data(int fd, const Rid& rid, Transaction* txn, RmRecord*& result, bool& is_deleted) {
+    int get_visible_data(int fd, const Rid& rid, Transaction* txn, std::unique_ptr<RmRecord>& result, bool& is_deleted) {
         VersionKey key{fd, rid.page_no, rid.slot_no};
         auto& bucket = get_bucket(key);
         std::lock_guard<std::mutex> lock(bucket.mutex_);
+        result.reset();
 
         auto it = bucket.chains_.find(key);
         if (it == bucket.chains_.end() || it->second.empty()) {
             is_deleted = false;
-            result = nullptr;
             return -1;  // 没有版本信息，从磁盘读取
         }
 
@@ -211,7 +211,7 @@ public:
 
         bool has_invisible_before_image = false;
         bool invisible_before_deleted = false;
-        RmRecord* invisible_before_data = nullptr;
+        std::shared_ptr<RmRecord> invisible_before_data;
 
         // 从最新版本开始查找。磁盘保存最新物理值，版本链保存每次写入前的旧值；
         // 如果快照看不到多个较新的写入，需要一直回退到最早的不可见写入前。
@@ -221,11 +221,9 @@ public:
             if (entry.txn_id_ == txn->get_transaction_id()) {
                 if (entry.new_deleted_) {
                     is_deleted = true;
-                    result = nullptr;
                     return 0;
                 }
                 is_deleted = false;
-                result = nullptr;
                 return -1;
             }
 
@@ -233,7 +231,7 @@ public:
             if (invisible) {
                 has_invisible_before_image = true;
                 invisible_before_deleted = entry.is_deleted_;
-                invisible_before_data = entry.old_data_.get();
+                invisible_before_data = entry.old_data_;
                 continue;
             }
 
@@ -241,7 +239,6 @@ public:
             // 且没有更晚的不可见写入需要回退，则该记录对本事务不存在。
             if (!has_invisible_before_image && entry.new_deleted_) {
                 is_deleted = true;
-                result = nullptr;
                 return 0;
             }
             break;
@@ -250,34 +247,35 @@ public:
         if (has_invisible_before_image) {
             if (invisible_before_deleted) {
                 is_deleted = true;
-                result = nullptr;
                 return 0;
             }
             is_deleted = false;
-            result = invisible_before_data;
+            if (invisible_before_data == nullptr) {
+                return 0;
+            }
+            result = std::make_unique<RmRecord>(*invisible_before_data);
             return 1;
         }
 
         is_deleted = false;
-        result = nullptr;
         return -1;  // 从磁盘读取
     }
 
-    int get_read_committed_data(int fd, const Rid& rid, RmRecord*& result, bool& is_deleted) {
+    int get_read_committed_data(int fd, const Rid& rid, std::unique_ptr<RmRecord>& result, bool& is_deleted) {
         VersionKey key{fd, rid.page_no, rid.slot_no};
         auto& bucket = get_bucket(key);
         std::lock_guard<std::mutex> lock(bucket.mutex_);
+        result.reset();
 
         auto it = bucket.chains_.find(key);
         if (it == bucket.chains_.end() || it->second.empty()) {
             is_deleted = false;
-            result = nullptr;
             return -1;
         }
 
         bool has_uncommitted_before_image = false;
         bool uncommitted_before_deleted = false;
-        RmRecord* uncommitted_before_data = nullptr;
+        std::shared_ptr<RmRecord> uncommitted_before_data;
 
         for (auto rit = it->second.rbegin(); rit != it->second.rend(); ++rit) {
             auto& entry = *rit;
@@ -285,13 +283,12 @@ public:
             if (entry.commit_ts_ == 0) {
                 has_uncommitted_before_image = true;
                 uncommitted_before_deleted = entry.is_deleted_;
-                uncommitted_before_data = entry.old_data_.get();
+                uncommitted_before_data = entry.old_data_;
                 continue;
             }
 
             if (!has_uncommitted_before_image && entry.new_deleted_) {
                 is_deleted = true;
-                result = nullptr;
                 return 0;
             }
 
@@ -301,16 +298,17 @@ public:
         if (has_uncommitted_before_image) {
             if (uncommitted_before_deleted) {
                 is_deleted = true;
-                result = nullptr;
                 return 0;
             }
             is_deleted = false;
-            result = uncommitted_before_data;
+            if (uncommitted_before_data == nullptr) {
+                return 0;
+            }
+            result = std::make_unique<RmRecord>(*uncommitted_before_data);
             return 1;
         }
 
         is_deleted = false;
-        result = nullptr;
         return -1;
     }
 
@@ -329,6 +327,27 @@ public:
             }
         }
         return false;
+    }
+
+    void clear_fd(int fd) {
+        for (size_t i = 0; i < NUM_SHARDS; ++i) {
+            std::lock_guard<std::mutex> lock(shards_[i].mutex_);
+            auto& chains = shards_[i].chains_;
+            for (auto it = chains.begin(); it != chains.end(); ) {
+                if (it->first.fd == fd) {
+                    it = chains.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+    }
+
+    void clear_all() {
+        for (size_t i = 0; i < NUM_SHARDS; ++i) {
+            std::lock_guard<std::mutex> lock(shards_[i].mutex_);
+            shards_[i].chains_.clear();
+        }
     }
 
 private:

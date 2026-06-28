@@ -29,7 +29,7 @@ std::unique_ptr<RmRecord> RmFileHandle::get_record(const Rid& rid, Context* cont
         if (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE) {
             auto& vm = VersionManager::instance();
             bool is_deleted = false;
-            RmRecord* result = nullptr;
+            std::unique_ptr<RmRecord> result;
             int vis = vm.get_visible_data(fd_, rid, context->txn_, result, is_deleted);
 
             if (vis == 0) {
@@ -40,13 +40,13 @@ std::unique_ptr<RmRecord> RmFileHandle::get_record(const Rid& rid, Context* cont
                 if (is_deleted) {
                     return nullptr;
                 }
-                return std::make_unique<RmRecord>(*result);
+                return result;
             }
             // vis == -1，从磁盘读取最新数据
         } else if (level == IsolationLevel::READ_COMMITTED) {
             auto& vm = VersionManager::instance();
             bool is_deleted = false;
-            RmRecord* result = nullptr;
+            std::unique_ptr<RmRecord> result;
             int vis = vm.get_read_committed_data(fd_, rid, result, is_deleted);
 
             if (vis == 0) {
@@ -55,7 +55,7 @@ std::unique_ptr<RmRecord> RmFileHandle::get_record(const Rid& rid, Context* cont
                 if (is_deleted) {
                     return nullptr;
                 }
-                return std::make_unique<RmRecord>(*result);
+                return result;
             }
         }
     }
