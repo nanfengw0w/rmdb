@@ -237,11 +237,11 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
     IsolationLevel level = txn->get_isolation_level();
     bool mvcc_abort = (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE);
     if (mvcc_abort) {
-        // MVCC: 回滚版本管理器中的所有写操作
-        auto& vm = VersionManager::instance();
-        vm.abort_transaction(txn->get_transaction_id());
+        // MVCC: 先恢复磁盘数据，再删除版本链条目
+        // 顺序至关重要：必须先恢复磁盘数据，否则在删除版本链和恢复磁盘之间的
+        // 窗口期，其他事务会读到未提交的脏数据（版本链已删除，磁盘还是新数据）
 
-        // 使用write_set恢复旧数据到磁盘（与非MVCC模式相同）
+        // Phase 1: 使用write_set恢复旧数据到磁盘（版本链仍保护读操作）
         auto write_set = txn->get_write_set();
         for (auto it = write_set->rbegin(); it != write_set->rend(); ++it) {
             WriteRecord *wr = *it;
@@ -272,6 +272,10 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
                 }
             }
         }
+
+        // Phase 2: 磁盘已一致，安全删除版本链条目
+        auto& vm = VersionManager::instance();
+        vm.abort_transaction(txn->get_transaction_id());
     } else {
         // 非MVCC模式：Undo all write operations in reverse order
         auto write_set = txn->get_write_set();
