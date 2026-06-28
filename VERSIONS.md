@@ -220,11 +220,12 @@
 - 性能从 814 tpmC 提升到 846 tpmC
 
 ### 本地性能测试结果
-- 单线程 TPCC NewOrder: 861 tpmC（145 NewOrders/10s）
+- 单线程 TPCC NewOrder: 845 tpmC（142 NewOrders/10s）
 - 瓶颈: explicit_txn_mutex_ 串行化所有显式事务，buffer_mutex 串行化 SQL 解析
 
 ### 已确认失败的优化
 - 快速 UPDATE 路径（绕过 parser）→ 唯一索引冲突，性能降到 60 tpmC
+- 移除 SNAPSHOT ISOLATION 的 explicit_txn_mutex_ → 单线程提升到 1140 tpmC，但多线程 abort 率极高（stock 表共享冲突）
 
 ### 已确认不能优化的方向
 - 移除 explicit_txn_mutex_ → 98.5% abort率，写写冲突
