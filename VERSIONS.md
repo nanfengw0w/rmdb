@@ -209,10 +209,13 @@
 - split_sql_requests 函数（支持多条SQL按分号分割）
 - pending_requests 队列（一次网络读取接收多条SQL，逐条处理）
 
+### Phase 5: check_logical_key_write_conflict 索引优化
+- 当第一列有索引时，使用索引查找匹配记录，避免全表扫描
+- 性能从 774 tpmC 提升到 814 tpmC
+
 ### 本地性能测试结果
-- 单线程 TPCC NewOrder: 774 tpmC（130 NewOrders/10s）
-- 4线程 TPCC NewOrder: 654 tpmC（109 NewOrders/10s）
-- 瓶颈: explicit_txn_mutex_ 串行化所有显式事务，但移除会导致写写冲突和数据不一致
+- 单线程 TPCC NewOrder: 814 tpmC（136 NewOrders/10s）
+- 瓶颈: explicit_txn_mutex_ 串行化所有显式事务，buffer_mutex 串行化 SQL 解析
 
 ### 已确认不能优化的方向
 - 移除 explicit_txn_mutex_ → 98.5% abort率，写写冲突
