@@ -40,73 +40,44 @@ void BufferPoolManager::update_page(Page *page, PageId new_page_id, frame_id_t n
 }
 
 Page* BufferPoolManager::fetch_page(PageId page_id) {
-    // 快速路径：页面已在缓冲池中（只用分片锁）
-    {
-        size_t shard = std::hash<PageId>{}(page_id) % NUM_LATCHES;
-        std::scoped_lock lock{page_latches_[shard]};
-        auto it = page_table_.find(page_id);
-        if (it != page_table_.end()) {
-            frame_id_t frame_id = it->second;
-            Page *page = &pages_[frame_id];
-            page->pin_count_++;
-            replacer_->pin(frame_id);
-            return page;
-        }
-    }
+    std::scoped_lock lock{latch_};
 
-    // 慢速路径：需要磁盘 I/O
-    frame_id_t frame_id;
-    Page *page = nullptr;
-    PageId old_page_id;
-    bool need_flush = false;
-
-    {
-        std::scoped_lock lock{latch_};
-        // 双重检查：可能其他线程已经加载了页面
-        auto it = page_table_.find(page_id);
-        if (it != page_table_.end()) {
-            frame_id_t frame_id = it->second;
-            Page *page = &pages_[frame_id];
-            page->pin_count_++;
-            replacer_->pin(frame_id);
-            return page;
-        }
-
-        if (!find_victim_page(&frame_id)) {
-            return nullptr;
-        }
-        page = &pages_[frame_id];
-        if (page->is_dirty_) {
-            old_page_id = page->id_;
-            need_flush = true;
-            page->is_dirty_ = false;
-        }
-        if (page->id_.page_no != INVALID_PAGE_ID) {
-            page_table_.erase(page->id_);
-        }
-        page->id_ = PageId{-1, INVALID_PAGE_ID};
-        page->pin_count_ = 1;
-    }
-
-    // 在锁外做磁盘 I/O
-    if (need_flush) {
-        disk_manager_->write_page(old_page_id.fd, old_page_id.page_no, page->data_, PAGE_SIZE);
-    }
-    disk_manager_->read_page(page_id.fd, page_id.page_no, page->data_, PAGE_SIZE);
-
-    {
-        std::scoped_lock lock{latch_};
-        page->id_ = page_id;
-        page_table_[page_id] = frame_id;
+    auto it = page_table_.find(page_id);
+    if (it != page_table_.end()) {
+        frame_id_t frame_id = it->second;
+        Page *page = &pages_[frame_id];
+        page->pin_count_++;
         replacer_->pin(frame_id);
+        return page;
     }
+
+    frame_id_t frame_id;
+    if (!find_victim_page(&frame_id)) {
+        return nullptr;
+    }
+
+    Page *page = &pages_[frame_id];
+    if (page->is_dirty_) {
+        disk_manager_->write_page(page->id_.fd, page->id_.page_no, page->data_, PAGE_SIZE);
+        page->is_dirty_ = false;
+    }
+
+    if (page->id_.page_no != INVALID_PAGE_ID) {
+        page_table_.erase(page->id_);
+    }
+
+    disk_manager_->read_page(page_id.fd, page_id.page_no, page->data_, PAGE_SIZE);
+    page->id_ = page_id;
+    page->pin_count_ = 1;
+    page_table_[page_id] = frame_id;
+
+    replacer_->pin(frame_id);
 
     return page;
 }
 
 bool BufferPoolManager::unpin_page(PageId page_id, bool is_dirty) {
-    size_t shard = std::hash<PageId>{}(page_id) % NUM_LATCHES;
-    std::scoped_lock lock{page_latches_[shard]};
+    std::scoped_lock lock{latch_};
 
     auto it = page_table_.find(page_id);
     if (it == page_table_.end()) {

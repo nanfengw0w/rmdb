@@ -161,16 +161,14 @@ class Portal
             return std::make_unique<ProjectionExecutor>(convert_plan_executor(x->subplan_, context), 
                                                         x->sel_cols_);
         } else if(auto x = std::dynamic_pointer_cast<ScanPlan>(plan)) {
-            // SI 下允许 IndexScan：
-            // - MVCC 事务不删除索引条目（executor_delete/update），索引是数据超集
-            // - get_record 的 MVCC 可见性过滤保证结果正确
-            // - IndexScanExecutor 对复合索引做前缀范围裁剪，避免全索引扫描
-            if(x->tag == T_SeqScan) {
+            bool force_seq_scan = context != nullptr && context->txn_ != nullptr &&
+                                  context->txn_->get_isolation_level() == IsolationLevel::SNAPSHOT_ISOLATION;
+            if(x->tag == T_SeqScan || force_seq_scan) {
                 return std::make_unique<SeqScanExecutor>(sm_manager_, x->tab_name_, x->conds_, context);
             }
             else {
                 return std::make_unique<IndexScanExecutor>(sm_manager_, x->tab_name_, x->conds_, x->index_col_names_, context);
-            }
+            } 
         } else if(auto x = std::dynamic_pointer_cast<JoinPlan>(plan)) {
             std::unique_ptr<AbstractExecutor> left = convert_plan_executor(x->left_, context);
             std::unique_ptr<AbstractExecutor> right = convert_plan_executor(x->right_, context);

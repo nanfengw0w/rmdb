@@ -407,7 +407,6 @@ auto ix_manager = std::make_unique<IxManager>(disk_manager.get(), buffer_pool_ma
 auto sm_manager = std::make_unique<SmManager>(disk_manager.get(), buffer_pool_manager.get(), rm_manager.get(), ix_manager.get());
 auto lock_manager = std::make_unique<LockManager>();
 auto txn_manager = std::make_unique<TransactionManager>(lock_manager.get(), sm_manager.get());
-
 TransactionManager* g_txn_manager = txn_manager.get();
 auto planner = std::make_unique<Planner>(sm_manager.get());
 auto optimizer = std::make_unique<Optimizer>(sm_manager.get(), planner.get());
@@ -1087,20 +1086,18 @@ void *client_handler(void *sock_fd) {
                            has_agg_func_call("max") ||
                            has_agg_func_call("min") ||
                            has_agg_func_call("sum") ||
-                           has_agg_func_call("avg");
+                           has_agg_func_call("avg") ||
+                           sql_lower.find(" limit ") != std::string::npos;
             bool has_multi_orderby = false;
             if (has_keyword("order by")) {
                 size_t ob_pos = sql_lower.find("order by");
                 std::string after_ob = sql_lower.substr(ob_pos + 8);
                 if (after_ob.find(',') != std::string::npos) has_multi_orderby = true;
             }
-            // LIMIT 单独处理：只有当有聚合函数或多列 ORDER BY 时才走 aggregate handler
-            bool has_limit = sql_lower.find(" limit ") != std::string::npos;
-            bool needs_agg = has_agg || (has_limit && has_multi_orderby);
             bool has_union = sql_lower.find(" union ") != std::string::npos;
             std::string sql_words = " " + normalize_sql_space(sql_lower) + " ";
             bool has_explain = sql_words.find(" explain analyze ") != std::string::npos;
-            if (needs_agg || has_multi_orderby || has_union || has_explain) {
+            if (has_agg || has_multi_orderby || has_union || has_explain) {
                 std::unique_ptr<Context> context_agg;
                 try {
                     memset(data_send, '\0', BUFFER_LENGTH);
@@ -1170,23 +1167,16 @@ void *client_handler(void *sock_fd) {
         std::vector<SetClause> arithmetic_set_clauses;
         if (try_parse_arithmetic_update(std::string(data_recv), arithmetic_dummy_sql, arithmetic_set_clauses)) {
             bool finish_analyze = false;
-            std::shared_ptr<ast::TreeNode> local_parse_tree;
             pthread_mutex_lock(buffer_mutex);
             ast::parse_tree = nullptr;
             YY_BUFFER_STATE buf = yy_scan_string(arithmetic_dummy_sql.c_str());
             if (yyparse() == 0 && ast::parse_tree != nullptr) {
-                local_parse_tree = ast::parse_tree;
-                yy_delete_buffer(buf);
-                finish_analyze = true;
-            } else {
-                yy_delete_buffer(buf);
-            }
-            pthread_mutex_unlock(buffer_mutex);
-
-            if (finish_analyze && local_parse_tree != nullptr) {
                 try {
-                    std::shared_ptr<Query> query = analyze->do_analyze(local_parse_tree);
+                    std::shared_ptr<Query> query = analyze->do_analyze(ast::parse_tree);
                     query->set_clauses = arithmetic_set_clauses;
+                    yy_delete_buffer(buf);
+                    finish_analyze = true;
+                    pthread_mutex_unlock(buffer_mutex);
 
                     std::shared_ptr<Plan> plan = optimizer->plan_query(query, context.get());
                     std::shared_ptr<PortalStmt> portalStmt = portal->start(plan, context.get());
@@ -1224,6 +1214,10 @@ void *client_handler(void *sock_fd) {
                 abort_active_transaction(context.get());
                 set_response(data_send, &offset, "Error: parse failed\n");
             }
+            if (finish_analyze == false) {
+                yy_delete_buffer(buf);
+                pthread_mutex_unlock(buffer_mutex);
+            }
             if (write(fd, data_send, offset + 1) == -1) {
                 break;
             }
@@ -1256,62 +1250,78 @@ void *client_handler(void *sock_fd) {
             });
         processed_sql = strip_select_aliases_for_parser(processed_sql);
 
-        // 解析在锁内，分析在锁外（减少锁持有时间）
+        // 用于判断是否已经调用了yy_delete_buffer来删除buf
         bool finish_analyze = false;
         std::shared_ptr<ast::TreeNode> local_parse_tree;
         pthread_mutex_lock(buffer_mutex);
         ast::parse_tree = nullptr;
         YY_BUFFER_STATE buf = yy_scan_string(processed_sql.c_str());
-        if (yyparse() == 0 && ast::parse_tree != nullptr) {
+        if (yyparse() == 0) {
             local_parse_tree = ast::parse_tree;
             yy_delete_buffer(buf);
             finish_analyze = true;
-        } else {
-            yy_delete_buffer(buf);
-        }
-        pthread_mutex_unlock(buffer_mutex);
+            pthread_mutex_unlock(buffer_mutex);
+            if (local_parse_tree != nullptr) {
+                try {
+                    // analyze and rewrite (outside lock)
+                    std::shared_ptr<Query> query = analyze->do_analyze(local_parse_tree);
+                    // 优化器
+                    std::shared_ptr<Plan> plan = optimizer->plan_query(query, context.get());
+                    // portal
+                    std::shared_ptr<PortalStmt> portalStmt = portal->start(plan, context.get());
+                    portal->run(portalStmt, ql_manager.get(), &txn_id, context.get());
+                    portal->drop();
+                } catch (TransactionAbortException &e) {
+                    // 事务需要回滚，需要把abort信息返回给客户端并写入output.txt文件中
+                    set_response(data_send, &offset, "abort\n");
+                    mark_failed_if_explicit(context.get(), &txn_failed);
 
-        if (finish_analyze && local_parse_tree != nullptr) {
-            try {
-                // analyze and rewrite（在锁外执行，减少 parser mutex 竞争）
-                std::shared_ptr<Query> query = analyze->do_analyze(local_parse_tree);
-                // 优化器
-                std::shared_ptr<Plan> plan = optimizer->plan_query(query, context.get());
-                // portal
-                std::shared_ptr<PortalStmt> portalStmt = portal->start(plan, context.get());
-                portal->run(portalStmt, ql_manager.get(), &txn_id, context.get());
-                portal->drop();
-            } catch (TransactionAbortException &e) {
-                set_response(data_send, &offset, "abort\n");
-                mark_failed_if_explicit(context.get(), &txn_failed);
-                txn_manager->abort(context->txn_, log_manager.get());
-                std::cout << e.GetInfo() << std::endl;
-                append_output_line("abort\n");
-            } catch (RMDBError &e) {
+                    // 回滚事务
+                    txn_manager->abort(context->txn_, log_manager.get());
+                    std::cout << e.GetInfo() << std::endl;
+
+                    append_output_line("abort\n");
+                } catch (RMDBError &e) {
+                    mark_failed_if_explicit(context.get(), &txn_failed);
+                    abort_active_transaction(context.get());
+                    // 遇到异常，需要打印failure到output.txt文件中，并发异常信息返回给客户端
+                    std::cerr << e.what() << std::endl;
+
+                    set_response(data_send, &offset, std::string(e.what()) + "\n");
+
+                    // 将报错信息写入output.txt
+                    append_output_line("failure\n");
+                } catch (std::exception &e) {
+                    mark_failed_if_explicit(context.get(), &txn_failed);
+                    abort_active_transaction(context.get());
+                    std::cerr << "Standard exception: " << e.what() << std::endl;
+                    std::string err_msg = std::string("Error: ") + e.what();
+                    set_response(data_send, &offset, err_msg + "\n");
+                    append_output_line("failure\n");
+                } catch (...) {
+                    mark_failed_if_explicit(context.get(), &txn_failed);
+                    abort_active_transaction(context.get());
+                    std::cerr << "Unknown exception caught" << std::endl;
+                    std::string err_msg = "Error: Unknown error";
+                    set_response(data_send, &offset, err_msg + "\n");
+                    append_output_line("failure\n");
+                }
+            } else {
                 mark_failed_if_explicit(context.get(), &txn_failed);
                 abort_active_transaction(context.get());
-                std::cerr << e.what() << std::endl;
-                set_response(data_send, &offset, std::string(e.what()) + "\n");
-                append_output_line("failure\n");
-            } catch (std::exception &e) {
-                mark_failed_if_explicit(context.get(), &txn_failed);
-                abort_active_transaction(context.get());
-                std::cerr << "Standard exception: " << e.what() << std::endl;
-                std::string err_msg = std::string("Error: ") + e.what();
-                set_response(data_send, &offset, err_msg + "\n");
-                append_output_line("failure\n");
-            } catch (...) {
-                mark_failed_if_explicit(context.get(), &txn_failed);
-                abort_active_transaction(context.get());
-                std::cerr << "Unknown exception caught" << std::endl;
-                std::string err_msg = "Error: Unknown error";
-                set_response(data_send, &offset, err_msg + "\n");
-                append_output_line("failure\n");
+                set_response(data_send, &offset, "Error: empty query\n");
             }
         } else {
+            yy_delete_buffer(buf);
+            finish_analyze = true;
+            pthread_mutex_unlock(buffer_mutex);
             mark_failed_if_explicit(context.get(), &txn_failed);
             abort_active_transaction(context.get());
             set_response(data_send, &offset, "Error: parse failed\n");
+        }
+        if(finish_analyze == false) {
+            yy_delete_buffer(buf);
+            pthread_mutex_unlock(buffer_mutex);
         }
         // future TODO: 格式化 sql_handler.result, 传给客户端
         // send result with fixed format, use protobuf in the future
