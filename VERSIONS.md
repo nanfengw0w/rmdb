@@ -233,7 +233,8 @@
 - 主要瓶颈: buffer_mutex 序列化所有 SQL 解析（yyparse + do_analyze）
 - 次要瓶颈: explicit_txn_mutex_ 序列化所有显式事务
 - 每个 NewOrder 事务约 20-35 条 SQL，每条都走完整流水线
-- 单线程 845 tpmC ≈ 14 NewOrder/s ≈ 280-490 SQL/s
+- 单线程 843 tpmC ≈ 14 NewOrder/s ≈ 280-490 SQL/s
+- 已确认的瓶颈: do_analyze 访问 sm_manager->db_，不能移出锁
 
 ### 已确认不能优化的方向
 - 移除 explicit_txn_mutex_ → 98.5% abort率，写写冲突
