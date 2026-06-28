@@ -16,5 +16,3 @@ t3_reorder/
 test_bracket*/
 test_t4a*/
 test_*_db/
-__pycache__/
-bench_tpcc_db/
