@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 #include "storage/disk_manager.h"
 
 #include <assert.h>    // for assert
+#include <errno.h>
 #include <string.h>    // for memset
 #include <sys/stat.h>  // for stat
 #include <unistd.h>    // for lseek
@@ -20,23 +21,38 @@ See the Mulan PSL v2 for more details. */
 DiskManager::DiskManager() { memset(fd2pageno_, 0, MAX_FD * (sizeof(std::atomic<page_id_t>) / sizeof(char))); }
 
 void DiskManager::write_page(int fd, page_id_t page_no, const char *offset, int num_bytes) {
-    lseek(fd, page_no * PAGE_SIZE, SEEK_SET);
-    ssize_t bytes_write = write(fd, offset, num_bytes);
-    if (bytes_write != num_bytes) {
-        throw InternalError("DiskManager::write_page Error");
+    off_t file_offset = static_cast<off_t>(page_no) * PAGE_SIZE;
+    int written = 0;
+    while (written < num_bytes) {
+        ssize_t bytes_write = pwrite(fd, offset + written, num_bytes - written, file_offset + written);
+        if (bytes_write < 0 && errno == EINTR) {
+            continue;
+        }
+        if (bytes_write <= 0) {
+            throw InternalError("DiskManager::write_page Error");
+        }
+        written += static_cast<int>(bytes_write);
     }
 }
 
 void DiskManager::read_page(int fd, page_id_t page_no, char *offset, int num_bytes) {
-    lseek(fd, page_no * PAGE_SIZE, SEEK_SET);
-    ssize_t bytes_read = read(fd, offset, num_bytes);
-    if (bytes_read < 0) {
-        throw InternalError("DiskManager::read_page Error");
+    off_t file_offset = static_cast<off_t>(page_no) * PAGE_SIZE;
+    int read_bytes = 0;
+    while (read_bytes < num_bytes) {
+        ssize_t bytes_read = pread(fd, offset + read_bytes, num_bytes - read_bytes, file_offset + read_bytes);
+        if (bytes_read < 0 && errno == EINTR) {
+            continue;
+        }
+        if (bytes_read < 0) {
+            throw InternalError("DiskManager::read_page Error");
+        }
+        if (bytes_read == 0) {
+            break;
+        }
+        read_bytes += static_cast<int>(bytes_read);
     }
-    // If we read fewer bytes than requested (e.g., reading beyond file end),
-    // zero out the remaining bytes
-    if (bytes_read < num_bytes) {
-        memset(offset + bytes_read, 0, num_bytes - bytes_read);
+    if (read_bytes < num_bytes) {
+        memset(offset + read_bytes, 0, num_bytes - read_bytes);
     }
 }
 
@@ -158,23 +174,45 @@ int DiskManager::read_log(char *log_data, int size, int offset) {
 
     size = std::min(size, file_size - offset);
     if(size == 0) return 0;
-    lseek(log_fd_, offset, SEEK_SET);
-    ssize_t bytes_read = read(log_fd_, log_data, size);
-    assert(bytes_read == size);
-    return bytes_read;
+    int read_bytes = 0;
+    while (read_bytes < size) {
+        ssize_t bytes_read = pread(log_fd_, log_data + read_bytes, size - read_bytes, offset + read_bytes);
+        if (bytes_read < 0 && errno == EINTR) {
+            continue;
+        }
+        if (bytes_read < 0) {
+            throw UnixError();
+        }
+        if (bytes_read == 0) {
+            break;
+        }
+        read_bytes += static_cast<int>(bytes_read);
+    }
+    return read_bytes;
 }
 
 void DiskManager::write_log(char *log_data, int size) {
+    std::lock_guard<std::mutex> lock(log_latch_);
     if (log_fd_ == -1) {
         log_fd_ = open_file(LOG_FILE_NAME);
     }
 
-    lseek(log_fd_, 0, SEEK_END);
-    ssize_t bytes_write = write(log_fd_, log_data, size);
-    if (bytes_write != size) {
+    struct stat stat_buf;
+    if (fstat(log_fd_, &stat_buf) < 0) {
         throw UnixError();
     }
+    off_t offset = stat_buf.st_size;
+    int written = 0;
+    while (written < size) {
+        ssize_t bytes_write = pwrite(log_fd_, log_data + written, size - written, offset + written);
+        if (bytes_write < 0 && errno == EINTR) {
+            continue;
+        }
+        if (bytes_write <= 0) {
+            throw UnixError();
+        }
+        written += static_cast<int>(bytes_write);
+    }
 }
-
 
 

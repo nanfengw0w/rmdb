@@ -9,6 +9,7 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #include <cstring>
+#include <vector>
 #include "log_manager.h"
 
 /**
@@ -23,6 +24,14 @@ lsn_t LogManager::add_log_to_buffer(LogRecord* log_record) {
     log_record->lsn_ = lsn;
 
     int size = log_record->log_tot_len_;
+    if (size > LOG_BUFFER_SIZE) {
+        flush_log_to_disk_unlocked();
+        std::vector<char> direct_buf(size);
+        log_record->serialize(direct_buf.data());
+        disk_manager_->write_log(direct_buf.data(), size);
+        persist_lsn_ = lsn;
+        return lsn;
+    }
     if (log_buffer_.is_full(size)) {
         flush_log_to_disk_unlocked();
     }

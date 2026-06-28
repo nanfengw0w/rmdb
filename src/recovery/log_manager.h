@@ -10,6 +10,7 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <condition_variable>
 #include <mutex>
 #include <vector>
 #include <set>
@@ -460,16 +461,31 @@ public:
 
     // 活跃事务跟踪（用于checkpoint）
     void add_active_txn(txn_id_t txn_id) {
-        std::lock_guard<std::mutex> lock(active_txn_latch_);
+        std::unique_lock<std::mutex> lock(active_txn_latch_);
+        checkpoint_cv_.wait(lock, [&]() { return !checkpoint_in_progress_; });
         active_txns_.insert(txn_id);
     }
     void remove_active_txn(txn_id_t txn_id) {
         std::lock_guard<std::mutex> lock(active_txn_latch_);
         active_txns_.erase(txn_id);
+        if (active_txns_.empty()) {
+            checkpoint_cv_.notify_all();
+        }
     }
     std::vector<txn_id_t> get_active_txns() {
         std::lock_guard<std::mutex> lock(active_txn_latch_);
         return std::vector<txn_id_t>(active_txns_.begin(), active_txns_.end());
+    }
+    std::vector<txn_id_t> begin_checkpoint() {
+        std::unique_lock<std::mutex> lock(active_txn_latch_);
+        checkpoint_in_progress_ = true;
+        checkpoint_cv_.wait(lock, [&]() { return active_txns_.empty(); });
+        return std::vector<txn_id_t>(active_txns_.begin(), active_txns_.end());
+    }
+    void end_checkpoint() {
+        std::lock_guard<std::mutex> lock(active_txn_latch_);
+        checkpoint_in_progress_ = false;
+        checkpoint_cv_.notify_all();
     }
 
 private:
@@ -481,5 +497,7 @@ private:
     lsn_t persist_lsn_;                 // 记录已经持久化到磁盘中的最后一条日志的日志号
     DiskManager* disk_manager_;
     std::mutex active_txn_latch_;       // 用于活跃事务集合的并发访问
+    std::condition_variable checkpoint_cv_;
     std::set<txn_id_t> active_txns_;    // 当前活跃的事务ID集合
+    bool checkpoint_in_progress_ = false;
 }; 

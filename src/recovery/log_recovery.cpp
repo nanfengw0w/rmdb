@@ -35,8 +35,7 @@ static std::vector<LogRecord*> read_all_logs(DiskManager* disk_manager, int star
         LogType log_type = *reinterpret_cast<const LogType*>(record_data);
         uint32_t log_tot_len = *reinterpret_cast<const uint32_t*>(record_data + OFFSET_LOG_TOT_LEN);
 
-        if (log_tot_len == 0 || log_tot_len > LOG_BUFFER_SIZE) break;
-        if (offset + static_cast<int>(log_tot_len) > bytes_read) break;
+        if (log_tot_len == 0 || log_tot_len > static_cast<uint32_t>(bytes_read - offset)) break;
 
         LogRecord* record = nullptr;
         switch (log_type) {
@@ -141,7 +140,7 @@ void RecoveryManager::analyze() {
                     start_offset = offset;
                     break;
                 }
-                if (log_tot_len == 0 || log_tot_len > LOG_BUFFER_SIZE) break;
+                if (log_tot_len == 0 || log_tot_len > static_cast<uint32_t>(file_size - offset)) break;
                 offset += log_tot_len;
             }
         }

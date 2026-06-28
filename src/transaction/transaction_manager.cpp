@@ -40,10 +40,10 @@ Transaction * TransactionManager::begin(Transaction* txn, LogManager* log_manage
 
     // WAL: Write begin log record (flushed at commit or when buffer is full)
     if (log_manager != nullptr) {
+        log_manager->add_active_txn(txn->get_transaction_id());
         BeginLogRecord begin_log(txn->get_transaction_id());
         lsn_t lsn = log_manager->add_log_to_buffer(&begin_log);
         txn->set_prev_lsn(lsn);
-        log_manager->add_active_txn(txn->get_transaction_id());
     }
 
     return txn;

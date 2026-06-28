@@ -17,6 +17,7 @@ See the Mulan PSL v2 for more details. */
 #include <atomic>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 
@@ -95,5 +96,6 @@ class DiskManager {
     std::unordered_map<int, std::string> fd2path_;  //<Page fd,Page文件磁盘路径>哈希表
 
     int log_fd_ = -1;                             // WAL日志文件的文件句柄，默认为-1，代表未打开日志文件
+    std::mutex log_latch_;                        // 保护日志文件追加位置
     std::atomic<page_id_t> fd2pageno_[MAX_FD]{};  // 文件中已经分配的页面个数，初始值为0
 };

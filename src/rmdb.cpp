@@ -789,7 +789,22 @@ void *client_handler(void *sock_fd) {
             std::string cmd_lower_ck = cmd_check;
             for (auto &c : cmd_lower_ck) c = tolower(c);
             if (cmd_lower_ck == "create static_checkpoint") {
+                bool checkpoint_started = false;
                 try {
+                    memset(data_send, '\0', BUFFER_LENGTH);
+                    offset = 0;
+
+                    Transaction *current_txn = txn_manager->get_transaction(txn_id);
+                    if (current_txn != nullptr &&
+                        current_txn->get_state() != TransactionState::COMMITTED &&
+                        current_txn->get_state() != TransactionState::ABORTED) {
+                        txn_manager->abort(current_txn, log_manager.get());
+                        txn_id = INVALID_TXN_ID;
+                    }
+
+                    auto active_txns = log_manager->begin_checkpoint();
+                    checkpoint_started = true;
+
                     // (1) Flush log buffer to disk
                     log_manager->flush_log_to_disk();
                     int checkpoint_offset = disk_manager->get_file_size(LOG_FILE_NAME);
@@ -798,7 +813,6 @@ void *client_handler(void *sock_fd) {
                     }
 
                     // (2) Write checkpoint record to log
-                    auto active_txns = log_manager->get_active_txns();
                     lsn_t current_lsn = 0; // will be assigned by add_log_to_buffer
                     {
                         CheckpointLogRecord ckpt(current_lsn, active_txns);
@@ -826,8 +840,15 @@ void *client_handler(void *sock_fd) {
                     ofs << checkpoint_offset;
                     ofs.close();
 
+                    log_manager->end_checkpoint();
+                    checkpoint_started = false;
                     set_response(data_send, &offset, "OK\n");
                 } catch (std::exception &e) {
+                    if (checkpoint_started) {
+                        log_manager->end_checkpoint();
+                    }
+                    memset(data_send, '\0', BUFFER_LENGTH);
+                    offset = 0;
                     set_response(data_send, &offset, std::string("Error: ") + e.what() + "\n");
                 }
                 if (write(fd, data_send, offset + 1) == -1) break;
