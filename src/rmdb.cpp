@@ -35,7 +35,7 @@ See the Mulan PSL v2 for more details. */
 #include "analyze/analyze.h"
 
 #define SOCK_PORT 8765
-#define MAX_CONN_LIMIT 8
+#define MAX_CONN_LIMIT 64
 
 static bool should_exit = false;
 std::atomic<bool> enable_output_file{true};
@@ -886,8 +886,8 @@ static bool try_handle_fast_insert(const std::string &sql, txn_id_t *txn_id,
 }
 
 void *client_handler(void *sock_fd) {
-    int fd = *((int *)sock_fd);
-    pthread_mutex_unlock(sockfd_mutex);
+    std::unique_ptr<int> fd_holder(static_cast<int *>(sock_fd));
+    int fd = *fd_holder;
 
     int i_recvBytes;
     // 接收客户端发送的请求
@@ -1456,7 +1456,6 @@ void start_server() {
         }
 
         // Block here. Until server accepts a new connection.
-        pthread_mutex_lock(sockfd_mutex);
         int sockfd = accept(sockfd_server, (struct sockaddr *)(&s_addr_client), (socklen_t *)(&client_length));
         if (sockfd == -1) {
             std::cout << "Accept error!" << std::endl;
@@ -1464,10 +1463,14 @@ void start_server() {
         }
         
         // 和客户端建立连接，并开启一个线程负责处理客户端请求
-        if (pthread_create(&thread_id, nullptr, &client_handler, (void *)(&sockfd)) != 0) {
+        auto *client_fd = new int(sockfd);
+        if (pthread_create(&thread_id, nullptr, &client_handler, client_fd) != 0) {
+            delete client_fd;
+            close(sockfd);
             std::cout << "Create thread fail!" << std::endl;
             break;  // break while loop
         }
+        pthread_detach(thread_id);
 
     }
 

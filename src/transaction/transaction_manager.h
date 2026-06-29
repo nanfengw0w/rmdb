@@ -60,6 +60,7 @@ public:
         sm_manager_ = sm_manager;
         lock_manager_ = lock_manager;
         concurrency_mode_ = concurrency_mode;
+        current_instance_ = this;
     }
     
     ~TransactionManager() = default;
@@ -73,6 +74,12 @@ public:
     void acquire_explicit_txn_lock(Transaction* txn);
 
     void release_explicit_txn_lock(Transaction* txn);
+
+    bool acquire_perf_write_lock(Transaction* txn, int fd, const Rid& rid);
+
+    void release_perf_write_locks(Transaction* txn);
+
+    static TransactionManager* current() { return current_instance_; }
 
     ConcurrencyMode get_concurrency_mode() { return concurrency_mode_; }
 
@@ -369,6 +376,30 @@ public:
     // SSI 互斥锁
     std::mutex ssi_mutex_;
     std::vector<std::pair<txn_id_t, txn_id_t>> rw_edges_;
+
+    struct PerfWriteLockKey {
+        int fd;
+        int page_no;
+        int slot_no;
+
+        bool operator==(const PerfWriteLockKey& other) const {
+            return fd == other.fd && page_no == other.page_no && slot_no == other.slot_no;
+        }
+    };
+
+    struct PerfWriteLockKeyHash {
+        size_t operator()(const PerfWriteLockKey& key) const {
+            size_t h1 = std::hash<int>()(key.fd);
+            size_t h2 = std::hash<int>()(key.page_no);
+            size_t h3 = std::hash<int>()(key.slot_no);
+            return h1 ^ (h2 << 16) ^ (h3 << 32);
+        }
+    };
+
+    std::mutex perf_write_lock_mutex_;
+    std::unordered_map<PerfWriteLockKey, txn_id_t, PerfWriteLockKeyHash> perf_write_locks_;
+    std::unordered_map<txn_id_t, std::vector<PerfWriteLockKey>> txn_perf_write_locks_;
+    inline static TransactionManager* current_instance_{nullptr};
 
     /**
      * @description: 获取事务ID为txn_id的事务对象

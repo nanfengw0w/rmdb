@@ -98,6 +98,8 @@ class Transaction {
     inline bool get_txn_mode() { return txn_mode_; }
     inline void set_serial_txn_lock_held(bool held) { serial_txn_lock_held_ = held; }
     inline bool get_serial_txn_lock_held() const { return serial_txn_lock_held_; }
+    inline void set_perf_mode(bool enabled) { perf_mode_ = enabled; }
+    inline bool get_perf_mode() const { return perf_mode_; }
 
     inline void set_start_ts(timestamp_t start_ts) { start_ts_ = start_ts; }
     inline timestamp_t get_start_ts() { return start_ts_; }
@@ -167,6 +169,7 @@ class Transaction {
    private:
     bool txn_mode_;                   // 用于标识当前事务为显式事务还是单条SQL语句的隐式事务
     bool serial_txn_lock_held_{false};
+    bool perf_mode_{false};
     TransactionState state_;          // 事务状态
     IsolationLevel isolation_level_;  // 事务的隔离级别，默认隔离级别为可串行化
     std::thread::id thread_id_;       // 当前事务对应的线程id

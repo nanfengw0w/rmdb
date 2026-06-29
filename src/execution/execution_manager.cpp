@@ -132,7 +132,7 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t *txn_id, Co
             {
                 // 显示开启一个事务
                 if (!enable_output_file.load()) {
-                    txn_mgr_->acquire_explicit_txn_lock(context->txn_);
+                    context->txn_->set_perf_mode(true);
                     if (context->txn_->get_isolation_level() == IsolationLevel::READ_COMMITTED) {
                         context->txn_->set_isolation_level(IsolationLevel::SNAPSHOT_ISOLATION);
                     }

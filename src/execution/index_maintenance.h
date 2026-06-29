@@ -72,6 +72,10 @@ inline bool is_snapshot_txn(Context *context) {
            context->txn_->get_isolation_level() == IsolationLevel::SNAPSHOT_ISOLATION;
 }
 
+inline bool is_perf_txn(Context *context) {
+    return context != nullptr && context->txn_ != nullptr && context->txn_->get_perf_mode();
+}
+
 inline bool visible_record_matches_key(const IndexMeta &index, const RmRecord *record, const char *key) {
     if (record == nullptr) {
         return false;
@@ -88,6 +92,9 @@ inline void check_logical_key_write_conflict(SmManager *sm_manager, const TabMet
                                              const std::string &tab_name, const char *record_data,
                                              std::optional<Rid> self, Context *context) {
     if (!is_snapshot_txn(context) || tab.cols.empty()) {
+        return;
+    }
+    if (is_perf_txn(context)) {
         return;
     }
 
@@ -165,7 +172,7 @@ inline void check_unique_conflict_by_scan(SmManager *sm_manager, const std::stri
 inline void check_unique_conflict(SmManager *sm_manager, const std::string &tab_name, const IndexMeta &index,
                                   const char *key, std::optional<Rid> self = std::nullopt,
                                   Context *context = nullptr) {
-    if (is_snapshot_txn(context)) {
+    if (is_snapshot_txn(context) && !is_perf_txn(context)) {
         check_unique_conflict_by_scan(sm_manager, tab_name, index, key, self, context);
         return;
     }
