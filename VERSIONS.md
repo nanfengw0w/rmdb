@@ -229,10 +229,14 @@
 - 性能测试 Phase 3: WA（Post-transaction consistency validation failed）
 - 第10题: 7.30分，crash_recovery_with_checkpoint 失败（server stops running at normal running phase）
 
+### 根因分析
+- 第10题 checkpoint 失败：`begin_checkpoint()` 等待所有活跃事务完成，但测试框架在有活跃事务时触发 checkpoint，导致死锁/超时
+- 性能测试 Phase 3 失败：可能是 main 分支本身的问题（已回退到纯 main 代码测试）
+
 ### 修复措施
-1. 恢复 explicit_txn_mutex_（移除它导致 Phase 3 一致性失败）
-2. 回退 check_logical_key_write_conflict 索引优化（可能漏检冲突）
-3. 移除 cleanup_committed_mvcc_changes 调用（可能在 checkpoint 期间引起问题）
+1. checkpoint 死锁修复：`begin_checkpoint()` 不再等待活跃事务，直接获取快照
+2. `add_active_txn()` 不再等待 checkpoint 结束
+3. 字符串 MIN/MAX 聚合支持
 
 ### 待验证
 - 线上测试待重新运行，验证修复是否有效
