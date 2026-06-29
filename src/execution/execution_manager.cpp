@@ -131,14 +131,6 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t *txn_id, Co
             case T_Transaction_begin:
             {
                 // 显示开启一个事务
-                txn_mgr_->acquire_explicit_txn_lock(context->txn_);
-                if (context->txn_->get_isolation_level() == IsolationLevel::READ_COMMITTED) {
-                    context->txn_->set_isolation_level(IsolationLevel::SNAPSHOT_ISOLATION);
-                }
-                if (context->txn_->get_isolation_level() == IsolationLevel::SNAPSHOT_ISOLATION ||
-                    context->txn_->get_isolation_level() == IsolationLevel::SERIALIZABLE) {
-                    context->txn_->set_start_ts(txn_mgr_->get_next_timestamp());
-                }
                 context->txn_->set_txn_mode(true);
                 break;
             }  

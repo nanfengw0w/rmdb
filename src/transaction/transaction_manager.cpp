@@ -185,7 +185,6 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     if (txn == nullptr) return;
     if (txn->get_state() == TransactionState::ABORTED ||
         txn->get_state() == TransactionState::COMMITTED) {
-        release_explicit_txn_lock(txn);
         return;
     }
 
@@ -217,11 +216,6 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     for (auto &lock_data_id : *lock_set) {
         lock_manager_->unlock(txn, lock_data_id);
     }
-
-    if (level != IsolationLevel::SERIALIZABLE) {
-        clear_write_records(txn);
-    }
-    release_explicit_txn_lock(txn);
 }
 
 /**
@@ -231,27 +225,21 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
     if (txn == nullptr) return;
 
     IsolationLevel level = txn->get_isolation_level();
-    bool mvcc_abort = (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE);
-    if (mvcc_abort) {
-        // MVCC: 先恢复磁盘数据，再删除版本链条目
-        // 顺序至关重要：必须先恢复磁盘数据，否则在删除版本链和恢复磁盘之间的
-        // 窗口期，其他事务会读到未提交的脏数据（版本链已删除，磁盘还是新数据）
+    if (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE) {
+        // MVCC: 回滚版本管理器中的所有写操作
+        auto& vm = VersionManager::instance();
+        vm.abort_transaction(txn->get_transaction_id());
 
-        // Phase 1: 使用write_set恢复旧数据到磁盘（版本链仍保护读操作）
+        // 使用write_set恢复旧数据到磁盘（与非MVCC模式相同）
         auto write_set = txn->get_write_set();
         for (auto it = write_set->rbegin(); it != write_set->rend(); ++it) {
             WriteRecord *wr = *it;
             auto &tab_name = wr->GetTableName();
             auto &rid = wr->GetRid();
             auto fh = sm_manager_->fhs_.at(tab_name).get();
-            auto &tab = sm_manager_->db_.get_table(tab_name);
 
             switch (wr->GetWriteType()) {
                 case WType::INSERT_TUPLE: {
-                    auto current = fh->get_record(rid, nullptr);
-                    if (current != nullptr) {
-                        delete_abort_index_entries(sm_manager_, tab_name, tab, current->data);
-                    }
                     fh->delete_record(rid, nullptr);
                     break;
                 }
@@ -260,18 +248,11 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
                     break;
                 }
                 case WType::UPDATE_TUPLE: {
-                    auto current = fh->get_record(rid, nullptr);
-                    rollback_update_index_entries(sm_manager_, tab_name, tab, current.get(),
-                                                  wr->GetRecord(), rid, mvcc_abort);
                     fh->update_record(rid, wr->GetRecord().data, nullptr);
                     break;
                 }
             }
         }
-
-        // Phase 2: 磁盘已一致，安全删除版本链条目
-        auto& vm = VersionManager::instance();
-        vm.abort_transaction(txn->get_transaction_id());
     } else {
         // 非MVCC模式：Undo all write operations in reverse order
         auto write_set = txn->get_write_set();
@@ -280,26 +261,17 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
             auto &tab_name = wr->GetTableName();
             auto &rid = wr->GetRid();
             auto fh = sm_manager_->fhs_.at(tab_name).get();
-            auto &tab = sm_manager_->db_.get_table(tab_name);
 
             switch (wr->GetWriteType()) {
                 case WType::INSERT_TUPLE: {
-                    auto current = fh->get_record(rid, nullptr);
-                    if (current != nullptr) {
-                        delete_abort_index_entries(sm_manager_, tab_name, tab, current->data);
-                    }
                     fh->delete_record(rid, nullptr);
                     break;
                 }
                 case WType::DELETE_TUPLE: {
-                    insert_abort_index_entries(sm_manager_, tab_name, tab, wr->GetRecord().data, rid);
                     fh->insert_record(rid, wr->GetRecord().data);
                     break;
                 }
                 case WType::UPDATE_TUPLE: {
-                    auto current = fh->get_record(rid, nullptr);
-                    rollback_update_index_entries(sm_manager_, tab_name, tab, current.get(),
-                                                  wr->GetRecord(), rid, false);
                     fh->update_record(rid, wr->GetRecord().data, nullptr);
                     break;
                 }
@@ -329,8 +301,6 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
     }
 
     txn->set_state(TransactionState::ABORTED);
-    clear_write_records(txn);
-    release_explicit_txn_lock(txn);
 }
 
 /**
