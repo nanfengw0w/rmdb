@@ -2,6 +2,26 @@
 
 ## 在线测试结果汇总
 
+## 性能测试合并分支修复记录
+
+### 2026-06-29 performance 入口语法与 load 修复
+- **背景**: `perf-main-safe` 分支前十题通过，`temp` 分支性能测试能过但前十题有大量风险，不能整体合并。当前只从性能题要求中抽取通用能力修复。
+- **题目依据**:
+  1. 性能题会发送 `load file_name into table_name;`，CSV 文件不包含建表语句，题面未保证有 header。
+  2. 性能题会发送 `set output_file off`，且该命令不带分号。
+  3. 性能 SQL 中存在自引用更新，例如 `update warehouse set w_ytd=w_ytd+:h_amount ...`、`c_delivery_cnt=c_delivery_cnt+1`。
+  4. 聚合测试覆盖字符串 `MIN/MAX`。
+- **本次改动**:
+  1. `rmdb.cpp` 增加多 SQL 包拆分，避免一次 socket read 中包含多条 SQL 时只处理第一条。
+  2. `rmdb.cpp` 支持自引用算术 UPDATE：`col=col+N`、`col=col+N-M` 和 `col += N` 等形式，最终仍走通用 `UpdateExecutor`。
+  3. `load` 不再无条件跳过第一行；仅当第一条非空行与表字段名完全匹配时作为 header 跳过，否则作为正常数据导入，修复无 header CSV 丢首行问题。
+  4. 显式事务中 SQL 执行异常或写写冲突后，连接进入失败态，后续语句返回 `abort` 直到 `commit/rollback/begin` 清理，避免失败事务继续产生部分写。
+- **本地验证**:
+  - `make -C build -j` 通过。
+  - `./build/bin/unit_test` 5/5 通过。
+  - socket smoke 通过：自增 UPDATE、无 header load、有 header load、字符串 MIN/MAX、`set output_file off` 后查询。
+- **风险边界**: 本次没有合并 `temp` 的事务、WAL、索引扫描、缓冲池优化；这些方向此前多次导致 Phase 3 consistency validation 或前十题回归。
+
 ## 第十题静态检查点修复记录
 
 ### 2026-06-29 checkpoint 正常运行阶段崩溃修复
