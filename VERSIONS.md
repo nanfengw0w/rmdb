@@ -4,6 +4,23 @@
 
 ## 性能测试合并分支修复记录
 
+### 2026-06-29 performance Phase 3 abort 索引与版本链顺序修复
+- **线上反馈**: 第九题已满分，但性能测试 Phase 3 仍在事务后 consistency validation 失败。
+- **继续定位**:
+  1. `TransactionManager::abort()` 原实现先删除 MVCC 版本链，再按 write set 恢复磁盘数据。高并发下存在窗口：版本链已消失但磁盘仍是 aborted 新值，其他事务可读到脏中间态。
+  2. abort 未同步维护索引。事务内 insert/update 索引列后 abort，表数据恢复了，但新索引项可能残留，后续索引扫描或唯一检查会受到污染。
+- **本次修复**:
+  1. MVCC abort 改为先按 write set 逆序恢复表数据和索引，再删除版本链条目。
+  2. INSERT abort 删除新记录对应索引项；UPDATE abort 删除新 key 索引项，MVCC 下保留旧 key 候选；非 MVCC DELETE/UPDATE abort 也恢复对应索引项。
+  3. abort 后清理 write set，避免同一事务对象后续重复回滚残留写记录。
+- **本地验证**:
+  - `make -C build -j` 通过。
+  - abort/index smoke 通过：更新索引列后 abort，旧 key 可查、新 key 不可查；插入后 abort，同 key 可重新插入。
+  - `./build/bin/unit_test` 5/5 通过。
+  - `python3 test_crash_recovery.py` 基础恢复和 checkpoint 恢复通过。
+  - `python3 test_topic5.py` 8/8 通过。
+  - `python3 test_topic6.py` 5/5 通过。
+
 ### 2026-06-29 performance Phase 3 / 第九题回归修复
 - **线上反馈**:
   1. 性能测试 Phase 1/2 通过，但 Phase 3 `Post-transaction consistency validation` 失败。
