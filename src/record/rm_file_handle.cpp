@@ -127,15 +127,15 @@ void RmFileHandle::delete_record(const Rid& rid, Context* context) {
             mvcc_delete = true;
             auto& vm = VersionManager::instance();
 
-            if (!vm.check_write_conflict(fd_, rid, context->txn_)) {
+            // Reserve the write version atomically with conflict detection.
+            // Otherwise two concurrent writers can both pass the check before
+            // either one appends its uncommitted version entry.
+            RmRecord old_data(file_hdr_.record_size, page_handle.get_slot(rid.slot_no));
+            if (!vm.save_old_data_if_no_conflict(fd_, rid, context->txn_, &old_data, false, true)) {
                 buffer_pool_manager_->unpin_page(PageId{fd_, rid.page_no}, false);
                 throw TransactionAbortException(context->txn_->get_transaction_id(),
                     AbortReason::DEADLOCK_PREVENTION);
             }
-
-            // 保存旧数据
-            RmRecord old_data(file_hdr_.record_size, page_handle.get_slot(rid.slot_no));
-            vm.save_old_data(fd_, rid, context->txn_, &old_data, false, true);
         }
     }
 
@@ -172,15 +172,13 @@ void RmFileHandle::update_record(const Rid& rid, char* buf, Context* context) {
         if (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE) {
             auto& vm = VersionManager::instance();
 
-            if (!vm.check_write_conflict(fd_, rid, context->txn_)) {
+            // Reserve the write version atomically with conflict detection.
+            RmRecord old_data(file_hdr_.record_size, page_handle.get_slot(rid.slot_no));
+            if (!vm.save_old_data_if_no_conflict(fd_, rid, context->txn_, &old_data, false)) {
                 buffer_pool_manager_->unpin_page(PageId{fd_, rid.page_no}, false);
                 throw TransactionAbortException(context->txn_->get_transaction_id(),
                     AbortReason::DEADLOCK_PREVENTION);
             }
-
-            // 保存旧数据
-            RmRecord old_data(file_hdr_.record_size, page_handle.get_slot(rid.slot_no));
-            vm.save_old_data(fd_, rid, context->txn_, &old_data, false);
         }
     }
 

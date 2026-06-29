@@ -340,3 +340,10 @@
 - **修复**: `handle_aggregate()` 跳过不可见记录；`UpdateExecutor` 和 `DeleteExecutor` 对过期 RID 做防护，MVCC 显式事务下按写冲突中止，避免继续生成日志、索引和写集。
 - **本地验证**: 16 线程最小 TPCC NewOrder+Delivery 压测通过核心不变量：`d_next_o_id-1 == max(o_id)`、`sum(o_ol_cnt) == count(order_line)`、`count(orders) == 成功 NewOrder`，且服务端不崩溃。
 - **教训**: 性能门禁必须覆盖 Delivery 对 `new_orders` 的并发 `min/delete`，只测 NewOrder 无法发现 MVCC tombstone 对聚合扫描和一致性检查的影响。
+
+### 11. 性能 Phase 3 持续失败：写写冲突检查非原子
+- **线上结果**: 修复 tombstone 后仍然 Phase 3 `Post-transaction consistency validation` 失败。
+- **定位**: `RmFileHandle::update_record/delete_record` 先调用 `VersionManager::check_write_conflict()`，再调用 `save_old_data()`。这两个函数分别加锁，中间存在窗口；16 线程同时更新同一行时，多个事务可能同时通过检查，导致本应 abort 的写事务继续提交，产生 lost update。
+- **修复**: 新增 `VersionManager::save_old_data_if_no_conflict()`，在同一把锁内完成写写冲突检查和未提交版本登记；UPDATE/DELETE 改为使用该原子接口。
+- **本地验证**: 16 线程同一行 `update t set v=v+1` 每轮仅 1 个事务提交；含 NewOrder/Payment/Delivery/stock 重复更新的混合压测通过订单链和 order_line 不变量。
+- **教训**: MVCC 写写冲突的“检测”和“占位/登记未提交版本”必须是一个原子步骤，否则并发压力下功能测试通过但 TPCC 一致性会丢更新。

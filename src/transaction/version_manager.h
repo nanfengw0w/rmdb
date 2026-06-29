@@ -103,6 +103,35 @@ public:
         return true;
     }
 
+    bool save_old_data_if_no_conflict(int fd, const Rid& rid, Transaction* txn,
+                                      const RmRecord* old_data, bool was_deleted,
+                                      bool new_deleted = false) {
+        VersionKey key{fd, rid.page_no, rid.slot_no};
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        auto& chain = version_chains_[key];
+        if (!chain.empty()) {
+            auto& latest = chain.back();
+            if (latest.txn_id_ != txn->get_transaction_id()) {
+                if (latest.commit_ts_ == 0 || latest.commit_ts_ > txn->get_start_ts()) {
+                    return false;
+                }
+            }
+        }
+
+        VersionEntry entry;
+        entry.txn_id_ = txn->get_transaction_id();
+        entry.commit_ts_ = 0;
+        entry.is_deleted_ = was_deleted;
+        entry.new_deleted_ = new_deleted;
+        if (old_data && !was_deleted) {
+            entry.old_data_ = std::make_shared<RmRecord>(*old_data);
+        }
+
+        chain.push_back(std::move(entry));
+        return true;
+    }
+
     /**
      * @brief 记录写操作前的旧数据
      * @param old_data 写操作前的数据
