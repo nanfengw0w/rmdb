@@ -218,10 +218,6 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
         lock_manager_->unlock(txn, lock_data_id);
     }
 
-    if (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE) {
-        cleanup_committed_mvcc_changes(sm_manager_, txn);
-    }
-
     if (level != IsolationLevel::SERIALIZABLE) {
         clear_write_records(txn);
     }
