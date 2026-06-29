@@ -121,6 +121,22 @@ Transaction * TransactionManager::begin(Transaction* txn, LogManager* log_manage
     return txn;
 }
 
+void TransactionManager::acquire_explicit_txn_lock(Transaction* txn) {
+    if (txn == nullptr || txn->get_serial_txn_lock_held()) {
+        return;
+    }
+    explicit_txn_mutex_.lock();
+    txn->set_serial_txn_lock_held(true);
+}
+
+void TransactionManager::release_explicit_txn_lock(Transaction* txn) {
+    if (txn == nullptr || !txn->get_serial_txn_lock_held()) {
+        return;
+    }
+    txn->set_serial_txn_lock_held(false);
+    explicit_txn_mutex_.unlock();
+}
+
 /**
  * @description: 事务的提交方法
  */
@@ -128,6 +144,7 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     if (txn == nullptr) return;
     if (txn->get_state() == TransactionState::ABORTED ||
         txn->get_state() == TransactionState::COMMITTED) {
+        release_explicit_txn_lock(txn);
         return;
     }
 
@@ -159,6 +176,7 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     for (auto &lock_data_id : *lock_set) {
         lock_manager_->unlock(txn, lock_data_id);
     }
+    release_explicit_txn_lock(txn);
 }
 
 /**
@@ -263,6 +281,7 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
 
     txn->set_state(TransactionState::ABORTED);
     clear_write_records(txn);
+    release_explicit_txn_lock(txn);
 }
 
 /**

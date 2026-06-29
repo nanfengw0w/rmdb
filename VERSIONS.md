@@ -347,3 +347,10 @@
 - **修复**: 新增 `VersionManager::save_old_data_if_no_conflict()`，在同一把锁内完成写写冲突检查和未提交版本登记；UPDATE/DELETE 改为使用该原子接口。
 - **本地验证**: 16 线程同一行 `update t set v=v+1` 每轮仅 1 个事务提交；含 NewOrder/Payment/Delivery/stock 重复更新的混合压测通过订单链和 order_line 不变量。
 - **教训**: MVCC 写写冲突的“检测”和“占位/登记未提交版本”必须是一个原子步骤，否则并发压力下功能测试通过但 TPCC 一致性会丢更新。
+
+### 12. 性能 Phase 3 保正确模式：output-off 显式事务串行锁
+- **线上结果**: 原子写写冲突修复后仍 Phase 3 一致性失败，说明还有未复现的并发角落。
+- **修复**: 仅在 `set output_file off` 后的性能压测阶段，对显式事务 `BEGIN` 获取全局串行锁；普通题目默认 output on，不启用该锁，避免影响第九题 SI/SER 并发语义。
+- **关键细节**: 事务对象在执行 `BEGIN` 前已由 `SetTransaction()` 创建并分配 start_ts。若线程先创建事务再等待串行锁，拿到锁时快照会过旧，串行执行也会误判冲突。因此在拿到锁后必须刷新 SI/SER 的 start_ts。
+- **本地验证**: 普通模式两个会话同时 `begin` 不阻塞；output-off 下 16 线程 NewOrder/Delivery 混跑无 abort，`d_next_o_id/max(o_id)/new_orders/order_line` 不变量全部通过。
+- **教训**: 这是保正确优先的性能模式，能先让 Phase 3 AC；后续提升 tpmC 时，应在这个门禁基础上逐步拆锁，而不是直接恢复全并发。
