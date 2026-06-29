@@ -799,8 +799,13 @@ static void clear_fast_autocommit_state(Transaction *txn) {
     write_set->clear();
 }
 
+static bool is_explicit_txn_context(Context *context) {
+    return context != nullptr && context->txn_ != nullptr && context->txn_->get_txn_mode();
+}
+
 static bool try_handle_fast_insert(const std::string &sql, txn_id_t *txn_id,
-                                   char *data_send, int *offset, int fd) {
+                                   char *data_send, int *offset, int fd,
+                                   bool *txn_failed) {
     std::string tab_name;
     std::vector<Value> values;
     if (!try_parse_simple_insert_local(sql, tab_name, values)) {
@@ -822,6 +827,9 @@ static bool try_handle_fast_insert(const std::string &sql, txn_id_t *txn_id,
         }
     } catch (TransactionAbortException &e) {
         set_response(data_send, offset, "abort\n");
+        if (is_explicit_txn_context(context.get()) && txn_failed != nullptr) {
+            *txn_failed = true;
+        }
         txn_manager->abort(context->txn_, log_manager.get());
         std::cout << e.GetInfo() << std::endl;
 
@@ -860,6 +868,7 @@ void *client_handler(void *sock_fd) {
     int offset = 0;
     // 记录客户端当前正在执行的事务ID
     txn_id_t txn_id = INVALID_TXN_ID;
+    bool txn_failed = false;
     std::deque<std::string> pending_requests;
 
     std::string output = "establish client connection, sockfd: " + std::to_string(fd) + "\n";
@@ -933,6 +942,27 @@ void *client_handler(void *sock_fd) {
             offset = 0;
             if (write(fd, data_send, offset + 1) == -1) break;
             continue;
+        }
+
+        if (txn_failed) {
+            if (control_cmd == "begin") {
+                txn_id = INVALID_TXN_ID;
+                txn_failed = false;
+            } else if (control_cmd == "commit" || control_cmd == "abort" || control_cmd == "rollback") {
+                txn_id = INVALID_TXN_ID;
+                txn_failed = false;
+                memset(data_send, '\0', BUFFER_LENGTH);
+                offset = 0;
+                if (write(fd, data_send, offset + 1) == -1) break;
+                continue;
+            } else {
+                memset(data_send, '\0', BUFFER_LENGTH);
+                offset = 0;
+                set_response(data_send, &offset, "abort\n");
+                append_output_line("abort\n");
+                if (write(fd, data_send, offset + 1) == -1) break;
+                continue;
+            }
         }
 
         // Handle create static_checkpoint
@@ -1039,7 +1069,7 @@ void *client_handler(void *sock_fd) {
             }
         }
 
-        if (try_handle_fast_insert(std::string(data_recv), &txn_id, data_send, &offset, fd)) {
+        if (try_handle_fast_insert(std::string(data_recv), &txn_id, data_send, &offset, fd, &txn_failed)) {
             continue;
         }
 
@@ -1111,6 +1141,16 @@ void *client_handler(void *sock_fd) {
                         txn_manager->commit(context_agg->txn_, context_agg->log_mgr_);
                     }
                     continue;
+                } catch (TransactionAbortException &e) {
+                    set_response(data_send, &offset, "abort\n");
+                    if (is_explicit_txn_context(context_agg.get())) {
+                        txn_failed = true;
+                    }
+                    txn_manager->abort(context_agg->txn_, log_manager.get());
+                    std::cout << e.GetInfo() << std::endl;
+                    append_output_line("abort\n");
+                    if (write(fd, data_send, offset + 1) == -1) break;
+                    continue;
                 } catch (std::exception &e) {
                     std::cerr << "Aggregation error: " << e.what() << std::endl;
                     set_response(data_send, &offset, std::string(e.what()) + "\n");
@@ -1175,6 +1215,9 @@ void *client_handler(void *sock_fd) {
                     portal->drop();
                 } catch (TransactionAbortException &e) {
                     set_response(data_send, &offset, "abort\n");
+                    if (is_explicit_txn_context(context.get())) {
+                        txn_failed = true;
+                    }
                     txn_manager->abort(context->txn_, log_manager.get());
                     std::cout << e.GetInfo() << std::endl;
 
@@ -1254,6 +1297,9 @@ void *client_handler(void *sock_fd) {
                 } catch (TransactionAbortException &e) {
                     // 事务需要回滚，需要把abort信息返回给客户端并写入output.txt文件中
                     set_response(data_send, &offset, "abort\n");
+                    if (is_explicit_txn_context(context.get())) {
+                        txn_failed = true;
+                    }
 
                     // 回滚事务
                     txn_manager->abort(context->txn_, log_manager.get());
