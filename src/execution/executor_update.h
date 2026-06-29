@@ -114,11 +114,19 @@ class UpdateExecutor : public AbstractExecutor {
 
         std::vector<PendingUpdate> pending_updates;
         pending_updates.reserve(rids_.size());
+        bool mvcc_txn = index_maintenance::is_mvcc_txn(context_);
 
         for (auto &rid : rids_) {
             PendingUpdate pending;
             pending.rid = rid;
             pending.old_record = fh_->get_record(rid, context_);
+            if (pending.old_record == nullptr) {
+                if (mvcc_txn && context_ != nullptr && context_->txn_ != nullptr) {
+                    throw TransactionAbortException(context_->txn_->get_transaction_id(),
+                        AbortReason::DEADLOCK_PREVENTION);
+                }
+                continue;
+            }
             pending.new_record = std::make_unique<RmRecord>(*pending.old_record);
 
             for (auto set_clause : set_clauses_) {
@@ -167,7 +175,6 @@ class UpdateExecutor : public AbstractExecutor {
         }
 
         Transaction *txn = context_ == nullptr ? nullptr : context_->txn_;
-        bool mvcc_txn = index_maintenance::is_mvcc_txn(context_);
         for (auto &pending : pending_updates) {
             // SSI: 检查 rw 依赖
             if (txn != nullptr && g_txn_manager != nullptr) {

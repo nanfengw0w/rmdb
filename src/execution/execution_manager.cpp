@@ -634,6 +634,10 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
     RmScan scan(fh);
     while (!scan.is_end()) {
         auto rec = fh->get_record(scan.rid(), context);
+        if (rec == nullptr) {
+            scan.next();
+            continue;
+        }
         if (eval_where(rec.get())) {
             std::vector<char> row(rec->data, rec->data + fh->get_file_hdr().record_size);
             raw_records.push_back(row);

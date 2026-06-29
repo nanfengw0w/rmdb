@@ -333,3 +333,10 @@
 - **修复** (a9e165c): 替换为 `compare_full_key()`，按列序逐列比较完整 key。
 - **教训**: 复合索引的 key 比较必须比较所有列，不能只比较第一列。门禁没抓到是因为本地测试的数据量和并发度不够高，不足以触发上下界选择错误导致的不一致。
 - **错因分析**: 用户之前尝试"SI 下允许 IndexScan"时测试卡住，推测原因是复合索引 (`col_num > 1`) 回退到 `ih_->leaf_begin()` 到 `ih_->leaf_end()` 全索引扫描，大索引全扫 + MVCC 检查 = 极慢。本次限制为仅单列索引，避免此问题。
+
+### 10. 性能 Phase 3 一致性失败：MVCC 删除残留行与过期 RID
+- **线上结果**: Phase 1/2 通过，Phase 3 `Post-transaction consistency validation` 失败。
+- **定位**: 16 线程 NewOrder + Delivery 本地脚本复现到 `handle_aggregate()` 崩点；Delivery 的 `select min(no_o_id) from new_orders ...` 和一致性检查的 `count/max/min/sum` 会扫描到 MVCC 删除后仍保留 bitmap 的记录，`fh->get_record()` 返回 `nullptr` 后代码继续解引用。
+- **修复**: `handle_aggregate()` 跳过不可见记录；`UpdateExecutor` 和 `DeleteExecutor` 对过期 RID 做防护，MVCC 显式事务下按写冲突中止，避免继续生成日志、索引和写集。
+- **本地验证**: 16 线程最小 TPCC NewOrder+Delivery 压测通过核心不变量：`d_next_o_id-1 == max(o_id)`、`sum(o_ol_cnt) == count(order_line)`、`count(orders) == 成功 NewOrder`，且服务端不崩溃。
+- **教训**: 性能门禁必须覆盖 Delivery 对 `new_orders` 的并发 `min/delete`，只测 NewOrder 无法发现 MVCC tombstone 对聚合扫描和一致性检查的影响。

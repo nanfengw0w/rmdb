@@ -43,12 +43,20 @@ class DeleteExecutor : public AbstractExecutor {
     }
 
     std::unique_ptr<RmRecord> Next() override {
-        if (cur_idx_ < rids_.size()) {
+        while (cur_idx_ < rids_.size()) {
             // Get the record before deletion
             auto record = fh_->get_record(rids_[cur_idx_], context_);
+            Transaction *txn = context_ == nullptr ? nullptr : context_->txn_;
+            if (record == nullptr) {
+                if (index_maintenance::is_mvcc_txn(context_) && txn != nullptr) {
+                    throw TransactionAbortException(txn->get_transaction_id(),
+                        AbortReason::DEADLOCK_PREVENTION);
+                }
+                cur_idx_++;
+                continue;
+            }
 
             // SSI: 检查 rw 依赖
-            Transaction *txn = context_ == nullptr ? nullptr : context_->txn_;
             if (txn != nullptr && g_txn_manager != nullptr) {
                 auto deps = g_txn_manager->check_rw_on_write(txn, tab_name_, rids_[cur_idx_],
                                                              record.get(), nullptr);
@@ -90,6 +98,7 @@ class DeleteExecutor : public AbstractExecutor {
                 }
             }
             cur_idx_++;
+            break;
         }
         return nullptr;
     }
