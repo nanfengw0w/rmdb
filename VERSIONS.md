@@ -225,9 +225,17 @@
 - 瓶颈: buffer_mutex 序列化 SQL 解析（yyparse 使用全局 ast::parse_tree）
 - 解析器使用全局状态，无法并行化，这是根本瓶颈
 
-### 线上测试结果
+### 线上测试结果（第一次）
 - 性能测试 Phase 3: WA（Post-transaction consistency validation failed）
 - 第10题: 7.30分，crash_recovery_with_checkpoint 失败（server stops running at normal running phase）
+
+### 修复措施
+1. 恢复 explicit_txn_mutex_（移除它导致 Phase 3 一致性失败）
+2. 回退 check_logical_key_write_conflict 索引优化（可能漏检冲突）
+3. 移除 cleanup_committed_mvcc_changes 调用（可能在 checkpoint 期间引起问题）
+
+### 待验证
+- 线上测试待重新运行，验证修复是否有效
 
 ### 已确认失败的优化（回退以修复一致性）
 - 移除 SNAPSHOT ISOLATION 的 explicit_txn_mutex_ → Phase 3 一致性失败（已回退）
