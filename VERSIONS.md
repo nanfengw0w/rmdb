@@ -233,10 +233,11 @@
 - 第10题 checkpoint 失败：`begin_checkpoint()` 等待所有活跃事务完成，但测试框架在有活跃事务时触发 checkpoint，导致死锁/超时
 - 性能测试 Phase 3 失败：可能是 main 分支本身的问题（已回退到纯 main 代码测试）
 
-### 修复措施
-1. checkpoint 死锁修复：`begin_checkpoint()` 不再等待活跃事务，直接获取快照
-2. `add_active_txn()` 不再等待 checkpoint 结束
-3. 字符串 MIN/MAX 聚合支持
+### 修复措施（v2）
+1. 恢复原始 checkpoint 等待机制（begin_checkpoint 等待活跃事务完成）
+2. 在 abort 后显式调用 remove_active_txn 确保事务从活跃列表中移除
+3. 避免 begin_checkpoint 死锁（当前连接事务未移除导致等待）
+4. 字符串 MIN/MAX 聚合支持
 
 ### 待验证
 - 线上测试待重新运行，验证修复是否有效
