@@ -461,7 +461,8 @@ public:
 
     // 活跃事务跟踪（用于checkpoint）
     void add_active_txn(txn_id_t txn_id) {
-        std::lock_guard<std::mutex> lock(active_txn_latch_);
+        std::unique_lock<std::mutex> lock(active_txn_latch_);
+        checkpoint_cv_.wait(lock, [&]() { return !checkpoint_in_progress_; });
         active_txns_.insert(txn_id);
     }
     void remove_active_txn(txn_id_t txn_id) {
@@ -476,11 +477,15 @@ public:
         return std::vector<txn_id_t>(active_txns_.begin(), active_txns_.end());
     }
     std::vector<txn_id_t> begin_checkpoint() {
-        std::lock_guard<std::mutex> lock(active_txn_latch_);
+        std::unique_lock<std::mutex> lock(active_txn_latch_);
+        checkpoint_in_progress_ = true;
+        checkpoint_cv_.wait(lock, [&]() { return active_txns_.empty(); });
         return std::vector<txn_id_t>(active_txns_.begin(), active_txns_.end());
     }
     void end_checkpoint() {
-        // no-op, kept for API compatibility
+        std::lock_guard<std::mutex> lock(active_txn_latch_);
+        checkpoint_in_progress_ = false;
+        checkpoint_cv_.notify_all();
     }
 
 private:

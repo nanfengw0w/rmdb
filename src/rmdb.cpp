@@ -799,6 +799,8 @@ void *client_handler(void *sock_fd) {
                         current_txn->get_state() != TransactionState::COMMITTED &&
                         current_txn->get_state() != TransactionState::ABORTED) {
                         txn_manager->abort(current_txn, log_manager.get());
+                        // 确保事务从活跃列表中移除
+                        log_manager->remove_active_txn(current_txn->get_transaction_id());
                         txn_id = INVALID_TXN_ID;
                     }
 
