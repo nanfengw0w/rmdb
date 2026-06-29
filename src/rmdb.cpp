@@ -16,7 +16,6 @@ See the Mulan PSL v2 for more details. */
 #include <atomic>
 #include <cctype>
 #include <cstring>
-#include <deque>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -89,31 +88,6 @@ static std::string strip_sql_line_comments(const std::string &sql) {
 
 static bool is_blank_sql(const std::string &sql) {
     return sql.find_first_not_of(" \t\r\n;") == std::string::npos;
-}
-
-static std::vector<std::string> split_sql_requests(const std::string &sql) {
-    std::vector<std::string> requests;
-    bool in_string = false;
-    size_t start = 0;
-    for (size_t i = 0; i < sql.size(); ++i) {
-        if (sql[i] == '\'') {
-            in_string = !in_string;
-            continue;
-        }
-        if (!in_string && sql[i] == ';') {
-            std::string part = sql.substr(start, i - start + 1);
-            if (!is_blank_sql(part)) {
-                requests.push_back(part);
-            }
-            start = i + 1;
-        }
-    }
-
-    std::string tail = sql.substr(start);
-    if (!is_blank_sql(tail)) {
-        requests.push_back(tail);
-    }
-    return requests;
 }
 
 static std::string trim_local(std::string s) {
@@ -304,6 +278,44 @@ static bool try_parse_arithmetic_update(const std::string &sql, std::string &dum
     return true;
 }
 
+// 构建全局所需的管理器对象
+auto disk_manager = std::make_unique<DiskManager>();
+auto buffer_pool_manager = std::make_unique<BufferPoolManager>(BUFFER_POOL_SIZE, disk_manager.get());
+auto rm_manager = std::make_unique<RmManager>(disk_manager.get(), buffer_pool_manager.get());
+auto ix_manager = std::make_unique<IxManager>(disk_manager.get(), buffer_pool_manager.get());
+auto sm_manager = std::make_unique<SmManager>(disk_manager.get(), buffer_pool_manager.get(), rm_manager.get(), ix_manager.get());
+auto lock_manager = std::make_unique<LockManager>();
+auto txn_manager = std::make_unique<TransactionManager>(lock_manager.get(), sm_manager.get());
+TransactionManager* g_txn_manager = txn_manager.get();
+auto planner = std::make_unique<Planner>(sm_manager.get());
+auto optimizer = std::make_unique<Optimizer>(sm_manager.get(), planner.get());
+auto ql_manager = std::make_unique<QlManager>(sm_manager.get(), txn_manager.get(), planner.get());
+auto log_manager = std::make_unique<LogManager>(disk_manager.get());
+auto recovery = std::make_unique<RecoveryManager>(disk_manager.get(), buffer_pool_manager.get(), sm_manager.get());
+auto portal = std::make_unique<Portal>(sm_manager.get());
+auto analyze = std::make_unique<Analyze>(sm_manager.get());
+pthread_mutex_t *buffer_mutex;
+pthread_mutex_t *sockfd_mutex;
+
+static jmp_buf jmpbuf;
+void sigint_handler(int signo) {
+    should_exit = true;
+    log_manager->flush_log_to_disk();
+    std::cout << "The Server receive Crtl+C, will been closed\n";
+    longjmp(jmpbuf, 1);
+}
+
+// 判断当前正在执行的是显式事务还是单条SQL语句的事务，并更新事务ID
+void SetTransaction(txn_id_t *txn_id, Context *context) {
+    context->txn_ = txn_manager->get_transaction(*txn_id);
+    if(context->txn_ == nullptr || context->txn_->get_state() == TransactionState::COMMITTED ||
+        context->txn_->get_state() == TransactionState::ABORTED) {
+        context->txn_ = txn_manager->begin(nullptr, context->log_mgr_);
+        *txn_id = context->txn_->get_transaction_id();
+        context->txn_->set_txn_mode(false);
+    }
+}
+
 static bool parse_insert_literal_local(const std::string &text, Value &value) {
     std::string s = trim_local(text);
     if (s.size() >= 2 && s.front() == '\'' && s.back() == '\'') {
@@ -352,7 +364,7 @@ static bool try_parse_simple_insert_local(const std::string &sql, std::string &t
 
     tab_name = trim_local(raw.substr(prefix.size(), values_pos - prefix.size()));
     std::string value_part = trim_local(raw.substr(values_pos + 7));
-    if (tab_name.empty() || value_part.size() < 2 || value_part.front() != '(' || value_part.back() == ')') {
+    if (tab_name.empty() || value_part.size() < 2 || value_part.front() != '(' || value_part.back() != ')') {
         return false;
     }
 
@@ -367,44 +379,6 @@ static bool try_parse_simple_insert_local(const std::string &sql, std::string &t
         values.push_back(std::move(value));
     }
     return true;
-}
-
-// 构建全局所需的管理器对象
-auto disk_manager = std::make_unique<DiskManager>();
-auto buffer_pool_manager = std::make_unique<BufferPoolManager>(BUFFER_POOL_SIZE, disk_manager.get());
-auto rm_manager = std::make_unique<RmManager>(disk_manager.get(), buffer_pool_manager.get());
-auto ix_manager = std::make_unique<IxManager>(disk_manager.get(), buffer_pool_manager.get());
-auto sm_manager = std::make_unique<SmManager>(disk_manager.get(), buffer_pool_manager.get(), rm_manager.get(), ix_manager.get());
-auto lock_manager = std::make_unique<LockManager>();
-auto txn_manager = std::make_unique<TransactionManager>(lock_manager.get(), sm_manager.get());
-TransactionManager* g_txn_manager = txn_manager.get();
-auto planner = std::make_unique<Planner>(sm_manager.get());
-auto optimizer = std::make_unique<Optimizer>(sm_manager.get(), planner.get());
-auto ql_manager = std::make_unique<QlManager>(sm_manager.get(), txn_manager.get(), planner.get());
-auto log_manager = std::make_unique<LogManager>(disk_manager.get());
-auto recovery = std::make_unique<RecoveryManager>(disk_manager.get(), buffer_pool_manager.get(), sm_manager.get());
-auto portal = std::make_unique<Portal>(sm_manager.get());
-auto analyze = std::make_unique<Analyze>(sm_manager.get());
-pthread_mutex_t *buffer_mutex;
-pthread_mutex_t *sockfd_mutex;
-
-static jmp_buf jmpbuf;
-void sigint_handler(int signo) {
-    should_exit = true;
-    log_manager->flush_log_to_disk();
-    std::cout << "The Server receive Crtl+C, will been closed\n";
-    longjmp(jmpbuf, 1);
-}
-
-// 判断当前正在执行的是显式事务还是单条SQL语句的事务，并更新事务ID
-void SetTransaction(txn_id_t *txn_id, Context *context) {
-    context->txn_ = txn_manager->get_transaction(*txn_id);
-    if(context->txn_ == nullptr || context->txn_->get_state() == TransactionState::COMMITTED ||
-        context->txn_->get_state() == TransactionState::ABORTED) {
-        context->txn_ = txn_manager->begin(nullptr, context->log_mgr_);
-        *txn_id = context->txn_->get_transaction_id();
-        context->txn_->set_txn_mode(false);
-    }
 }
 
 static void execute_fast_insert_direct(const std::string &tab_name, std::vector<Value> &values, Context *context) {
@@ -485,64 +459,6 @@ static void execute_fast_insert_direct(const std::string &tab_name, std::vector<
         auto ih = index_maintenance::get_index_handle(sm_manager.get(), tab_name, index);
         ih->insert_entry(index_keys[i].data(), rid, txn);
     }
-}
-
-static bool try_handle_fast_insert(const std::string &sql, txn_id_t *txn_id,
-                                   char *data_send, int *offset, int fd,
-                                   bool *txn_failed) {
-    std::string tab_name;
-    std::vector<Value> values;
-    if (!try_parse_simple_insert_local(sql, tab_name, values)) {
-        return false;
-    }
-
-    memset(data_send, '\0', BUFFER_LENGTH);
-    *offset = 0;
-    auto context = std::make_unique<Context>(lock_manager.get(), log_manager.get(), nullptr, data_send, offset);
-    SetTransaction(txn_id, context.get());
-
-    try {
-        execute_fast_insert_direct(tab_name, values, context.get());
-        if (context->txn_ != nullptr && context->txn_->get_txn_mode() == false &&
-            context->txn_->get_state() != TransactionState::COMMITTED &&
-            context->txn_->get_state() != TransactionState::ABORTED) {
-            txn_manager->commit(context->txn_, context->log_mgr_);
-        }
-    } catch (TransactionAbortException &e) {
-        set_response(data_send, offset, "abort\n");
-        txn_manager->abort(context->txn_, log_manager.get());
-        std::cout << e.GetInfo() << std::endl;
-        append_output_line("abort\n");
-    } catch (RMDBError &e) {
-        if (context->txn_ != nullptr && context->txn_->get_txn_mode() &&
-            context->txn_->get_state() != TransactionState::COMMITTED &&
-            context->txn_->get_state() != TransactionState::ABORTED) {
-            *txn_failed = true;
-        }
-        if (context->txn_ != nullptr && context->txn_->get_state() != TransactionState::COMMITTED &&
-            context->txn_->get_state() != TransactionState::ABORTED) {
-            txn_manager->abort(context->txn_, log_manager.get());
-        }
-        std::cerr << e.what() << std::endl;
-        set_response(data_send, offset, std::string(e.what()) + "\n");
-        append_output_line("failure\n");
-    } catch (std::exception &e) {
-        if (context->txn_ != nullptr && context->txn_->get_txn_mode() &&
-            context->txn_->get_state() != TransactionState::COMMITTED &&
-            context->txn_->get_state() != TransactionState::ABORTED) {
-            *txn_failed = true;
-        }
-        if (context->txn_ != nullptr && context->txn_->get_state() != TransactionState::COMMITTED &&
-            context->txn_->get_state() != TransactionState::ABORTED) {
-            txn_manager->abort(context->txn_, log_manager.get());
-        }
-        std::cerr << "Standard exception: " << e.what() << std::endl;
-        set_response(data_send, offset, std::string("Error: ") + e.what() + "\n");
-        append_output_line("failure\n");
-    }
-
-    write(fd, data_send, *offset + 1);
-    return true;
 }
 
 static bool try_parse_load_command_local(const std::string &sql, std::string &file_name,
@@ -736,6 +652,54 @@ static void clear_fast_autocommit_state(Transaction *txn) {
     write_set->clear();
 }
 
+static bool try_handle_fast_insert(const std::string &sql, txn_id_t *txn_id,
+                                   char *data_send, int *offset, int fd) {
+    std::string tab_name;
+    std::vector<Value> values;
+    if (!try_parse_simple_insert_local(sql, tab_name, values)) {
+        return false;
+    }
+
+    memset(data_send, '\0', BUFFER_LENGTH);
+    *offset = 0;
+    auto context = std::make_unique<Context>(lock_manager.get(), log_manager.get(), nullptr, data_send, offset);
+    SetTransaction(txn_id, context.get());
+
+    try {
+        execute_fast_insert_direct(tab_name, values, context.get());
+        if (context->txn_ != nullptr && context->txn_->get_txn_mode() == false &&
+            context->txn_->get_state() != TransactionState::COMMITTED &&
+            context->txn_->get_state() != TransactionState::ABORTED) {
+            txn_manager->commit(context->txn_, context->log_mgr_);
+            clear_fast_autocommit_state(context->txn_);
+        }
+    } catch (TransactionAbortException &e) {
+        set_response(data_send, offset, "abort\n");
+        txn_manager->abort(context->txn_, log_manager.get());
+        std::cout << e.GetInfo() << std::endl;
+
+        append_output_line("abort\n");
+    } catch (RMDBError &e) {
+        std::cerr << e.what() << std::endl;
+        set_response(data_send, offset, std::string(e.what()) + "\n");
+
+        append_output_line("failure\n");
+    } catch (std::exception &e) {
+        std::cerr << "Standard exception: " << e.what() << std::endl;
+        set_response(data_send, offset, std::string("Error: ") + e.what() + "\n");
+
+        append_output_line("failure\n");
+    } catch (...) {
+        std::cerr << "Unknown exception caught" << std::endl;
+        set_response(data_send, offset, "Error: Unknown error\n");
+
+        append_output_line("failure\n");
+    }
+
+    write(fd, data_send, *offset + 1);
+    return true;
+}
+
 void *client_handler(void *sock_fd) {
     int fd = *((int *)sock_fd);
     pthread_mutex_unlock(sockfd_mutex);
@@ -749,8 +713,6 @@ void *client_handler(void *sock_fd) {
     int offset = 0;
     // 记录客户端当前正在执行的事务ID
     txn_id_t txn_id = INVALID_TXN_ID;
-    bool txn_failed = false;
-    std::deque<std::string> pending_requests;
 
     std::string output = "establish client connection, sockfd: " + std::to_string(fd) + "\n";
     std::cout << output;
@@ -758,38 +720,29 @@ void *client_handler(void *sock_fd) {
     while (true) {
         memset(data_recv, 0, BUFFER_LENGTH);
 
-        if (pending_requests.empty()) {
-            i_recvBytes = read(fd, data_recv, BUFFER_LENGTH);
+        i_recvBytes = read(fd, data_recv, BUFFER_LENGTH);
 
-            if (i_recvBytes == 0) {
-                std::cout << "Maybe the client has closed" << std::endl;
-                break;
-            }
-            if (i_recvBytes == -1) {
-                std::cout << "Client read error!" << std::endl;
-                break;
-            }
-
-            std::string sanitized_sql = strip_sql_line_comments(std::string(data_recv));
-            auto requests = split_sql_requests(sanitized_sql);
-            if (requests.empty()) {
-                memset(data_send, '\0', BUFFER_LENGTH);
-                offset = 0;
-                if (write(fd, data_send, 1) == -1) {
-                    break;
-                }
-                continue;
-            }
-            for (auto &request : requests) {
-                pending_requests.push_back(std::move(request));
-            }
+        if (i_recvBytes == 0) {
+            std::cout << "Maybe the client has closed" << std::endl;
+            break;
         }
-
-        std::string current_sql = pending_requests.front();
-        pending_requests.pop_front();
+        if (i_recvBytes == -1) {
+            std::cout << "Client read error!" << std::endl;
+            break;
+        }
+        
+        std::string sanitized_sql = strip_sql_line_comments(std::string(data_recv));
+        if (is_blank_sql(sanitized_sql)) {
+            memset(data_send, '\0', BUFFER_LENGTH);
+            offset = 0;
+            if (write(fd, data_send, 1) == -1) {
+                break;
+            }
+            continue;
+        }
         memset(data_recv, 0, BUFFER_LENGTH);
-        size_t sanitized_len = std::min(current_sql.size(), static_cast<size_t>(BUFFER_LENGTH - 1));
-        memcpy(data_recv, current_sql.data(), sanitized_len);
+        size_t sanitized_len = std::min(sanitized_sql.size(), static_cast<size_t>(BUFFER_LENGTH - 1));
+        memcpy(data_recv, sanitized_sql.data(), sanitized_len);
 
         std::string control_cmd(data_recv);
         size_t ctrl_start = control_cmd.find_first_not_of(" \t\r\n");
@@ -927,7 +880,7 @@ void *client_handler(void *sock_fd) {
             }
         }
 
-        if (try_handle_fast_insert(std::string(data_recv), &txn_id, data_send, &offset, fd, &txn_failed)) {
+        if (try_handle_fast_insert(std::string(data_recv), &txn_id, data_send, &offset, fd)) {
             continue;
         }
 
@@ -1127,13 +1080,11 @@ void *client_handler(void *sock_fd) {
         if (yyparse() == 0) {
             if (ast::parse_tree != nullptr) {
                 try {
-                    // analyze and rewrite - do_analyze only reads metadata, safe to call outside lock
-                    auto parse_tree_copy = ast::parse_tree;
+                    // analyze and rewrite
+                    std::shared_ptr<Query> query = analyze->do_analyze(ast::parse_tree);
                     yy_delete_buffer(buf);
                     finish_analyze = true;
                     pthread_mutex_unlock(buffer_mutex);
-
-                    std::shared_ptr<Query> query = analyze->do_analyze(parse_tree_copy);
                     // 优化器
                     std::shared_ptr<Plan> plan = optimizer->plan_query(query, context.get());
                     // portal
