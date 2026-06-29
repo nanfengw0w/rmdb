@@ -225,13 +225,16 @@
 - 瓶颈: buffer_mutex 序列化 SQL 解析（yyparse 使用全局 ast::parse_tree）
 - 解析器使用全局状态，无法并行化，这是根本瓶颈
 
-### 已确认失败的优化
-- 快速 UPDATE 路径 v1（绕过 parser）→ 唯一索引冲突，性能降到 60 tpmC
-- 快速 UPDATE 路径 v2（算术更新专用）→ 同样唯一索引冲突，d_next_o_id 读取错误
-- 快速 SELECT 路径（绕过 parser）→ MVCC 可见性问题，导致唯一索引冲突
-- 单 warehouse 移除 explicit_txn_mutex_ → 高 abort 率（stock 表共享冲突）
-- 移除 do_analyze 的 buffer_mutex → 数据竞争
-- Thread-local parse_tree → 解析器有其他全局状态，多线程崩溃
+### 线上测试结果
+- 性能测试 Phase 3: WA（Post-transaction consistency validation failed）
+- 第10题: 7.30分，crash_recovery_with_checkpoint 失败（server stops running at normal running phase）
+
+### 已确认失败的优化（回退以修复一致性）
+- 移除 SNAPSHOT ISOLATION 的 explicit_txn_mutex_ → Phase 3 一致性失败（已回退）
+- check_logical_key_write_conflict 索引优化 → 可能漏检冲突（已回退）
+- 快速 UPDATE 路径 v1/v2 → 唯一索引冲突
+- 快速 SELECT 路径 → MVCC 可见性问题
+- Thread-local parse_tree → 解析器其他全局状态崩溃
 
 ### 重要优化：移除 SNAPSHOT ISOLATION 的 explicit_txn_mutex_
 - 多 warehouse（W=4）测试：0 aborts，说明 MVCC 可以正确处理并发
