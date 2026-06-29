@@ -4,6 +4,26 @@
 
 ## 性能测试合并分支修复记录
 
+### 2026-06-29 performance Phase 3 / 第九题回归修复
+- **线上反馈**:
+  1. 性能测试 Phase 1/2 通过，但 Phase 3 `Post-transaction consistency validation` 失败。
+  2. 第九题退回 14.40 分，SI 写冲突相关用例大量 mismatch。
+- **错因**:
+  1. 上一版新增的 `txn_failed` 连接失败态改变了第九题输出协议：冲突写语句已返回 `abort` 并回滚后，后续 `commit` 仍可能额外返回 `abort`。
+  2. 默认 `READ_COMMITTED` 读取没有经过 MVCC 版本链。MVCC delete 不清 bitmap，性能测试事务后的一致性检查会读到已提交删除的行。
+  3. MVCC insert 在设置 bitmap 之后才登记版本链，存在未提交插入被并发快照读看到的窗口。
+- **本次修复**:
+  1. 移除 `txn_failed` 失败态和额外 `abort` 输出，恢复冲突语句只输出一次 `abort`。
+  2. `RmFileHandle::get_record()` 对 `READ_COMMITTED` 增加版本链可见性判断，隐藏未提交写和已提交删除。
+  3. `RmFileHandle::insert_record()` 在设置 bitmap 前保存 MVCC old-data 条目，避免未提交插入脏读。
+- **本地验证**:
+  - `make -C build -j` 通过。
+  - socket smoke 通过：SI 同记录写冲突只输出一次 `abort`，已提交 MVCC delete 在默认读下不可见，未提交 insert 对其他 SI 事务不可见。
+  - `./build/bin/unit_test` 5/5 通过。
+  - `python3 test_topic5.py` 8/8 通过。
+  - `python3 test_topic6.py` 5/5 通过。
+  - `python3 test_crash_recovery.py` 基础恢复与 checkpoint 恢复均通过。
+
 ### 2026-06-29 performance 入口语法与 load 修复
 - **背景**: `perf-main-safe` 分支前十题通过，`temp` 分支性能测试能过但前十题有大量风险，不能整体合并。当前只从性能题要求中抽取通用能力修复。
 - **题目依据**:

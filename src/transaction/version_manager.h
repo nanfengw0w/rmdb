@@ -272,6 +272,47 @@ public:
         return false;
     }
 
+    int get_read_committed_data(int fd, const Rid& rid, RmRecord*& result, bool& is_deleted) {
+        VersionKey key{fd, rid.page_no, rid.slot_no};
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        auto it = version_chains_.find(key);
+        if (it == version_chains_.end() || it->second.empty()) {
+            is_deleted = false;
+            result = nullptr;
+            return -1;
+        }
+
+        for (auto rit = it->second.rbegin(); rit != it->second.rend(); ++rit) {
+            auto& entry = *rit;
+
+            if (entry.commit_ts_ == 0) {
+                if (entry.is_deleted_) {
+                    is_deleted = true;
+                    result = nullptr;
+                    return 0;
+                }
+                is_deleted = false;
+                result = entry.old_data_.get();
+                return 1;
+            }
+
+            if (entry.new_deleted_) {
+                is_deleted = true;
+                result = nullptr;
+                return 0;
+            }
+
+            is_deleted = false;
+            result = nullptr;
+            return -1;
+        }
+
+        is_deleted = false;
+        result = nullptr;
+        return -1;
+    }
+
 private:
     VersionManager() = default;
     std::mutex mutex_;
