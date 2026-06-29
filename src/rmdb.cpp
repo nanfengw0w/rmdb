@@ -803,6 +803,20 @@ static bool is_explicit_txn_context(Context *context) {
     return context != nullptr && context->txn_ != nullptr && context->txn_->get_txn_mode();
 }
 
+static bool is_read_only_after_failed_txn(const std::string &control_cmd) {
+    std::string cmd = normalize_sql_space(control_cmd);
+    if (cmd.empty()) {
+        return true;
+    }
+    if (cmd == "help" || cmd == "show tables" || cmd.rfind("show index from ", 0) == 0 ||
+        cmd.rfind("desc ", 0) == 0 || cmd.rfind("select ", 0) == 0 ||
+        cmd == "select" || cmd.rfind("explain analyze select ", 0) == 0 ||
+        cmd == "explain analyze select") {
+        return true;
+    }
+    return false;
+}
+
 static bool try_handle_fast_insert(const std::string &sql, txn_id_t *txn_id,
                                    char *data_send, int *offset, int fd,
                                    bool *txn_failed) {
@@ -955,6 +969,8 @@ void *client_handler(void *sock_fd) {
                 offset = 0;
                 if (write(fd, data_send, offset + 1) == -1) break;
                 continue;
+            } else if (is_read_only_after_failed_txn(control_cmd)) {
+                txn_id = INVALID_TXN_ID;
             } else {
                 memset(data_send, '\0', BUFFER_LENGTH);
                 offset = 0;
