@@ -18,7 +18,6 @@ See the Mulan PSL v2 for more details. */
 #include <shared_mutex>
 #include <cstring>
 #include <limits>
-#include <condition_variable>
 
 #include "transaction.h"
 #include "watermark.h"
@@ -77,8 +76,6 @@ public:
     void release_explicit_txn_lock(Transaction* txn);
 
     bool acquire_perf_write_lock(Transaction* txn, int fd, const Rid& rid);
-
-    void acquire_perf_write_lock_wait(Transaction* txn, int fd, const Rid& rid);
 
     void release_perf_write_locks(Transaction* txn);
 
@@ -400,7 +397,6 @@ public:
     };
 
     std::mutex perf_write_lock_mutex_;
-    std::condition_variable perf_write_lock_cv_;
     std::unordered_map<PerfWriteLockKey, txn_id_t, PerfWriteLockKeyHash> perf_write_locks_;
     std::unordered_map<txn_id_t, std::vector<PerfWriteLockKey>> txn_perf_write_locks_;
     inline static TransactionManager* current_instance_{nullptr};

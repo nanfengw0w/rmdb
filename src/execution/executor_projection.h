@@ -59,7 +59,7 @@ class ProjectionExecutor : public AbstractExecutor {
         return result;
     }
 
-    Rid &rid() override { return prev_->rid(); }
+    Rid &rid() override { return _abstract_rid; }
 
     bool is_end() const override { return prev_->is_end(); }
 

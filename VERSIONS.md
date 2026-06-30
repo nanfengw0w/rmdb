@@ -4,6 +4,12 @@
 
 ## 性能测试合并分支修复记录
 
+### 2026-06-30 撤回错误的 SELECT 预留锁优化
+- **线上结果**: `daf939a` Phase 1/2 通过，但 Phase 3 `Post-transaction consistency validation` 失败。
+- **错因**: `daf939a` 在性能模式下让单行数值 SELECT 等待记录锁、刷新事务 start_ts 并重新输出最新值。这个做法会改变 `select d_next_o_id` 的返回结果，破坏 SI 事务级快照语义，本质上不是纯算法优化。
+- **修复**: 撤回 SELECT 预留锁、Projection RID 透传和等待式性能锁接口，恢复 SELECT 原输出语义；保留 `MIN(col)` 等值条件索引快路径，因为它只改变访问路径，不改变结果。
+- **教训**: 性能优化不能通过改 SELECT 输出或刷新事务快照绕过 abort；后续只能做通用执行计划、索引访问、聚合早停、锁粒度和 WAL/缓存优化。
+
 ### 2026-06-30 性能模式热点读写冲突与 Delivery MIN 快路径
 - **背景**: 上一版性能测试 AC，但线上 `median tpmC=2.166667`、`abort-rate=74.77%`。主要问题不是工程刷盘，而是 NewOrder 在 `select d_next_o_id` 后并发更新同一 district 行，多个事务读到同一个旧订单号，后续 update/insert 大量 abort。
 - **改动**:

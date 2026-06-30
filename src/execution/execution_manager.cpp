@@ -204,11 +204,6 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
         captions.push_back(sel_col.col_name);
     }
 
-    struct OutputRow {
-        std::vector<std::string> columns;
-        Rid rid;
-    };
-
     auto tuple_to_columns = [](const RmRecord *tuple, const std::vector<ColMeta> &cols) {
         std::vector<std::string> columns;
         columns.reserve(cols.size());
@@ -227,53 +222,6 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
         }
         return columns;
     };
-
-    auto materialize_rows = [&]() {
-        std::vector<OutputRow> rows;
-        for (executorTreeRoot->beginTuple(); !executorTreeRoot->is_end(); executorTreeRoot->nextTuple()) {
-            auto tuple = executorTreeRoot->Next();
-            rows.push_back(OutputRow{tuple_to_columns(tuple.get(), executorTreeRoot->cols()),
-                                     executorTreeRoot->rid()});
-        }
-        return rows;
-    };
-
-    auto perf_single_row_reserve_candidate = [&]() {
-        if (context == nullptr || context->txn_ == nullptr ||
-            !context->txn_->get_perf_mode() || !context->txn_->get_txn_mode()) {
-            return false;
-        }
-        auto level = context->txn_->get_isolation_level();
-        if (level != IsolationLevel::SNAPSHOT_ISOLATION && level != IsolationLevel::SERIALIZABLE) {
-            return false;
-        }
-        auto &cols = executorTreeRoot->cols();
-        if (cols.empty()) {
-            return false;
-        }
-        std::string tab_name = cols.front().tab_name;
-        for (auto &col : cols) {
-            if (col.tab_name != tab_name || (col.type != TYPE_INT && col.type != TYPE_FLOAT)) {
-                return false;
-            }
-        }
-        return true;
-    };
-
-    std::vector<OutputRow> reserved_rows;
-    bool use_materialized_rows = false;
-    if (perf_single_row_reserve_candidate()) {
-        reserved_rows = materialize_rows();
-        use_materialized_rows = true;
-        if (reserved_rows.size() == 1 && reserved_rows[0].rid.page_no >= 0 &&
-            reserved_rows[0].rid.slot_no >= 0) {
-            const auto &tab_name = executorTreeRoot->cols().front().tab_name;
-            auto fh = sm_manager_->get_table_fh(tab_name);
-            txn_mgr_->acquire_perf_write_lock_wait(context->txn_, fh->GetFd(), reserved_rows[0].rid);
-            context->txn_->set_start_ts(txn_mgr_->get_next_timestamp());
-            reserved_rows = materialize_rows();
-        }
-    }
 
     // Print header into buffer
     RecordPrinter rec_printer(sel_cols.size());
@@ -309,15 +257,9 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
         num_rec++;
     };
 
-    if (use_materialized_rows) {
-        for (auto &row : reserved_rows) {
-            print_columns(row.columns);
-        }
-    } else {
-        for (executorTreeRoot->beginTuple(); !executorTreeRoot->is_end(); executorTreeRoot->nextTuple()) {
-            auto Tuple = executorTreeRoot->Next();
-            print_columns(tuple_to_columns(Tuple.get(), executorTreeRoot->cols()));
-        }
+    for (executorTreeRoot->beginTuple(); !executorTreeRoot->is_end(); executorTreeRoot->nextTuple()) {
+        auto Tuple = executorTreeRoot->Next();
+        print_columns(tuple_to_columns(Tuple.get(), executorTreeRoot->cols()));
     }
     if (write_output_file) {
         outfile.close();
