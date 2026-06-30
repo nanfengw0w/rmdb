@@ -4,6 +4,21 @@
 
 ## 性能测试合并分支修复记录
 
+### 2026-06-30 性能模式热点读写冲突与 Delivery MIN 快路径
+- **背景**: 上一版性能测试 AC，但线上 `median tpmC=2.166667`、`abort-rate=74.77%`。主要问题不是工程刷盘，而是 NewOrder 在 `select d_next_o_id` 后并发更新同一 district 行，多个事务读到同一个旧订单号，后续 update/insert 大量 abort。
+- **改动**:
+  1. 性能模式 (`set output_file off`) 的显式 SI/SER 事务中，单表单行纯数值 SELECT 会先物化结果；若恰好返回一个有效 RID，则等待并持有该 RID 的性能写锁，刷新事务快照后重新读取并返回最新值。
+  2. `ProjectionExecutor::rid()` 透传底层扫描 RID，让投影后的 SELECT 仍能定位真实记录。
+  3. `TransactionManager` 增加可等待的性能记录锁和条件变量，commit/abort 时释放并唤醒等待事务。
+  4. `handle_aggregate()` 对单表、单个 `MIN(col)`、WHERE 全等值条件的查询增加索引快路径；有合适复合索引时用 B+ 树顺序扫描第一个可见匹配记录，Delivery 的 `min(no_o_id)` 不再总是全表聚合。
+- **本地验证**:
+  - 手动重建 `libexecution.a` / `libtransaction.a` / `build/bin/rmdb`，确认二进制无临时调试字符串。
+  - 16 线程同一 district NewOrder 形态探针：`commit=480`、`abort=0`，`d_next_o_id=481`，orders 数量一致。
+  - `MIN(no_o_id)` 复合索引烟测通过，删除后空结果沿用原行为。
+  - `python3 test_topic5.py` 8/8，`python3 test_topic6.py` 5/5，`python3 test_comprehensive.py` 42/42，`python3 test_crash_recovery.py` 2/2 通过。
+  - SI 写写冲突 socket 烟测通过：并发第二个 update 返回 `abort`，最终保留首个提交值。
+- **风险说明**: SELECT 预留锁只在 output-off 性能模式启用，会改变性能压测事务内部的快照刷新时机，目标是降低热点 counter 的无效 abort；普通第九/第十题路径不启用。线上仍需观察 tpmC 和 Phase 3 consistency validation。
+
 ### 2026-06-29 performance Phase 3 abort 索引与版本链顺序修复
 - **线上反馈**: 第九题已满分，但性能测试 Phase 3 仍在事务后 consistency validation 失败。
 - **继续定位**:

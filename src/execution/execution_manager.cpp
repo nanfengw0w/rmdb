@@ -11,7 +11,9 @@ See the Mulan PSL v2 for more details. */
 #include "execution_manager.h"
 
 #include <cctype>
+#include <limits>
 #include <map>
+#include <optional>
 #include <sstream>
 #include <set>
 #include "executor_delete.h"
@@ -202,6 +204,77 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
         captions.push_back(sel_col.col_name);
     }
 
+    struct OutputRow {
+        std::vector<std::string> columns;
+        Rid rid;
+    };
+
+    auto tuple_to_columns = [](const RmRecord *tuple, const std::vector<ColMeta> &cols) {
+        std::vector<std::string> columns;
+        columns.reserve(cols.size());
+        for (auto &col : cols) {
+            std::string col_str;
+            char *rec_buf = tuple->data + col.offset;
+            if (col.type == TYPE_INT) {
+                col_str = std::to_string(*(int *)rec_buf);
+            } else if (col.type == TYPE_FLOAT) {
+                col_str = std::to_string(*(float *)rec_buf);
+            } else if (col.type == TYPE_STRING) {
+                col_str = std::string((char *)rec_buf, col.len);
+                col_str.resize(strlen(col_str.c_str()));
+            }
+            columns.push_back(std::move(col_str));
+        }
+        return columns;
+    };
+
+    auto materialize_rows = [&]() {
+        std::vector<OutputRow> rows;
+        for (executorTreeRoot->beginTuple(); !executorTreeRoot->is_end(); executorTreeRoot->nextTuple()) {
+            auto tuple = executorTreeRoot->Next();
+            rows.push_back(OutputRow{tuple_to_columns(tuple.get(), executorTreeRoot->cols()),
+                                     executorTreeRoot->rid()});
+        }
+        return rows;
+    };
+
+    auto perf_single_row_reserve_candidate = [&]() {
+        if (context == nullptr || context->txn_ == nullptr ||
+            !context->txn_->get_perf_mode() || !context->txn_->get_txn_mode()) {
+            return false;
+        }
+        auto level = context->txn_->get_isolation_level();
+        if (level != IsolationLevel::SNAPSHOT_ISOLATION && level != IsolationLevel::SERIALIZABLE) {
+            return false;
+        }
+        auto &cols = executorTreeRoot->cols();
+        if (cols.empty()) {
+            return false;
+        }
+        std::string tab_name = cols.front().tab_name;
+        for (auto &col : cols) {
+            if (col.tab_name != tab_name || (col.type != TYPE_INT && col.type != TYPE_FLOAT)) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    std::vector<OutputRow> reserved_rows;
+    bool use_materialized_rows = false;
+    if (perf_single_row_reserve_candidate()) {
+        reserved_rows = materialize_rows();
+        use_materialized_rows = true;
+        if (reserved_rows.size() == 1 && reserved_rows[0].rid.page_no >= 0 &&
+            reserved_rows[0].rid.slot_no >= 0) {
+            const auto &tab_name = executorTreeRoot->cols().front().tab_name;
+            auto fh = sm_manager_->get_table_fh(tab_name);
+            txn_mgr_->acquire_perf_write_lock_wait(context->txn_, fh->GetFd(), reserved_rows[0].rid);
+            context->txn_->set_start_ts(txn_mgr_->get_next_timestamp());
+            reserved_rows = materialize_rows();
+        }
+    }
+
     // Print header into buffer
     RecordPrinter rec_printer(sel_cols.size());
     rec_printer.print_separator(context);
@@ -222,22 +295,7 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
     // Print records
     size_t num_rec = 0;
     // 执行query_plan
-    for (executorTreeRoot->beginTuple(); !executorTreeRoot->is_end(); executorTreeRoot->nextTuple()) {
-        auto Tuple = executorTreeRoot->Next();
-        std::vector<std::string> columns;
-        for (auto &col : executorTreeRoot->cols()) {
-            std::string col_str;
-            char *rec_buf = Tuple->data + col.offset;
-            if (col.type == TYPE_INT) {
-                col_str = std::to_string(*(int *)rec_buf);
-            } else if (col.type == TYPE_FLOAT) {
-                col_str = std::to_string(*(float *)rec_buf);
-            } else if (col.type == TYPE_STRING) {
-                col_str = std::string((char *)rec_buf, col.len);
-                col_str.resize(strlen(col_str.c_str()));
-            }
-            columns.push_back(col_str);
-        }
+    auto print_columns = [&](const std::vector<std::string> &columns) {
         // print record into buffer
         rec_printer.print_record(columns, context);
         // print record into file
@@ -249,6 +307,17 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
             outfile << "\n";
         }
         num_rec++;
+    };
+
+    if (use_materialized_rows) {
+        for (auto &row : reserved_rows) {
+            print_columns(row.columns);
+        }
+    } else {
+        for (executorTreeRoot->beginTuple(); !executorTreeRoot->is_end(); executorTreeRoot->nextTuple()) {
+            auto Tuple = executorTreeRoot->Next();
+            print_columns(tuple_to_columns(Tuple.get(), executorTreeRoot->cols()));
+        }
     }
     if (write_output_file) {
         outfile.close();
@@ -641,18 +710,203 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
 
     // 8. 扫描表并收集记录
     std::vector<std::vector<char>> raw_records;
-    RmScan scan(fh);
-    while (!scan.is_end()) {
-        auto rec = fh->get_record(scan.rid(), context);
-        if (rec == nullptr) {
+    auto parse_eq_where = [&]() -> std::optional<std::map<std::string, std::string>> {
+        std::map<std::string, std::string> eq_values;
+        if (where_clause.empty()) {
+            return eq_values;
+        }
+        std::string wc_lower = to_lower_str(where_clause);
+        size_t pos = 0;
+        while (true) {
+            size_t and_pos = wc_lower.find(" and ", pos);
+            std::string cond = (and_pos == std::string::npos)
+                                   ? trim_str(where_clause.substr(pos))
+                                   : trim_str(where_clause.substr(pos, and_pos - pos));
+            if (cond.empty()) {
+                return std::nullopt;
+            }
+
+            size_t op_pos = std::string::npos;
+            std::string op_str;
+            for (auto &op : {"<=", ">=", "<>", "!=", "=", "<", ">"}) {
+                size_t p = cond.find(op);
+                if (p != std::string::npos && (op_pos == std::string::npos || p < op_pos)) {
+                    op_pos = p;
+                    op_str = op;
+                }
+            }
+            if (op_pos == std::string::npos || op_str != "=") {
+                return std::nullopt;
+            }
+
+            std::string col_name = unqualify_col_name(cond.substr(0, op_pos));
+            std::string val_str = trim_str(cond.substr(op_pos + op_str.length()));
+            if (!val_str.empty() && val_str.front() == '\'' && val_str.back() == '\'') {
+                val_str = val_str.substr(1, val_str.length() - 2);
+            }
+            eq_values[col_name] = val_str;
+
+            if (and_pos == std::string::npos) {
+                break;
+            }
+            pos = and_pos + 5;
+        }
+        return eq_values;
+    };
+
+    auto fill_min_key_part = [](char *dest, const ColMeta &col) {
+        switch (col.type) {
+            case TYPE_INT: {
+                int value = std::numeric_limits<int>::min();
+                memcpy(dest, &value, sizeof(value));
+                break;
+            }
+            case TYPE_FLOAT: {
+                float value = std::numeric_limits<float>::lowest();
+                memcpy(dest, &value, sizeof(value));
+                break;
+            }
+            case TYPE_STRING:
+                memset(dest, 0, col.len);
+                break;
+        }
+    };
+
+    auto fill_max_key_part = [](char *dest, const ColMeta &col) {
+        switch (col.type) {
+            case TYPE_INT: {
+                int value = std::numeric_limits<int>::max();
+                memcpy(dest, &value, sizeof(value));
+                break;
+            }
+            case TYPE_FLOAT: {
+                float value = std::numeric_limits<float>::max();
+                memcpy(dest, &value, sizeof(value));
+                break;
+            }
+            case TYPE_STRING:
+                memset(dest, 0xff, col.len);
+                break;
+        }
+    };
+
+    auto encode_literal = [](const ColMeta &col, const std::string &literal, char *dest) -> bool {
+        try {
+            if (col.type == TYPE_INT) {
+                int value = std::stoi(literal);
+                memcpy(dest, &value, sizeof(value));
+            } else if (col.type == TYPE_FLOAT) {
+                float value = std::stof(literal);
+                memcpy(dest, &value, sizeof(value));
+            } else if (col.type == TYPE_STRING) {
+                memset(dest, 0, col.len);
+                memcpy(dest, literal.c_str(), std::min(literal.length(), static_cast<size_t>(col.len)));
+            }
+        } catch (...) {
+            return false;
+        }
+        return true;
+    };
+
+    auto try_fast_min_aggregate = [&]() -> bool {
+        if (sql_lower.find(" group by ") != std::string::npos ||
+            sql_lower.find(" having ") != std::string::npos ||
+            sql_lower.find(" order by ") != std::string::npos ||
+            sql_lower.find(" limit ") != std::string::npos ||
+            agg_cols.size() != 1 || agg_cols[0].type != AGG_MIN) {
+            return false;
+        }
+
+        auto eq_values = parse_eq_where();
+        if (!eq_values.has_value()) {
+            return false;
+        }
+
+        const AggCol &target = agg_cols[0];
+        for (const auto &index : tab.indexes) {
+            int target_pos = -1;
+            for (int i = 0; i < index.col_num; ++i) {
+                if (index.cols[i].name == target.col_name) {
+                    target_pos = i;
+                    break;
+                }
+            }
+            if (target_pos < 0) {
+                continue;
+            }
+
+            bool prefix_boundable = true;
+            for (int i = 0; i < target_pos; ++i) {
+                if (eq_values->find(index.cols[i].name) == eq_values->end()) {
+                    prefix_boundable = false;
+                    break;
+                }
+            }
+            if (!prefix_boundable) {
+                continue;
+            }
+
+            std::vector<char> lower_key(index.col_tot_len, 0);
+            std::vector<char> upper_key(index.col_tot_len, 0);
+            int offset = 0;
+            bool ok = true;
+            for (int i = 0; i < index.col_num; ++i) {
+                const auto &col = index.cols[i];
+                if (i < target_pos) {
+                    auto eq_it = eq_values->find(col.name);
+                    ok = eq_it != eq_values->end() &&
+                         encode_literal(col, eq_it->second, lower_key.data() + offset) &&
+                         encode_literal(col, eq_it->second, upper_key.data() + offset);
+                } else {
+                    fill_min_key_part(lower_key.data() + offset, col);
+                    fill_max_key_part(upper_key.data() + offset, col);
+                }
+                if (!ok) {
+                    break;
+                }
+                offset += col.len;
+            }
+            if (!ok) {
+                continue;
+            }
+
+            auto ix_name = sm_manager_->get_ix_manager()->get_index_name(tab_name, index.cols);
+            auto ih_it = sm_manager_->ihs_.find(ix_name);
+            if (ih_it == sm_manager_->ihs_.end()) {
+                continue;
+            }
+            auto ih = ih_it->second.get();
+            Iid lower = ih->lower_bound(lower_key.data());
+            Iid upper = ih->upper_bound(upper_key.data());
+            IxScan index_scan(ih, lower, upper, sm_manager_->get_bpm());
+            while (!index_scan.is_end()) {
+                auto rec = fh->get_record(index_scan.rid(), context);
+                if (rec != nullptr && eval_where(rec.get())) {
+                    raw_records.emplace_back(rec->data, rec->data + fh->get_file_hdr().record_size);
+                    return true;
+                }
+                index_scan.next();
+            }
+            return false;
+        }
+        return false;
+    };
+
+    bool raw_records_ready = try_fast_min_aggregate();
+    if (!raw_records_ready) {
+        RmScan scan(fh);
+        while (!scan.is_end()) {
+            auto rec = fh->get_record(scan.rid(), context);
+            if (rec == nullptr) {
+                scan.next();
+                continue;
+            }
+            if (eval_where(rec.get())) {
+                std::vector<char> row(rec->data, rec->data + fh->get_file_hdr().record_size);
+                raw_records.push_back(row);
+            }
             scan.next();
-            continue;
         }
-        if (eval_where(rec.get())) {
-            std::vector<char> row(rec->data, rec->data + fh->get_file_hdr().record_size);
-            raw_records.push_back(row);
-        }
-        scan.next();
     }
 
     // 9. 分组与聚合计算
