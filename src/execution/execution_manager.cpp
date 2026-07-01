@@ -696,6 +696,56 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
         return eq_values;
     };
 
+    struct SimpleWhereCond {
+        std::string col_name;
+        std::string op_str;
+        std::string val_str;
+    };
+
+    auto parse_simple_where = [&]() -> std::optional<std::vector<SimpleWhereCond>> {
+        std::vector<SimpleWhereCond> result;
+        if (where_clause.empty()) {
+            return result;
+        }
+        std::string wc_lower = to_lower_str(where_clause);
+        size_t pos = 0;
+        while (true) {
+            size_t and_pos = wc_lower.find(" and ", pos);
+            std::string cond = (and_pos == std::string::npos)
+                                   ? trim_str(where_clause.substr(pos))
+                                   : trim_str(where_clause.substr(pos, and_pos - pos));
+            if (cond.empty()) {
+                return std::nullopt;
+            }
+
+            size_t op_pos = std::string::npos;
+            std::string op_str;
+            for (auto &op : {"<=", ">=", "<>", "!=", "=", "<", ">"}) {
+                size_t p = cond.find(op);
+                if (p != std::string::npos && (op_pos == std::string::npos || p < op_pos)) {
+                    op_pos = p;
+                    op_str = op;
+                }
+            }
+            if (op_pos == std::string::npos) {
+                return std::nullopt;
+            }
+
+            std::string col_name = unqualify_col_name(cond.substr(0, op_pos));
+            std::string val_str = trim_str(cond.substr(op_pos + op_str.length()));
+            if (!val_str.empty() && val_str.front() == '\'' && val_str.back() == '\'') {
+                val_str = val_str.substr(1, val_str.length() - 2);
+            }
+            result.push_back(SimpleWhereCond{col_name, op_str, val_str});
+
+            if (and_pos == std::string::npos) {
+                break;
+            }
+            pos = and_pos + 5;
+        }
+        return result;
+    };
+
     auto fill_min_key_part = [](char *dest, const ColMeta &col) {
         switch (col.type) {
             case TYPE_INT: {
@@ -746,6 +796,88 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
             }
         } catch (...) {
             return false;
+        }
+        return true;
+    };
+
+    auto try_collect_records_with_index = [&]() -> bool {
+        if (context == nullptr || context->txn_ == nullptr || !context->txn_->get_perf_mode() ||
+            sql_lower.find(" group by ") != std::string::npos ||
+            sql_lower.find(" having ") != std::string::npos ||
+            sql_lower.find(" order by ") != std::string::npos ||
+            sql_lower.find(" limit ") != std::string::npos) {
+            return false;
+        }
+
+        auto simple_conds = parse_simple_where();
+        if (!simple_conds.has_value() || simple_conds->empty()) {
+            return false;
+        }
+
+        std::map<std::string, std::string> eq_values;
+        for (auto &cond : *simple_conds) {
+            if (cond.op_str == "=") {
+                eq_values[cond.col_name] = cond.val_str;
+            }
+        }
+        if (eq_values.empty()) {
+            return false;
+        }
+
+        const IndexMeta *best_index = nullptr;
+        int best_prefix = 0;
+        for (const auto &index : tab.indexes) {
+            int prefix = 0;
+            for (int i = 0; i < index.col_num; ++i) {
+                if (eq_values.find(index.cols[i].name) == eq_values.end()) {
+                    break;
+                }
+                prefix++;
+            }
+            if (prefix > best_prefix) {
+                best_prefix = prefix;
+                best_index = &index;
+            }
+        }
+        if (best_index == nullptr || best_prefix == 0) {
+            return false;
+        }
+
+        std::vector<char> lower_key(best_index->col_tot_len, 0);
+        std::vector<char> upper_key(best_index->col_tot_len, 0);
+        int offset = 0;
+        for (int i = 0; i < best_index->col_num; ++i) {
+            const auto &col = best_index->cols[i];
+            if (i < best_prefix) {
+                auto it = eq_values.find(col.name);
+                if (it == eq_values.end() ||
+                    !encode_literal(col, it->second, lower_key.data() + offset) ||
+                    !encode_literal(col, it->second, upper_key.data() + offset)) {
+                    return false;
+                }
+            } else {
+                fill_min_key_part(lower_key.data() + offset, col);
+                fill_max_key_part(upper_key.data() + offset, col);
+            }
+            offset += col.len;
+        }
+
+        auto ix_name = sm_manager_->get_ix_manager()->get_index_name(tab_name, best_index->cols);
+        auto ih_it = sm_manager_->ihs_.find(ix_name);
+        if (ih_it == sm_manager_->ihs_.end()) {
+            return false;
+        }
+
+        auto ih = ih_it->second.get();
+        Iid lower = ih->lower_bound(lower_key.data());
+        Iid upper = ih->upper_bound(upper_key.data());
+        IxScan index_scan(ih, lower, upper, sm_manager_->get_bpm());
+        while (!index_scan.is_end()) {
+            auto rec = fh->get_record(index_scan.rid(), context);
+            if (rec != nullptr && eval_where(rec.get())) {
+                raw_records.emplace_back(rec->data, rec->data + fh->get_file_hdr().record_size);
+            }
+            index_scan.next();
         }
         return true;
     };
@@ -835,6 +967,9 @@ void QlManager::handle_aggregate(const std::string &sql, Context *context) {
     };
 
     bool raw_records_ready = try_fast_min_aggregate();
+    if (!raw_records_ready) {
+        raw_records_ready = try_collect_records_with_index();
+    }
     if (!raw_records_ready) {
         RmScan scan(fh);
         while (!scan.is_end()) {

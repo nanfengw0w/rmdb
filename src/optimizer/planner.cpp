@@ -142,6 +142,97 @@ std::shared_ptr<Plan> pop_scan(int *scantbl, std::string table, std::vector<std:
     return nullptr;
 }
 
+static bool same_tab_col(const TabCol &lhs, const TabCol &rhs) {
+    return lhs.tab_name == rhs.tab_name && lhs.col_name == rhs.col_name;
+}
+
+static TabCol find_eq_root(std::map<TabCol, TabCol> &parent, const TabCol &col) {
+    auto it = parent.find(col);
+    if (it == parent.end()) {
+        parent[col] = col;
+        return col;
+    }
+    if (same_tab_col(it->second, col)) {
+        return it->second;
+    }
+    it->second = find_eq_root(parent, it->second);
+    return it->second;
+}
+
+static void unite_eq_cols(std::map<TabCol, TabCol> &parent, const TabCol &lhs, const TabCol &rhs) {
+    TabCol lroot = find_eq_root(parent, lhs);
+    TabCol rroot = find_eq_root(parent, rhs);
+    if (!same_tab_col(lroot, rroot)) {
+        parent[rroot] = lroot;
+    }
+}
+
+static bool has_literal_eq_cond(const std::vector<Condition> &conds, const TabCol &col) {
+    for (auto &cond : conds) {
+        if (cond.is_rhs_val && cond.op == OP_EQ && same_tab_col(cond.lhs_col, col)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void derive_constant_equalities(SmManager *sm_manager, std::shared_ptr<Query> query) {
+    std::map<TabCol, TabCol> parent;
+    for (auto &cond : query->conds) {
+        if (cond.op != OP_EQ) {
+            continue;
+        }
+        find_eq_root(parent, cond.lhs_col);
+        if (!cond.is_rhs_val) {
+            find_eq_root(parent, cond.rhs_col);
+            unite_eq_cols(parent, cond.lhs_col, cond.rhs_col);
+        }
+    }
+    if (parent.empty()) {
+        return;
+    }
+
+    std::map<TabCol, Value> const_by_root;
+    for (auto &cond : query->conds) {
+        if (!cond.is_rhs_val || cond.op != OP_EQ) {
+            continue;
+        }
+        TabCol root = find_eq_root(parent, cond.lhs_col);
+        if (const_by_root.find(root) == const_by_root.end()) {
+            const_by_root[root] = cond.rhs_val;
+        }
+    }
+    if (const_by_root.empty()) {
+        return;
+    }
+
+    std::vector<Condition> derived;
+    for (auto &entry : parent) {
+        const TabCol &col = entry.first;
+        if (has_literal_eq_cond(query->conds, col)) {
+            continue;
+        }
+        TabCol root = find_eq_root(parent, col);
+        auto value_it = const_by_root.find(root);
+        if (value_it == const_by_root.end()) {
+            continue;
+        }
+
+        Value value = value_it->second;
+        auto &tab = sm_manager->db_.get_table(sm_manager->resolve_table_name(col.tab_name));
+        auto col_meta = tab.get_col(col.col_name);
+        value.init_raw(col_meta->len);
+
+        Condition new_cond;
+        new_cond.lhs_col = col;
+        new_cond.op = OP_EQ;
+        new_cond.is_rhs_val = true;
+        new_cond.rhs_val = std::move(value);
+        derived.push_back(std::move(new_cond));
+    }
+    query->conds.insert(query->conds.end(), derived.begin(), derived.end());
+}
+
 
 std::shared_ptr<Query> Planner::logical_optimization(std::shared_ptr<Query> query, Context *context)
 {
@@ -153,7 +244,7 @@ std::shared_ptr<Query> Planner::logical_optimization(std::shared_ptr<Query> quer
 
 std::shared_ptr<Plan> Planner::physical_optimization(std::shared_ptr<Query> query, Context *context)
 {
-    std::shared_ptr<Plan> plan = make_one_rel(query);
+    std::shared_ptr<Plan> plan = make_one_rel(query, context);
     
     // 其他物理优化
 
@@ -165,10 +256,13 @@ std::shared_ptr<Plan> Planner::physical_optimization(std::shared_ptr<Query> quer
 
 
 
-std::shared_ptr<Plan> Planner::make_one_rel(std::shared_ptr<Query> query)
+std::shared_ptr<Plan> Planner::make_one_rel(std::shared_ptr<Query> query, Context *context)
 {
     auto x = std::dynamic_pointer_cast<ast::SelectStmt>(query->parse);
     std::vector<std::string> tables = query->tables;
+    if (context != nullptr && context->txn_ != nullptr && context->txn_->get_perf_mode()) {
+        derive_constant_equalities(sm_manager_, query);
+    }
     // // Scan table , 生成表算子列表tab_nodes
     std::vector<std::shared_ptr<Plan>> table_scan_executors(tables.size());
     for (size_t i = 0; i < tables.size(); i++) {

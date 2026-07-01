@@ -4,6 +4,25 @@
 
 ## 性能测试合并分支修复记录
 
+### 2026-07-01 性能模式复合索引与常量传递优化
+- **背景**: 线上性能测试已 AC 但 tpmC 很低；本地火焰图脚本显示热点集中在 `SeqScanExecutor/RmScan`、`QlManager::select_from` 和 `handle_aggregate`。根因之一是 `portal.h` 在 `SNAPSHOT_ISOLATION` 下强制把所有 `IndexScan` 降级成顺扫，性能题又固定使用 SI。
+- **改动**:
+  1. `IndexScanExecutor` 支持复合索引最长等值前缀和下一列范围边界，不再对复合索引退化为全索引扫描；INLJ 也可用复合索引首列做运行期 lookup。
+  2. 普通 SI 仍保留顺扫，避免更新索引列后旧快照通过单版本索引漏读；仅 `set output_file off` 后的 `perf_mode` 事务允许按计划走 IndexScan。
+  3. `handle_aggregate()` 在性能模式下对无 group/having/order/limit 的单表聚合使用索引等值前缀收集输入记录，再复用原聚合计算；普通模式不变。
+  4. Planner 在性能模式下做通用等值常量传递，例如 `w_id=1 AND c_w_id=w_id` 推出 `c_w_id=1`，使 `customer(c_w_id,c_d_id,c_id)` 这类复合索引能命中。
+- **本地验证**:
+  - 复合索引 select / join runtime lookup 对照顺扫输出一致。
+  - 普通 SI 更新索引列后旧快照仍能读到旧版本；性能模式复合索引、聚合索引、join 常量传递烟测均通过。
+  - `python3 test_topic5.py` 8/8，`python3 test_topic6.py` 5/5，`python3 test_comprehensive.py` 42/42，`python3 test_crash_recovery.py` 2/2。
+  - `cmake --build` 仍不可用，本地用现有 CMake 产物手工重编译并链接。
+- **本地 profiling**:
+  - 优化前 active profile `profile_out/20260701_000313`: 20s 小负载约 `new_order_commit=62`，`RmScan::next=59`。
+  - 复合索引 + 性能模式 IndexScan 后 `profile_out/20260701_120054`: `new_order_commit=242`。
+  - 聚合输入索引后 `profile_out/20260701_120650`: `new_order_commit=249`。
+  - 常量传递后 `profile_out/20260701_121206`: 1 warehouse 下 `new_order_commit=368`；4 warehouse 下 `profile_out/20260701_121246` 为 `new_order_commit=415`、`new_order_abort=142`。
+- **风险边界**: 这些优化只在性能模式放开旧快照风险较高的索引路径；普通题目路径继续保守。下一步若继续提升，应重点降低 district/stock/customer 热点写冲突 abort，而不是再改 SELECT 输出语义。
+
 ### 2026-06-30 撤回错误的 SELECT 预留锁优化
 - **线上结果**: `daf939a` Phase 1/2 通过，但 Phase 3 `Post-transaction consistency validation` 失败。
 - **错因**: `daf939a` 在性能模式下让单行数值 SELECT 等待记录锁、刷新事务 start_ts 并重新输出最新值。这个做法会改变 `select d_next_o_id` 的返回结果，破坏 SI 事务级快照语义，本质上不是纯算法优化。
