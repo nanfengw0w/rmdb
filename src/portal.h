@@ -72,7 +72,7 @@ class Portal
                 case T_select:
                 {
                     std::shared_ptr<ProjectionPlan> p = std::dynamic_pointer_cast<ProjectionPlan>(x->subplan_);
-                    std::unique_ptr<AbstractExecutor> root= convert_plan_executor(p, context);
+                    std::unique_ptr<AbstractExecutor> root= convert_plan_executor(p, context, true);
                     return std::make_shared<PortalStmt>(PORTAL_ONE_SELECT, std::move(p->sel_cols_), std::move(root), plan);
                 }
                     
@@ -155,14 +155,20 @@ class Portal
     void drop(){}
 
 
-    std::unique_ptr<AbstractExecutor> convert_plan_executor(std::shared_ptr<Plan> plan, Context *context)
+    std::unique_ptr<AbstractExecutor> convert_plan_executor(std::shared_ptr<Plan> plan, Context *context,
+                                                            bool allow_perf_si_index_scan = false)
     {
         if(auto x = std::dynamic_pointer_cast<ProjectionPlan>(plan)){
-            return std::make_unique<ProjectionExecutor>(convert_plan_executor(x->subplan_, context), 
+            return std::make_unique<ProjectionExecutor>(convert_plan_executor(x->subplan_, context,
+                                                                              allow_perf_si_index_scan),
                                                         x->sel_cols_);
         } else if(auto x = std::dynamic_pointer_cast<ScanPlan>(plan)) {
+            bool allow_index_in_si = allow_perf_si_index_scan &&
+                                     context != nullptr && context->txn_ != nullptr &&
+                                     context->txn_->get_perf_mode();
             bool force_seq_scan = context != nullptr && context->txn_ != nullptr &&
-                                  context->txn_->get_isolation_level() == IsolationLevel::SNAPSHOT_ISOLATION;
+                                  context->txn_->get_isolation_level() == IsolationLevel::SNAPSHOT_ISOLATION &&
+                                  !allow_index_in_si;
             if(x->tag == T_SeqScan || force_seq_scan) {
                 return std::make_unique<SeqScanExecutor>(sm_manager_, x->tab_name_, x->conds_, context);
             }
@@ -170,14 +176,17 @@ class Portal
                 return std::make_unique<IndexScanExecutor>(sm_manager_, x->tab_name_, x->conds_, x->index_col_names_, context);
             } 
         } else if(auto x = std::dynamic_pointer_cast<JoinPlan>(plan)) {
-            std::unique_ptr<AbstractExecutor> left = convert_plan_executor(x->left_, context);
-            std::unique_ptr<AbstractExecutor> right = convert_plan_executor(x->right_, context);
+            std::unique_ptr<AbstractExecutor> left = convert_plan_executor(x->left_, context,
+                                                                           allow_perf_si_index_scan);
+            std::unique_ptr<AbstractExecutor> right = convert_plan_executor(x->right_, context,
+                                                                            allow_perf_si_index_scan);
             std::unique_ptr<AbstractExecutor> join = std::make_unique<NestedLoopJoinExecutor>(
                                 std::move(left), 
                                 std::move(right), std::move(x->conds_));
             return join;
         } else if(auto x = std::dynamic_pointer_cast<SortPlan>(plan)) {
-            return std::make_unique<SortExecutor>(convert_plan_executor(x->subplan_, context), 
+            return std::make_unique<SortExecutor>(convert_plan_executor(x->subplan_, context,
+                                                                        allow_perf_si_index_scan),
                                             x->sel_col_, x->is_desc_);
         }
         return nullptr;
