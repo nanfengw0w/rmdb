@@ -22,6 +22,15 @@
   - 聚合输入索引后 `profile_out/20260701_120650`: `new_order_commit=249`。
   - 常量传递后 `profile_out/20260701_121206`: 1 warehouse 下 `new_order_commit=368`；4 warehouse 下 `profile_out/20260701_121246` 为 `new_order_commit=415`、`new_order_abort=142`。
 - **风险边界**: 这些优化只在性能模式放开旧快照风险较高的索引路径；普通题目路径继续保守。下一步若继续提升，应重点降低 district/stock/customer 热点写冲突 abort，而不是再改 SELECT 输出语义。
+- **线上复盘补充**:
+  - `fa2c337` 将性能模式 SI 下的所有 `ScanPlan` 都放开为 IndexScan，Phase 3 consistency validation 失败。
+  - `93e1276` 仅回退 `portal.h` 的通用放开后恢复 AC，`median tpmC=2.333333`。
+  - `c2d7067` 改为只对性能模式只读 SELECT 启用 IndexScan，UPDATE/DELETE 收集 RID 仍走 SeqScan，线上 AC，`median tpmC=6.333333`。
+  - 结论：SI + SELECT IndexScan 方向是可行的；之前 WA 的问题是 DML 扫描路径也被一刀切放开，而不是 SELECT 走索引天然错误。
+- **本次 trial**:
+  - 在 `c2d7067` 基础上，仅当 `set output_file off` 性能模式且 `UPDATE` 不修改任何索引列时，允许用于收集 RID 的子扫描走 IndexScan；更新索引列和 DELETE 仍保持 SeqScan。
+  - 本地定向验证：性能模式复合索引条件 UPDATE 的 commit/abort 正常；两个 SI 事务并发更新同一索引条件记录时，第二个写语句返回 `abort`，最终只保留第一个提交值。
+  - 同参数短窗口 probe 对比：`c2d7067` 基线 `new_order_commit=47`，本 trial `new_order_commit=263`。该结果只用于筛选方向，最终仍以线上 Phase 3 consistency 和 tpmC 为准。
 
 ### 2026-06-30 撤回错误的 SELECT 预留锁优化
 - **线上结果**: `daf939a` Phase 1/2 通过，但 Phase 3 `Post-transaction consistency validation` 失败。

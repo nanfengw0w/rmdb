@@ -78,7 +78,9 @@ class Portal
                     
                 case T_Update:
                 {
-                    std::unique_ptr<AbstractExecutor> scan= convert_plan_executor(x->subplan_, context);
+                    bool allow_update_index_scan = can_update_scan_use_index(x, context);
+                    std::unique_ptr<AbstractExecutor> scan= convert_plan_executor(x->subplan_, context,
+                                                                                  allow_update_index_scan);
                     std::vector<Rid> rids;
                     for (scan->beginTuple(); !scan->is_end(); scan->nextTuple()) {
                         rids.push_back(scan->rid());
@@ -153,6 +155,25 @@ class Portal
 
     // 清空资源
     void drop(){}
+
+
+    bool can_update_scan_use_index(const std::shared_ptr<DMLPlan> &plan, Context *context) {
+        if (plan == nullptr || context == nullptr || context->txn_ == nullptr ||
+            !context->txn_->get_perf_mode()) {
+            return false;
+        }
+        auto tab = sm_manager_->db_.get_table(plan->tab_name_);
+        for (auto &set_clause : plan->set_clauses_) {
+            for (auto &index : tab.indexes) {
+                for (auto &col : index.cols) {
+                    if (set_clause.lhs.col_name == col.name) {
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
+    }
 
 
     std::unique_ptr<AbstractExecutor> convert_plan_executor(std::shared_ptr<Plan> plan, Context *context,
