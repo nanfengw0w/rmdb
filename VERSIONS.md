@@ -4,6 +4,11 @@
 
 ## 性能测试合并分支修复记录
 
+### 2026-07-02 VersionManager 提交回滚局部化试验
+- **背景**: 当前 AC 基线 `f1a2a53` 线上 `median tpmC=10.166667`，`abort-rate=68.30%`。DML 复用 `IndexScanExecutor` 的两次试验均导致 Phase 3 consistency 失败，因此本轮先做不改变 SQL 语义的 MVCC 元数据优化。
+- **改动**: `VersionManager` 记录每个事务写过的 `(fd,page,slot)` key；`commit_transaction()` 和 `abort_transaction()` 只遍历当前事务的版本 key，不再扫描全局所有版本链。`clear_fd()` / `clear_all()` 同步清理该索引。
+- **风险边界**: 不改变可见性、写写冲突、表/索引恢复逻辑；只减少提交/回滚时持有全局版本锁的工作量。线上若 WA，单独回退本提交。
+
 ### 2026-07-02 默认 Release 编译优化
 - **背景**: 线上性能测试 AC 基线 `c2d7067` 的 `median tpmC=6.333333` 仍极低。检查发现顶层 `CMakeLists.txt` 强制 `-O0 -g -ggdb3`，若评测按仓库 CMake 重新编译，线上实际运行的是 Debug 优化级别。
 - **改动**:

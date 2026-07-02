@@ -129,6 +129,7 @@ public:
         }
 
         chain.push_back(std::move(entry));
+        txn_versions_[txn->get_transaction_id()].push_back(key);
         return true;
     }
 
@@ -155,6 +156,7 @@ public:
         }
 
         chain.push_back(std::move(entry));
+        txn_versions_[txn->get_transaction_id()].push_back(key);
     }
 
     /**
@@ -163,13 +165,24 @@ public:
     void commit_transaction(txn_id_t txn_id, timestamp_t commit_ts) {
         std::lock_guard<std::mutex> lock(mutex_);
 
-        for (auto& [key, chain] : version_chains_) {
+        auto txn_it = txn_versions_.find(txn_id);
+        if (txn_it == txn_versions_.end()) {
+            return;
+        }
+
+        for (const auto& key : txn_it->second) {
+            auto chain_it = version_chains_.find(key);
+            if (chain_it == version_chains_.end()) {
+                continue;
+            }
+            auto& chain = chain_it->second;
             for (auto& entry : chain) {
                 if (entry.txn_id_ == txn_id && entry.commit_ts_ == 0) {
                     entry.commit_ts_ = commit_ts;
                 }
             }
         }
+        txn_versions_.erase(txn_it);
     }
 
     /**
@@ -181,7 +194,16 @@ public:
 
         std::vector<std::tuple<int, Rid, std::shared_ptr<RmRecord>, bool>> to_restore;
 
-        for (auto it = version_chains_.begin(); it != version_chains_.end(); ) {
+        auto txn_it = txn_versions_.find(txn_id);
+        if (txn_it == txn_versions_.end()) {
+            return to_restore;
+        }
+
+        for (const auto& key : txn_it->second) {
+            auto it = version_chains_.find(key);
+            if (it == version_chains_.end()) {
+                continue;
+            }
             auto& chain = it->second;
 
             // 找到该事务的版本条目，恢复旧数据
@@ -204,12 +226,11 @@ public:
             );
 
             if (chain.empty()) {
-                it = version_chains_.erase(it);
-            } else {
-                ++it;
+                version_chains_.erase(it);
             }
         }
 
+        txn_versions_.erase(txn_it);
         return to_restore;
     }
 
@@ -361,15 +382,28 @@ public:
                 ++it;
             }
         }
+        for (auto txn_it = txn_versions_.begin(); txn_it != txn_versions_.end(); ) {
+            auto& keys = txn_it->second;
+            keys.erase(std::remove_if(keys.begin(), keys.end(),
+                                      [fd](const VersionKey& key) { return key.fd == fd; }),
+                       keys.end());
+            if (keys.empty()) {
+                txn_it = txn_versions_.erase(txn_it);
+            } else {
+                ++txn_it;
+            }
+        }
     }
 
     void clear_all() {
         std::lock_guard<std::mutex> lock(mutex_);
         version_chains_.clear();
+        txn_versions_.clear();
     }
 
 private:
     VersionManager() = default;
     std::mutex mutex_;
     std::unordered_map<VersionKey, std::vector<VersionEntry>, VersionKeyHash> version_chains_;
+    std::unordered_map<txn_id_t, std::vector<VersionKey>> txn_versions_;
 };
