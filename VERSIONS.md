@@ -9,7 +9,18 @@
 - **改动**:
   1. 回退已知线上 WA 的 `fbcccee`，恢复到只读 SELECT 走 IndexScan 的稳定语义。
   2. 默认 `CMAKE_BUILD_TYPE` 改为 `Release`，Release 使用 `-O3 -DNDEBUG`；Debug 单独保留 `-O0 -g -ggdb3`。
-- **风险边界**: 这是编译级优化，不改变 SQL 语义和事务逻辑。若线上仍 AC，应优先比较 tpmC 与 `6.333333` 基线。
+- **线上结果**: `f1a2a53` AC，`median tpmC=10.166667`，`abort-rate=68.30%`，`rmdb-max-rss=0.503059 GB`。
+- **风险边界**: 这是编译级优化，不改变 SQL 语义和事务逻辑。提升幅度约 60%，但 abort 仍是主要瓶颈。
+
+### 2026-07-02 性能模式完整等值 UPDATE 索引试验
+- **背景**: `fbcccee` 曾让性能模式下所有非索引列 UPDATE 收集 RID 时走 IndexScan，线上 Phase 3 consistency 失败。原因是 prefix/multi-row UPDATE 复用只读 IndexScan 会漏处理候选 RID。
+- **改动**: 本次只在更窄条件放开 UPDATE 子扫描：
+  1. 必须是 `set output_file off` 后的性能模式事务。
+  2. UPDATE 不能修改任何已建索引列。
+  3. Planner 选中的索引所有列都必须在 WHERE 中有等值常量条件。
+  4. DELETE 和 prefix/range/multi-row UPDATE 继续保持 SeqScan。
+- **预期收益**: TPCC 中 `warehouse/district/customer/stock/orders` 的完整主键等值单行 UPDATE 可以少走顺扫；`order_line` delivery 批量更新仍不放开。
+- **线上风险**: 这是 trial 提交。若 Phase 3 consistency 再次失败，应单独回退该提交，保留 `f1a2a53` 的 Release 编译 AC 基线。
 
 ### 2026-07-01 性能模式复合索引与常量传递优化
 - **背景**: 线上性能测试已 AC 但 tpmC 很低；本地火焰图脚本显示热点集中在 `SeqScanExecutor/RmScan`、`QlManager::select_from` 和 `handle_aggregate`。根因之一是 `portal.h` 在 `SNAPSHOT_ISOLATION` 下强制把所有 `IndexScan` 降级成顺扫，性能题又固定使用 SI。
