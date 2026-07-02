@@ -4,6 +4,13 @@
 
 ## 性能测试合并分支修复记录
 
+### 2026-07-02 默认 Release 编译优化
+- **背景**: 线上性能测试 AC 基线 `c2d7067` 的 `median tpmC=6.333333` 仍极低。检查发现顶层 `CMakeLists.txt` 强制 `-O0 -g -ggdb3`，若评测按仓库 CMake 重新编译，线上实际运行的是 Debug 优化级别。
+- **改动**:
+  1. 回退已知线上 WA 的 `fbcccee`，恢复到只读 SELECT 走 IndexScan 的稳定语义。
+  2. 默认 `CMAKE_BUILD_TYPE` 改为 `Release`，Release 使用 `-O3 -DNDEBUG`；Debug 单独保留 `-O0 -g -ggdb3`。
+- **风险边界**: 这是编译级优化，不改变 SQL 语义和事务逻辑。若线上仍 AC，应优先比较 tpmC 与 `6.333333` 基线。
+
 ### 2026-07-01 性能模式复合索引与常量传递优化
 - **背景**: 线上性能测试已 AC 但 tpmC 很低；本地火焰图脚本显示热点集中在 `SeqScanExecutor/RmScan`、`QlManager::select_from` 和 `handle_aggregate`。根因之一是 `portal.h` 在 `SNAPSHOT_ISOLATION` 下强制把所有 `IndexScan` 降级成顺扫，性能题又固定使用 SI。
 - **改动**:
