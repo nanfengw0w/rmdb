@@ -75,10 +75,11 @@ public:
      */
     bool check_write_conflict(int fd, const Rid& rid, Transaction* txn) {
         VersionKey key{fd, rid.page_no, rid.slot_no};
-        std::lock_guard<std::mutex> lock(mutex_);
+        auto& shard = get_shard(key);
+        std::lock_guard<std::mutex> lock(shard.mutex);
 
-        auto it = version_chains_.find(key);
-        if (it == version_chains_.end() || it->second.empty()) {
+        auto it = shard.version_chains.find(key);
+        if (it == shard.version_chains.end() || it->second.empty()) {
             return true;  // 没有版本信息，可以写
         }
 
@@ -104,12 +105,13 @@ public:
     }
 
     bool save_old_data_if_no_conflict(int fd, const Rid& rid, Transaction* txn,
-                                      const RmRecord* old_data, bool was_deleted,
-                                      bool new_deleted = false) {
+                                       const RmRecord* old_data, bool was_deleted,
+                                       bool new_deleted = false) {
         VersionKey key{fd, rid.page_no, rid.slot_no};
-        std::lock_guard<std::mutex> lock(mutex_);
+        auto& shard = get_shard(key);
+        std::lock_guard<std::mutex> lock(shard.mutex);
 
-        auto& chain = version_chains_[key];
+        auto& chain = shard.version_chains[key];
         if (!chain.empty()) {
             auto& latest = chain.back();
             if (latest.txn_id_ != txn->get_transaction_id()) {
@@ -129,7 +131,10 @@ public:
         }
 
         chain.push_back(std::move(entry));
-        txn_versions_[txn->get_transaction_id()].push_back(key);
+        {
+            std::lock_guard<std::mutex> txn_lock(txn_mutex_);
+            txn_versions_[txn->get_transaction_id()].push_back(key);
+        }
         return true;
     }
 
@@ -139,12 +144,13 @@ public:
      * @param was_deleted 写操作前记录是否已删除
      */
     void save_old_data(int fd, const Rid& rid, Transaction* txn,
-                       const RmRecord* old_data, bool was_deleted,
-                       bool new_deleted = false) {
+                        const RmRecord* old_data, bool was_deleted,
+                        bool new_deleted = false) {
         VersionKey key{fd, rid.page_no, rid.slot_no};
-        std::lock_guard<std::mutex> lock(mutex_);
+        auto& shard = get_shard(key);
+        std::lock_guard<std::mutex> lock(shard.mutex);
 
-        auto& chain = version_chains_[key];
+        auto& chain = shard.version_chains[key];
 
         VersionEntry entry;
         entry.txn_id_ = txn->get_transaction_id();
@@ -156,33 +162,49 @@ public:
         }
 
         chain.push_back(std::move(entry));
-        txn_versions_[txn->get_transaction_id()].push_back(key);
+        {
+            std::lock_guard<std::mutex> txn_lock(txn_mutex_);
+            txn_versions_[txn->get_transaction_id()].push_back(key);
+        }
     }
 
     /**
      * @brief 提交事务的所有写操作
      */
     void commit_transaction(txn_id_t txn_id, timestamp_t commit_ts) {
-        std::lock_guard<std::mutex> lock(mutex_);
-
-        auto txn_it = txn_versions_.find(txn_id);
-        if (txn_it == txn_versions_.end()) {
-            return;
+        std::vector<VersionKey> keys;
+        {
+            std::lock_guard<std::mutex> txn_lock(txn_mutex_);
+            auto txn_it = txn_versions_.find(txn_id);
+            if (txn_it == txn_versions_.end()) {
+                return;
+            }
+            keys = std::move(txn_it->second);
+            txn_versions_.erase(txn_it);
         }
 
-        for (const auto& key : txn_it->second) {
-            auto chain_it = version_chains_.find(key);
-            if (chain_it == version_chains_.end()) {
-                continue;
-            }
-            auto& chain = chain_it->second;
-            for (auto& entry : chain) {
-                if (entry.txn_id_ == txn_id && entry.commit_ts_ == 0) {
-                    entry.commit_ts_ = commit_ts;
+        // 按分片分组处理
+        std::vector<std::vector<VersionKey>> shard_keys(NUM_SHARDS);
+        for (const auto& key : keys) {
+            shard_keys[get_shard_index(key)].push_back(key);
+        }
+
+        for (int i = 0; i < NUM_SHARDS; ++i) {
+            if (shard_keys[i].empty()) continue;
+            std::lock_guard<std::mutex> lock(shards_[i].mutex);
+            for (const auto& key : shard_keys[i]) {
+                auto chain_it = shards_[i].version_chains.find(key);
+                if (chain_it == shards_[i].version_chains.end()) {
+                    continue;
+                }
+                auto& chain = chain_it->second;
+                for (auto& entry : chain) {
+                    if (entry.txn_id_ == txn_id && entry.commit_ts_ == 0) {
+                        entry.commit_ts_ = commit_ts;
+                    }
                 }
             }
         }
-        txn_versions_.erase(txn_it);
     }
 
     /**
@@ -190,47 +212,60 @@ public:
      * @return 需要恢复的记录列表 (fd, rid, old_data, is_deleted)
      */
     std::vector<std::tuple<int, Rid, std::shared_ptr<RmRecord>, bool>> abort_transaction(txn_id_t txn_id) {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<VersionKey> keys;
+        {
+            std::lock_guard<std::mutex> txn_lock(txn_mutex_);
+            auto txn_it = txn_versions_.find(txn_id);
+            if (txn_it == txn_versions_.end()) {
+                return {};
+            }
+            keys = std::move(txn_it->second);
+            txn_versions_.erase(txn_it);
+        }
 
         std::vector<std::tuple<int, Rid, std::shared_ptr<RmRecord>, bool>> to_restore;
 
-        auto txn_it = txn_versions_.find(txn_id);
-        if (txn_it == txn_versions_.end()) {
-            return to_restore;
+        // 按分片分组处理
+        std::vector<std::vector<VersionKey>> shard_keys(NUM_SHARDS);
+        for (const auto& key : keys) {
+            shard_keys[get_shard_index(key)].push_back(key);
         }
 
-        for (const auto& key : txn_it->second) {
-            auto it = version_chains_.find(key);
-            if (it == version_chains_.end()) {
-                continue;
-            }
-            auto& chain = it->second;
+        for (int i = 0; i < NUM_SHARDS; ++i) {
+            if (shard_keys[i].empty()) continue;
+            std::lock_guard<std::mutex> lock(shards_[i].mutex);
+            for (const auto& key : shard_keys[i]) {
+                auto it = shards_[i].version_chains.find(key);
+                if (it == shards_[i].version_chains.end()) {
+                    continue;
+                }
+                auto& chain = it->second;
 
-            // 找到该事务的版本条目，恢复旧数据
-            for (auto& entry : chain) {
-                if (entry.txn_id_ == txn_id) {
-                    to_restore.push_back({it->first.fd,
-                                          Rid{it->first.page_no, it->first.slot_no},
-                                          entry.old_data_,
-                                          entry.is_deleted_});
+                // 找到该事务的版本条目，恢复旧数据
+                for (auto& entry : chain) {
+                    if (entry.txn_id_ == txn_id) {
+                        to_restore.push_back({key.fd,
+                                              Rid{key.page_no, key.slot_no},
+                                              entry.old_data_,
+                                              entry.is_deleted_});
+                    }
+                }
+
+                // 移除该事务的版本条目
+                chain.erase(
+                    std::remove_if(chain.begin(), chain.end(),
+                        [txn_id](const VersionEntry& entry) {
+                            return entry.txn_id_ == txn_id;
+                        }),
+                    chain.end()
+                );
+
+                if (chain.empty()) {
+                    shards_[i].version_chains.erase(it);
                 }
             }
-
-            // 移除该事务的版本条目
-            chain.erase(
-                std::remove_if(chain.begin(), chain.end(),
-                    [txn_id](const VersionEntry& entry) {
-                        return entry.txn_id_ == txn_id;
-                    }),
-                chain.end()
-            );
-
-            if (chain.empty()) {
-                version_chains_.erase(it);
-            }
         }
 
-        txn_versions_.erase(txn_it);
         return to_restore;
     }
 
@@ -240,13 +275,14 @@ public:
      * @return -1: 从磁盘读取, 0: 记录不存在, 1: 从old_data读取
      */
     int get_visible_data(int fd, const Rid& rid, Transaction* txn,
-                         std::unique_ptr<RmRecord>& result, bool& is_deleted) {
+                          std::unique_ptr<RmRecord>& result, bool& is_deleted) {
         VersionKey key{fd, rid.page_no, rid.slot_no};
-        std::lock_guard<std::mutex> lock(mutex_);
+        auto& shard = get_shard(key);
+        std::lock_guard<std::mutex> lock(shard.mutex);
         result.reset();
 
-        auto it = version_chains_.find(key);
-        if (it == version_chains_.end() || it->second.empty()) {
+        auto it = shard.version_chains.find(key);
+        if (it == shard.version_chains.end() || it->second.empty()) {
             is_deleted = false;
             return -1;  // 没有版本信息，从磁盘读取
         }
@@ -308,10 +344,11 @@ public:
 
     bool latest_is_deleted_for_txn(int fd, const Rid& rid, txn_id_t txn_id) {
         VersionKey key{fd, rid.page_no, rid.slot_no};
-        std::lock_guard<std::mutex> lock(mutex_);
+        auto& shard = get_shard(key);
+        std::lock_guard<std::mutex> lock(shard.mutex);
 
-        auto it = version_chains_.find(key);
-        if (it == version_chains_.end() || it->second.empty()) {
+        auto it = shard.version_chains.find(key);
+        if (it == shard.version_chains.end() || it->second.empty()) {
             return false;
         }
         for (auto rit = it->second.rbegin(); rit != it->second.rend(); ++rit) {
@@ -325,11 +362,12 @@ public:
     int get_read_committed_data(int fd, const Rid& rid,
                                 std::unique_ptr<RmRecord>& result, bool& is_deleted) {
         VersionKey key{fd, rid.page_no, rid.slot_no};
-        std::lock_guard<std::mutex> lock(mutex_);
+        auto& shard = get_shard(key);
+        std::lock_guard<std::mutex> lock(shard.mutex);
         result.reset();
 
-        auto it = version_chains_.find(key);
-        if (it == version_chains_.end() || it->second.empty()) {
+        auto it = shard.version_chains.find(key);
+        if (it == shard.version_chains.end() || it->second.empty()) {
             is_deleted = false;
             return -1;
         }
@@ -374,36 +412,78 @@ public:
     }
 
     void clear_fd(int fd) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (auto it = version_chains_.begin(); it != version_chains_.end(); ) {
-            if (it->first.fd == fd) {
-                it = version_chains_.erase(it);
-            } else {
-                ++it;
+        // 清理所有分片中的version_chains
+        for (int i = 0; i < NUM_SHARDS; ++i) {
+            std::lock_guard<std::mutex> lock(shards_[i].mutex);
+            auto& chains = shards_[i].version_chains;
+            for (auto it = chains.begin(); it != chains.end(); ) {
+                if (it->first.fd == fd) {
+                    it = chains.erase(it);
+                } else {
+                    ++it;
+                }
             }
         }
-        for (auto txn_it = txn_versions_.begin(); txn_it != txn_versions_.end(); ) {
-            auto& keys = txn_it->second;
-            keys.erase(std::remove_if(keys.begin(), keys.end(),
-                                      [fd](const VersionKey& key) { return key.fd == fd; }),
-                       keys.end());
-            if (keys.empty()) {
-                txn_it = txn_versions_.erase(txn_it);
-            } else {
-                ++txn_it;
+
+        // 清理txn_versions_
+        {
+            std::lock_guard<std::mutex> txn_lock(txn_mutex_);
+            for (auto txn_it = txn_versions_.begin(); txn_it != txn_versions_.end(); ) {
+                auto& keys = txn_it->second;
+                keys.erase(std::remove_if(keys.begin(), keys.end(),
+                                          [fd](const VersionKey& key) { return key.fd == fd; }),
+                           keys.end());
+                if (keys.empty()) {
+                    txn_it = txn_versions_.erase(txn_it);
+                } else {
+                    ++txn_it;
+                }
             }
         }
     }
 
     void clear_all() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        version_chains_.clear();
-        txn_versions_.clear();
+        for (int i = 0; i < NUM_SHARDS; ++i) {
+            std::lock_guard<std::mutex> lock(shards_[i].mutex);
+            shards_[i].version_chains.clear();
+        }
+        {
+            std::lock_guard<std::mutex> txn_lock(txn_mutex_);
+            txn_versions_.clear();
+        }
     }
 
 private:
     VersionManager() = default;
-    std::mutex mutex_;
-    std::unordered_map<VersionKey, std::vector<VersionEntry>, VersionKeyHash> version_chains_;
+
+    // 分片锁配置
+    static constexpr int NUM_SHARDS = 64;
+    static constexpr int SHARD_MASK = NUM_SHARDS - 1;
+
+    struct Shard {
+        std::mutex mutex;
+        std::unordered_map<VersionKey, std::vector<VersionEntry>, VersionKeyHash> version_chains;
+    };
+
+    // 根据key计算分片索引
+    static int get_shard_index(const VersionKey& key) {
+        size_t hash = VersionKeyHash{}(key);
+        return hash & SHARD_MASK;
+    }
+
+    // 获取分片引用
+    Shard& get_shard(const VersionKey& key) {
+        return shards_[get_shard_index(key)];
+    }
+
+    Shard& get_shard(int fd, const Rid& rid) {
+        return get_shard(VersionKey{fd, rid.page_no, rid.slot_no});
+    }
+
+    // 分片数组
+    Shard shards_[NUM_SHARDS];
+
+    // txn_versions_ 使用单独的锁保护
+    std::mutex txn_mutex_;
     std::unordered_map<txn_id_t, std::vector<VersionKey>> txn_versions_;
 };
