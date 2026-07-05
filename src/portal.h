@@ -23,6 +23,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution/executor_insert.h"
 #include "execution/executor_delete.h"
 #include "execution/execution_sort.h"
+#include "execution/write_index_probe.h"
 #include "common/common.h"
 
 typedef enum portalTag{
@@ -78,10 +79,12 @@ class Portal
                     
                 case T_Update:
                 {
-                    std::unique_ptr<AbstractExecutor> scan= convert_plan_executor(x->subplan_, context);
                     std::vector<Rid> rids;
-                    for (scan->beginTuple(); !scan->is_end(); scan->nextTuple()) {
-                        rids.push_back(scan->rid());
+                    if (!write_index_probe::collect_update_rids(sm_manager_, x, context, rids)) {
+                        std::unique_ptr<AbstractExecutor> scan= convert_plan_executor(x->subplan_, context);
+                        for (scan->beginTuple(); !scan->is_end(); scan->nextTuple()) {
+                            rids.push_back(scan->rid());
+                        }
                     }
                     std::unique_ptr<AbstractExecutor> root =std::make_unique<UpdateExecutor>(sm_manager_, 
                                                             x->tab_name_, x->set_clauses_, x->conds_, rids, context);

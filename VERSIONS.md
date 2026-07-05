@@ -4,6 +4,21 @@
 
 ## 性能测试合并分支修复记录
 
+### 2026-07-05 写路径专用 WriteIndexProbe 小步试验
+- **背景**: `08be174` 线上 AC，`median tpmC=8.333333`，相对 `f1a2a53` 的 `10.166667/约6` 波动无明显收益。此前 `fbcccee`、`05a286e` 直接让 UPDATE 复用只读 `IndexScanExecutor`，均导致 Phase 3 consistency validation 失败。
+- **改动**:
+  1. 新增 `src/execution/write_index_probe.h`，只在 `set output_file off` 性能模式下尝试为 UPDATE 收集候选 RID。
+  2. 仅支持完整索引等值条件；UPDATE 修改任何索引列时直接回退原 SeqScan。
+  3. probe 只作为候选 RID 加速，仍用事务快照记录重新判断 WHERE；真正写入、写写冲突、WAL、索引维护和回滚仍交给原 `UpdateExecutor` / `RmFileHandle` 路径。
+  4. 本轮不启用 DELETE，也不启用 prefix/range/multi-row UPDATE。
+- **本地验证**:
+  - 手动重编 `rmdb.cpp.o` 并重新链接 `build/bin/rmdb`；当前环境无可用 `cmake`，`build/Makefile` 绑定的 `/tmp/cmake-3.28.1...` 已失效。
+  - 性能模式索引等值 UPDATE smoke 通过。
+  - SI 并发未提交写冲突 smoke 通过，第二个 update 返回 `abort`。
+  - SI 旧快照写冲突 smoke 通过，较晚写入返回 `abort`。
+  - `./build/bin/unit_test` 5/5，通过；`python3 test_topic5.py` 8/8，通过；`python3 test_topic6.py` 5/5，通过；`python3 test_comprehensive.py` 42/42，通过；`python3 test_crash_recovery.py` 两项通过。
+- **风险边界**: 这是线上 trial。若 Phase 3 consistency validation 失败，只回退本提交；不要回退 Release 编译、SELECT IndexScan 和第九/第十题修复。
+
 ### 2026-07-02 VersionManager 提交回滚局部化试验
 - **背景**: 当前 AC 基线 `f1a2a53` 线上 `median tpmC=10.166667`，`abort-rate=68.30%`。DML 复用 `IndexScanExecutor` 的两次试验均导致 Phase 3 consistency 失败，因此本轮先做不改变 SQL 语义的 MVCC 元数据优化。
 - **改动**: `VersionManager` 记录每个事务写过的 `(fd,page,slot)` key；`commit_transaction()` 和 `abort_transaction()` 只遍历当前事务的版本 key，不再扫描全局所有版本链。`clear_fd()` / `clear_all()` 同步清理该索引。
