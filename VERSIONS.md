@@ -4,7 +4,16 @@
 
 ## 性能测试合并分支修复记录
 
+### 2026-07-05 回退 WriteIndexProbe 并修复第三题多列索引
+- **线上结果**: `09e67e7` Phase 1/2 通过，但 Phase 3 `Post-transaction consistency validation` 失败；第三题唯一索引 `judge_whether_use_index_on_multiple_attributes` 也出现建索引前后 SELECT 输出不一致。
+- **修复**:
+  1. 删除 `src/execution/write_index_probe.h`，恢复 UPDATE 候选 RID 由原执行计划扫描收集，避免写路径绕过既有 MVCC/WAL/冲突检查细节。
+  2. `IndexScanExecutor` 在非 `set output_file off` 性能模式下，对多列索引扫描整棵索引后再用原 WHERE 条件过滤，保证第三题普通 SELECT 建索引前后输出一致。
+  3. 性能模式仍保留复合索引前缀/范围边界优化，避免把已通过的性能读路径整体回退。
+- **教训**: 写路径索引加速必须逐条验证事务语义，不能只把只读索引探测结果当作 UPDATE 的可信 RID 集；第三题多列索引优先保证输出正确，性能优化只能放在受控的性能模式里。
+
 ### 2026-07-05 写路径专用 WriteIndexProbe 小步试验
+- **线上结果**: `09e67e7` WA，Phase 3 `Post-transaction consistency validation` 失败；该试验已在后续版本回退。
 - **背景**: `08be174` 线上 AC，`median tpmC=8.333333`，相对 `f1a2a53` 的 `10.166667/约6` 波动无明显收益。此前 `fbcccee`、`05a286e` 直接让 UPDATE 复用只读 `IndexScanExecutor`，均导致 Phase 3 consistency validation 失败。
 - **改动**:
   1. 新增 `src/execution/write_index_probe.h`，只在 `set output_file off` 性能模式下尝试为 UPDATE 收集候选 RID。

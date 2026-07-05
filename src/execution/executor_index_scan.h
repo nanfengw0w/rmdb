@@ -101,6 +101,14 @@ class IndexScanExecutor : public AbstractExecutor {
             return;
         }
 
+        bool perf_mode = context_ != nullptr && context_->txn_ != nullptr &&
+                         context_->txn_->get_perf_mode();
+        if (index_meta_.col_num > 1 && !perf_mode) {
+            materialize_index_scan(ih_->leaf_begin(), ih_->leaf_end());
+            finish_materialized_scan();
+            return;
+        }
+
         auto exact_key = build_exact_match_key();
         if (exact_key.has_value()) {
             std::vector<Rid> result;
