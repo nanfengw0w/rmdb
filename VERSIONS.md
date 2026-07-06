@@ -4,6 +4,20 @@
 
 ## 性能测试合并分支修复记录
 
+### 2026-07-06 写路径 exact-index probe 收窄修复
+- **线上症状**: `8f9ba53` Phase 1/2 通过，但 Phase 3 `Post-transaction consistency validation` 失败。根因判断是性能模式下 `portal.h` 让 UPDATE/DELETE 直接复用只读 `IndexScanExecutor` 收集 RID，写路径候选集合和 MVCC/WAL/冲突语义边界不够明确。
+- **修复**:
+  1. 新增 `src/execution/write_index_probe.h`，只在 `set output_file off` 性能模式下启用写专用索引候选收集。
+  2. 仅允许完整等值索引命中；候选 RID 取出后仍用事务可见版本重新判断 WHERE。
+  3. UPDATE 修改任意索引列时直接回退 SeqScan；不满足完整等值索引条件时回退 SeqScan。
+  4. 不再让 UPDATE/DELETE 直接调用 `convert_plan_executor(..., allow_index=true)`，避免范围/前缀 IndexScan 进入写路径。
+- **本地验证**:
+  - `cmake --build build -j` 通过。
+  - `./build/bin/unit_test` 5/5 通过。
+  - `python3 test_topic5.py` 8/8，`python3 test_topic6.py` 5/5，`python3 test_comprehensive.py` 42/42，`python3 test_crash_recovery.py` 2/2 通过。
+  - exact-index UPDATE/DELETE smoke 通过；并发同一行 exact-index UPDATE 中第二个事务返回 `abort`，最终只保留首个提交值。
+- **风险边界**: 这是比 `8f9ba53` 更窄的写路径优化，仍需线上 Phase 3 验证。若仍 WA，下一步应关闭 DELETE probe，只保留 UPDATE 非索引列完整等值 probe 或完全回到 `e3e91cc`。
+
 ### 2026-07-05 回退 WriteIndexProbe 并修复第三题多列索引
 - **线上结果**: `09e67e7` Phase 1/2 通过，但 Phase 3 `Post-transaction consistency validation` 失败；第三题唯一索引 `judge_whether_use_index_on_multiple_attributes` 也出现建索引前后 SELECT 输出不一致。
 - **修复**:
