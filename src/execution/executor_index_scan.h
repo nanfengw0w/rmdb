@@ -193,16 +193,25 @@ class IndexScanExecutor : public AbstractExecutor {
    private:
     void materialize_index_scan(const Iid &lower, const Iid &upper) {
         IxScan index_scan(ih_, lower, upper, sm_manager_->get_bpm());
+        bool perf_mode = context_ != nullptr && context_->txn_ != nullptr && context_->txn_->get_perf_mode();
+        
         while (!index_scan.is_end()) {
             if (!eval_index_key(index_scan.key())) {
                 index_scan.next();
                 continue;
             }
             auto candidate_rid = index_scan.rid();
-            auto record = fh_->get_record(candidate_rid, context_);
-            if (record != nullptr && eval_conds(record.get(), fed_conds_)) {
-                track_record_read(candidate_rid);
+            
+            if (perf_mode) {
+                // 性能模式：只收集RID，不读取记录内容（避免一致性问题）
                 matched_rids_.push_back(candidate_rid);
+            } else {
+                // 普通模式：读取记录并检查条件
+                auto record = fh_->get_record(candidate_rid, context_);
+                if (record != nullptr && eval_conds(record.get(), fed_conds_)) {
+                    track_record_read(candidate_rid);
+                    matched_rids_.push_back(candidate_rid);
+                }
             }
             index_scan.next();
         }
