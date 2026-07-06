@@ -111,6 +111,8 @@ class SmManager {
 
     void flush_meta();
 
+    void reload_meta();
+
     void show_tables(Context* context);
 
     void desc_table(const std::string& tab_name, Context* context);

@@ -34,6 +34,17 @@ class SeqScanExecutor : public AbstractExecutor {
 
     SmManager *sm_manager_;
 
+    // 条件快速路径优化：预计算的列偏移和类型
+    struct FastCondInfo {
+        int lhs_offset;
+        int lhs_len;
+        ColType lhs_type;
+        const char *rhs_data;
+        CompOp op;
+    };
+    std::vector<FastCondInfo> fast_cond_cache_;
+    bool use_fast_path_;
+
     TransactionManager* get_txn_manager() { return g_txn_manager; }
 
    public:
@@ -47,6 +58,39 @@ class SeqScanExecutor : public AbstractExecutor {
         context_ = context;
         fed_conds_ = conds_;
         is_end_ = true;
+
+        // 条件快速路径：预计算列偏移
+        use_fast_path_ = true;
+        fast_cond_cache_.reserve(conds_.size());
+        for (const auto &cond : conds_) {
+            if (!cond.is_rhs_val) {
+                use_fast_path_ = false;
+                break;
+            }
+            try {
+                auto &lhs_col = find_col_meta(cols_, cond.lhs_col);
+                FastCondInfo info;
+                info.lhs_offset = lhs_col.offset;
+                info.lhs_len = lhs_col.len;
+                info.lhs_type = lhs_col.type;
+                info.rhs_data = cond.rhs_val.raw->data;
+                info.op = cond.op;
+                fast_cond_cache_.push_back(info);
+            } catch (...) {
+                use_fast_path_ = false;
+                break;
+            }
+        }
+
+        // 调试：输出快速路径状态
+        if (tab_name_.find("stock") != std::string::npos && context != nullptr) {
+            static bool logged = false;
+            if (!logged) {
+                fprintf(stderr, "[DEBUG] SeqScan on %s: use_fast_path=%d, conds=%zu\n",
+                        tab_name_.c_str(), use_fast_path_, conds_.size());
+                logged = true;
+            }
+        }
     }
 
     void beginTuple() override {
@@ -122,6 +166,12 @@ class SeqScanExecutor : public AbstractExecutor {
 
    private:
     bool eval_conds(RmRecord *record, const std::vector<Condition> &conds) {
+        // 快速路径：使用预计算的偏移量
+        if (use_fast_path_) {
+            return eval_conds_fast(record);
+        }
+
+        // 通用路径
         for (auto &cond : conds) {
             auto &lhs_col_meta = find_col_meta(cols_, cond.lhs_col);
             char *lhs_buf = record->data + lhs_col_meta.offset;
@@ -136,6 +186,16 @@ class SeqScanExecutor : public AbstractExecutor {
                 int cmp = compare_value(lhs_buf, rhs_buf, lhs_col_meta.type, lhs_col_meta.len);
                 if (!eval_cmp(cmp, cond.op)) return false;
             }
+        }
+        return true;
+    }
+
+    // 快速路径：避免每次查找列偏移
+    bool eval_conds_fast(RmRecord *record) {
+        for (const auto &info : fast_cond_cache_) {
+            const char *lhs_buf = record->data + info.lhs_offset;
+            int cmp = compare_value(lhs_buf, info.rhs_data, info.lhs_type, info.lhs_len);
+            if (!eval_cmp(cmp, info.op)) return false;
         }
         return true;
     }

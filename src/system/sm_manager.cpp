@@ -171,6 +171,68 @@ void SmManager::flush_meta() {
 }
 
 /**
+ * @description: Reload database metadata from disk
+ */
+void SmManager::reload_meta() {
+    std::ifstream ifs(DB_META_NAME);
+    if (!ifs.is_open()) {
+        return;  // File doesn't exist, keep current metadata
+    }
+
+    // Read new metadata into temporary structure
+    DbMeta new_db;
+    ifs >> new_db;
+    ifs.close();
+
+    // Update index information for each table
+    for (auto &new_entry : new_db.tabs_) {
+        auto &tab_name = new_entry.first;
+        auto &new_tab = new_entry.second;
+
+        // Find existing table
+        auto it = db_.tabs_.find(tab_name);
+        if (it != db_.tabs_.end()) {
+            auto &existing_tab = it->second;
+
+            // Check if indexes changed
+            if (existing_tab.indexes.size() != new_tab.indexes.size()) {
+                // Update indexes
+                existing_tab.indexes = new_tab.indexes;
+
+                // Update column index flags
+                for (auto &col : existing_tab.cols) {
+                    col.index = false;
+                }
+                for (auto &index : existing_tab.indexes) {
+                    for (auto &index_col : index.cols) {
+                        for (auto &col : existing_tab.cols) {
+                            if (col.name == index_col.name) {
+                                col.index = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // Open new indexes
+                for (auto &index : existing_tab.indexes) {
+                    std::vector<std::string> col_names;
+                    for (auto &col : index.cols) {
+                        col_names.push_back(col.name);
+                    }
+                    std::string ix_name = ix_manager_->get_index_name(tab_name, col_names);
+
+                    // Check if already open
+                    if (ihs_.find(ix_name) == ihs_.end() && ix_manager_->exists(tab_name, col_names)) {
+                        ihs_.emplace(ix_name, ix_manager_->open_index(tab_name, col_names));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
  * @description: å³é­æ°æ®åºå¹¶ææ°æ®è½ç?
  */
 void SmManager::close_db() {
