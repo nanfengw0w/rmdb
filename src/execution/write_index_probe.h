@@ -165,7 +165,7 @@ inline bool collect_exact_write_rids(SmManager *sm_manager, const std::shared_pt
     }
 
     auto scan = std::dynamic_pointer_cast<ScanPlan>(plan->subplan_);
-    if (scan == nullptr || scan->tag != T_IndexScan) {
+    if (scan == nullptr) {
         return false;
     }
 
@@ -191,7 +191,7 @@ inline bool collect_exact_write_rids(SmManager *sm_manager, const std::shared_pt
     std::vector<Rid> candidates;
     auto ih = index_maintenance::get_index_handle(sm_manager, real_tab_name, *index_meta);
     if (!ih->get_value(key.data(), &candidates, nullptr)) {
-        return false;
+        return true;
     }
 
     auto fh = sm_manager->get_table_fh(plan->tab_name_);
@@ -205,7 +205,7 @@ inline bool collect_exact_write_rids(SmManager *sm_manager, const std::shared_pt
 
     std::sort(rids.begin(), rids.end(), index_maintenance::rid_less);
     rids.erase(std::unique(rids.begin(), rids.end(), index_maintenance::same_rid), rids.end());
-    return !rids.empty();
+    return true;
 }
 
 }  // namespace write_index_probe

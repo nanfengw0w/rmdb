@@ -4,6 +4,19 @@
 
 ## 性能测试合并分支修复记录
 
+### 2026-07-06 exact write probe 空结果与 Planner 无关化
+- **背景**: `52de5cd` 线上 AC，`median tpmC=8.833333`，但写路径 exact-index probe 仍只在 Planner 产出 `T_IndexScan` 时启用；exact key 没有候选 RID 时会返回失败并退回 SeqScan。
+- **改动**:
+  1. 写路径 probe 不再依赖 `ScanPlan::tag == T_IndexScan`，只要 UPDATE/DELETE 子计划是单表 Scan 且表上存在完整等值索引，就直接使用该索引收集候选 RID。
+  2. 完整等值索引查询无候选 RID 时，返回空 RID 集合作为有效结果，不再退化为全表扫描。
+  3. 仍保持安全边界：只在 `set output_file off` 性能模式启用；只支持完整等值索引；候选记录继续按事务可见版本复核 WHERE；UPDATE 修改索引列时回退 SeqScan；范围/前缀写不放开。
+- **本地验证**:
+  - `cmake --build build -j` 通过。
+  - `./build/bin/unit_test` 通过。
+  - `python3 test_topic5.py` 8/8，`python3 test_topic6.py` 5/5，`python3 test_comprehensive.py` 42/42，`python3 test_crash_recovery.py` 2/2 通过。
+  - exact-index UPDATE/DELETE smoke、exact-index 空结果 smoke、并发同一行 exact-index UPDATE 冲突 smoke 均通过。
+- **风险边界**: 这是 `52de5cd` 的安全放宽，不引入等待锁、不改变 SELECT 快照语义。线上若 Phase 3 WA，优先回退本提交。
+
 ### 2026-07-06 写路径 exact-index probe 收窄修复
 - **线上症状**: `8f9ba53` Phase 1/2 通过，但 Phase 3 `Post-transaction consistency validation` 失败。根因判断是性能模式下 `portal.h` 让 UPDATE/DELETE 直接复用只读 `IndexScanExecutor` 收集 RID，写路径候选集合和 MVCC/WAL/冲突语义边界不够明确。
 - **修复**:
