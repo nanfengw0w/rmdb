@@ -20,6 +20,7 @@ See the Mulan PSL v2 for more details. */
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 
@@ -190,6 +191,220 @@ static bool parse_literal_local(const std::string &text, Value &value) {
     } catch (...) {
         return false;
     }
+}
+
+static std::vector<std::string> split_and_local(const std::string &text) {
+    std::vector<std::string> parts;
+    std::string lower = lower_local(text);
+    bool in_string = false;
+    size_t start = 0;
+    for (size_t i = 0; i < lower.size();) {
+        if (lower[i] == '\'') {
+            in_string = !in_string;
+            i++;
+            continue;
+        }
+        if (!in_string && i + 5 <= lower.size() && lower.compare(i, 5, " and ") == 0) {
+            parts.push_back(trim_local(text.substr(start, i - start)));
+            i += 5;
+            start = i;
+            continue;
+        }
+        i++;
+    }
+    parts.push_back(trim_local(text.substr(start)));
+    return parts;
+}
+
+static TabCol parse_tab_col_local(const std::string &text, const std::string &default_tab) {
+    std::string name = trim_local(text);
+    size_t dot = name.rfind('.');
+    if (dot == std::string::npos) {
+        return TabCol{default_tab, name};
+    }
+    return TabCol{trim_local(name.substr(0, dot)), trim_local(name.substr(dot + 1))};
+}
+
+static bool parse_comp_condition_local(const std::string &text, const std::string &tab_name, Condition &cond) {
+    bool in_string = false;
+    size_t op_pos = std::string::npos;
+    CompOp op = OP_EQ;
+    size_t op_len = 0;
+    for (size_t i = 0; i < text.size(); ++i) {
+        if (text[i] == '\'') {
+            in_string = !in_string;
+            continue;
+        }
+        if (in_string) {
+            continue;
+        }
+        if (i + 2 <= text.size()) {
+            std::string two = text.substr(i, 2);
+            if (two == "<=" || two == ">=" || two == "<>" || two == "!=") {
+                op_pos = i;
+                op_len = 2;
+                op = two == "<=" ? OP_LE : (two == ">=" ? OP_GE : OP_NE);
+                break;
+            }
+        }
+        if (text[i] == '=' || text[i] == '<' || text[i] == '>') {
+            op_pos = i;
+            op_len = 1;
+            op = text[i] == '=' ? OP_EQ : (text[i] == '<' ? OP_LT : OP_GT);
+            break;
+        }
+    }
+    if (op_pos == std::string::npos) {
+        return false;
+    }
+
+    std::string lhs = trim_local(text.substr(0, op_pos));
+    std::string rhs = trim_local(text.substr(op_pos + op_len));
+    if (lhs.empty() || rhs.empty()) {
+        return false;
+    }
+
+    cond.lhs_col = parse_tab_col_local(lhs, tab_name);
+    cond.op = op;
+    cond.is_rhs_val = true;
+    return parse_literal_local(rhs, cond.rhs_val);
+}
+
+static bool prepare_fast_condition_local(TabMeta &tab, const std::string &tab_name, Condition &cond) {
+    if (cond.lhs_col.tab_name.empty()) {
+        cond.lhs_col.tab_name = tab_name;
+    }
+    if (cond.lhs_col.tab_name != tab_name) {
+        return false;
+    }
+    auto col = tab.get_col(cond.lhs_col.col_name);
+    if (col == tab.cols.end()) {
+        throw ColumnNotFoundError(cond.lhs_col.col_name);
+    }
+    if (col->type == TYPE_FLOAT && cond.rhs_val.type == TYPE_INT) {
+        cond.rhs_val.set_float(static_cast<float>(cond.rhs_val.int_val));
+    }
+    if (col->type != cond.rhs_val.type) {
+        throw IncompatibleTypeError(coltype2str(col->type), coltype2str(cond.rhs_val.type));
+    }
+    cond.rhs_val.init_raw(col->len);
+    return true;
+}
+
+static bool choose_fast_select_index_local(const TabMeta &tab, const std::string &tab_name,
+                                           const std::vector<Condition> &conds,
+                                           std::vector<std::string> &index_col_names) {
+    index_col_names.clear();
+    for (const auto &index : tab.indexes) {
+        if (index.cols.empty()) {
+            continue;
+        }
+        for (const auto &cond : conds) {
+            if (cond.lhs_col.tab_name == tab_name && cond.lhs_col.col_name == index.cols[0].name) {
+                for (const auto &col : index.cols) {
+                    index_col_names.push_back(col.name);
+                }
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool try_parse_simple_select_local(SmManager *sm_mgr, const std::string &sql, std::string &tab_name,
+                                          std::vector<TabCol> &sel_cols,
+                                          std::vector<Condition> &conds) {
+    if (sm_mgr == nullptr) {
+        return false;
+    }
+    std::string raw = trim_local(sql);
+    while (!raw.empty() && raw.back() == ';') {
+        raw.pop_back();
+        raw = trim_local(raw);
+    }
+    std::string lower = lower_local(raw);
+    const std::string prefix = "select ";
+    if (lower.rfind(prefix, 0) != 0) {
+        return false;
+    }
+    if (lower.find(" join ") != std::string::npos ||
+        lower.find(" union ") != std::string::npos ||
+        lower.find(" group by ") != std::string::npos ||
+        lower.find(" having ") != std::string::npos ||
+        lower.find(" order by ") != std::string::npos ||
+        lower.find(" limit ") != std::string::npos ||
+        lower.find(" count(") != std::string::npos ||
+        lower.find(" max(") != std::string::npos ||
+        lower.find(" min(") != std::string::npos ||
+        lower.find(" sum(") != std::string::npos ||
+        lower.find(" avg(") != std::string::npos) {
+        return false;
+    }
+
+    size_t from_pos = find_keyword_local(lower, " from ", prefix.size());
+    if (from_pos == std::string::npos) {
+        return false;
+    }
+    size_t where_pos = find_keyword_local(lower, " where ", from_pos + 6);
+    if (where_pos == std::string::npos) {
+        return false;
+    }
+
+    std::string select_part = trim_local(raw.substr(prefix.size(), from_pos - prefix.size()));
+    std::string table_part = trim_local(raw.substr(from_pos + 6, where_pos - (from_pos + 6)));
+    std::string where_part = trim_local(raw.substr(where_pos + 7));
+    if (select_part.empty() || table_part.empty() || where_part.empty() ||
+        table_part.find(',') != std::string::npos ||
+        table_part.find(' ') != std::string::npos ||
+        table_part.find('\t') != std::string::npos) {
+        return false;
+    }
+
+    tab_name = table_part;
+    std::string real_tab_name = sm_mgr->resolve_table_name(tab_name);
+    TabMeta &tab = sm_mgr->db_.get_table(real_tab_name);
+
+    sel_cols.clear();
+    if (trim_local(select_part) == "*") {
+        for (const auto &col : tab.cols) {
+            sel_cols.push_back(TabCol{tab_name, col.name});
+        }
+    } else {
+        auto col_tokens = split_commas_local(select_part);
+        for (const auto &token : col_tokens) {
+            if (token.empty() || token.find('(') != std::string::npos) {
+                return false;
+            }
+            TabCol col = parse_tab_col_local(token, tab_name);
+            if (col.tab_name.empty()) {
+                col.tab_name = tab_name;
+            }
+            if (col.tab_name != tab_name) {
+                return false;
+            }
+            tab.get_col(col.col_name);
+            sel_cols.push_back(std::move(col));
+        }
+    }
+    if (sel_cols.empty()) {
+        return false;
+    }
+
+    conds.clear();
+    for (const auto &part : split_and_local(where_part)) {
+        if (part.empty()) {
+            return false;
+        }
+        Condition cond;
+        if (!parse_comp_condition_local(part, tab_name, cond)) {
+            return false;
+        }
+        if (!prepare_fast_condition_local(tab, tab_name, cond)) {
+            return false;
+        }
+        conds.push_back(std::move(cond));
+    }
+    return !conds.empty();
 }
 
 static std::string value_to_update_sql_local(const Value &value) {
@@ -885,6 +1100,75 @@ static bool try_handle_fast_insert(const std::string &sql, txn_id_t *txn_id,
     return true;
 }
 
+static bool try_handle_fast_select(const std::string &sql, txn_id_t *txn_id,
+                                   char *data_send, int *offset, int fd,
+                                   bool *txn_failed) {
+    if (enable_output_file.load()) {
+        return false;
+    }
+
+    std::string tab_name;
+    std::vector<TabCol> sel_cols;
+    std::vector<Condition> conds;
+    try {
+        if (!try_parse_simple_select_local(sm_manager.get(), sql, tab_name, sel_cols, conds)) {
+            return false;
+        }
+    } catch (...) {
+        return false;
+    }
+
+    memset(data_send, '\0', BUFFER_LENGTH);
+    *offset = 0;
+    auto context = std::make_unique<Context>(lock_manager.get(), log_manager.get(), nullptr, data_send, offset);
+    SetTransaction(txn_id, context.get());
+
+    try {
+        std::string real_tab_name = sm_manager->resolve_table_name(tab_name);
+        TabMeta &tab = sm_manager->db_.get_table(real_tab_name);
+        std::vector<std::string> index_col_names;
+        bool index_exist = choose_fast_select_index_local(tab, tab_name, conds, index_col_names);
+        auto scan = std::make_shared<ScanPlan>(index_exist ? T_IndexScan : T_SeqScan,
+                                               sm_manager.get(), tab_name, conds, index_col_names);
+        auto projection = std::make_shared<ProjectionPlan>(T_Projection, scan, sel_cols);
+        auto root = portal->convert_plan_executor(projection, context.get(), true);
+        ql_manager->select_from(std::move(root), sel_cols, context.get());
+
+        if (context->txn_ != nullptr && context->txn_->get_txn_mode() == false &&
+            context->txn_->get_state() != TransactionState::COMMITTED &&
+            context->txn_->get_state() != TransactionState::ABORTED) {
+            txn_manager->commit(context->txn_, context->log_mgr_);
+            clear_fast_autocommit_state(context->txn_);
+        }
+    } catch (TransactionAbortException &e) {
+        set_response(data_send, offset, "abort\n");
+        abort_failed_explicit_txn(context.get(), txn_failed);
+        if (!is_explicit_txn_context(context.get())) {
+            txn_manager->abort(context->txn_, log_manager.get());
+        }
+        std::cout << e.GetInfo() << std::endl;
+        append_output_line("abort\n");
+    } catch (RMDBError &e) {
+        abort_failed_explicit_txn(context.get(), txn_failed);
+        std::cerr << e.what() << std::endl;
+        set_response(data_send, offset, std::string(e.what()) + "\n");
+        append_output_line("failure\n");
+    } catch (std::exception &e) {
+        abort_failed_explicit_txn(context.get(), txn_failed);
+        std::cerr << "Standard exception: " << e.what() << std::endl;
+        set_response(data_send, offset, std::string("Error: ") + e.what() + "\n");
+        append_output_line("failure\n");
+    } catch (...) {
+        abort_failed_explicit_txn(context.get(), txn_failed);
+        std::cerr << "Unknown exception caught" << std::endl;
+        set_response(data_send, offset, "Error: Unknown error\n");
+        append_output_line("failure\n");
+    }
+
+    write(fd, data_send, *offset + 1);
+    return true;
+}
+
 void *client_handler(void *sock_fd) {
     std::unique_ptr<int> fd_holder(static_cast<int *>(sock_fd));
     int fd = *fd_holder;
@@ -1102,6 +1386,10 @@ void *client_handler(void *sock_fd) {
         }
 
         if (try_handle_fast_insert(std::string(data_recv), &txn_id, data_send, &offset, fd, &txn_failed)) {
+            continue;
+        }
+
+        if (try_handle_fast_select(std::string(data_recv), &txn_id, data_send, &offset, fd, &txn_failed)) {
             continue;
         }
 

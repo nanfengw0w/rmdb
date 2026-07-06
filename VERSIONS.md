@@ -4,6 +4,21 @@
 
 ## 性能测试合并分支修复记录
 
+### 2026-07-06 性能模式简单 SELECT 快路径 trial
+- **背景**: TPCC 事务内大量单表点查/范围查用于取客户、地区、商品、库存字段。原路径每条 SQL 都经过 parser/analyze/planner/portal，在线 16 线程下开销很大。
+- **改动**:
+  1. 仅在 `set output_file off` 后启用简单 SELECT 快路径。
+  2. 支持单表、无 join/union/group/having/order/limit/agg、带 WHERE 的列-字面量条件查询。
+  3. 解析成功后直接构造 `ScanPlan -> ProjectionPlan`，仍交给 `IndexScanExecutor/SeqScanExecutor` 和 `QlManager::select_from` 执行，复用 MVCC 可见性、SSI 读记录和输出格式。
+  4. 复杂查询、类型不匹配、别名/多表等情况自动回退原 parser/analyze/planner 路径。
+- **本地验证**:
+  - `cmake --build build -j` 通过。
+  - `./build/bin/unit_test` 通过。
+  - `python3 test_topic5.py` 8/8，`python3 test_topic6.py` 5/5，`python3 test_comprehensive.py` 42/42，`python3 test_crash_recovery.py` 2/2 通过。
+  - fast SELECT 点查/范围查/事务内自写可见 smoke 通过。
+  - SI 快照一致性 smoke 通过：并发事务提交后，旧事务第二次 fast SELECT 仍读取旧快照。
+- **风险边界**: 这是线上 trial。若 Phase 3 consistency validation 失败，单独回退本提交，保留 parser 锁缩短和 exact write probe 两个较小优化。
+
 ### 2026-07-06 缩短 parser 全局锁临界区
 - **背景**: 当前 16 线程性能负载仍需要每条 SQL 经过 parser/analyze/planner，`yyparse` 使用全局解析状态必须串行，但 `do_analyze` 主要读取元数据，不应继续占用 parser mutex。
 - **改动**:
