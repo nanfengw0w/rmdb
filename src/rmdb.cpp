@@ -1236,12 +1236,13 @@ void *client_handler(void *sock_fd) {
             YY_BUFFER_STATE buf = yy_scan_string(arithmetic_dummy_sql.c_str());
             if (yyparse() == 0 && ast::parse_tree != nullptr) {
                 try {
-                    std::shared_ptr<Query> query = analyze->do_analyze(ast::parse_tree);
-                    query->set_clauses = arithmetic_set_clauses;
+                    auto parse_tree_copy = ast::parse_tree;
                     yy_delete_buffer(buf);
                     finish_analyze = true;
                     pthread_mutex_unlock(buffer_mutex);
 
+                    std::shared_ptr<Query> query = analyze->do_analyze(parse_tree_copy);
+                    query->set_clauses = arithmetic_set_clauses;
                     std::shared_ptr<Plan> plan = optimizer->plan_query(query, context.get());
                     std::shared_ptr<PortalStmt> portalStmt = portal->start(plan, context.get());
                     portal->run(portalStmt, ql_manager.get(), &txn_id, context.get());
@@ -1320,11 +1321,13 @@ void *client_handler(void *sock_fd) {
         if (yyparse() == 0) {
             if (ast::parse_tree != nullptr) {
                 try {
-                    // analyze and rewrite
-                    std::shared_ptr<Query> query = analyze->do_analyze(ast::parse_tree);
+                    // yyparse uses global parser state; analyze only reads metadata.
+                    auto parse_tree_copy = ast::parse_tree;
                     yy_delete_buffer(buf);
                     finish_analyze = true;
                     pthread_mutex_unlock(buffer_mutex);
+                    // analyze and rewrite
+                    std::shared_ptr<Query> query = analyze->do_analyze(parse_tree_copy);
                     // 优化器
                     std::shared_ptr<Plan> plan = optimizer->plan_query(query, context.get());
                     // portal

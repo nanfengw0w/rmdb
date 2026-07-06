@@ -4,6 +4,18 @@
 
 ## 性能测试合并分支修复记录
 
+### 2026-07-06 缩短 parser 全局锁临界区
+- **背景**: 当前 16 线程性能负载仍需要每条 SQL 经过 parser/analyze/planner，`yyparse` 使用全局解析状态必须串行，但 `do_analyze` 主要读取元数据，不应继续占用 parser mutex。
+- **改动**:
+  1. 普通 SQL 路径在 `yyparse` 成功后复制 `ast::parse_tree`，立即释放 parser buffer 和 `buffer_mutex`，随后在锁外执行 `analyze->do_analyze`。
+  2. 自引用 arithmetic UPDATE 路径同样缩短 parser mutex，只把 `yyparse` 留在锁内。
+- **本地验证**:
+  - `cmake --build build -j` 通过。
+  - `./build/bin/unit_test` 通过。
+  - `python3 test_topic5.py` 8/8，`python3 test_topic6.py` 5/5，`python3 test_comprehensive.py` 42/42，`python3 test_crash_recovery.py` 2/2 通过。
+  - 自增 UPDATE smoke 通过。
+- **风险边界**: 该改动不改变 SQL 结果和事务语义，只缩短全局 parser 锁持有时间。若线上异常，优先单独回退本提交。
+
 ### 2026-07-06 exact write probe 空结果与 Planner 无关化
 - **背景**: `52de5cd` 线上 AC，`median tpmC=8.833333`，但写路径 exact-index probe 仍只在 Planner 产出 `T_IndexScan` 时启用；exact key 没有候选 RID 时会返回失败并退回 SeqScan。
 - **改动**:
