@@ -43,10 +43,22 @@ class DeleteExecutor : public AbstractExecutor {
     }
 
     std::unique_ptr<RmRecord> Next() override {
+        Transaction *txn = context_ == nullptr ? nullptr : context_->txn_;
+        if (index_maintenance::is_mvcc_txn(context_) && txn != nullptr && g_txn_manager != nullptr &&
+            txn->get_perf_mode() && rids_.size() == 1 &&
+            !g_txn_manager->owns_perf_write_lock(txn, fh_->GetFd(), rids_[0]) &&
+            !g_txn_manager->has_perf_write_locks(txn)) {
+            if (!g_txn_manager->acquire_perf_write_lock_wait_for(txn, fh_->GetFd(), rids_[0],
+                                                                 std::chrono::milliseconds(200))) {
+                throw TransactionAbortException(txn->get_transaction_id(),
+                    AbortReason::DEADLOCK_PREVENTION);
+            }
+            txn->set_start_ts(g_txn_manager->get_next_timestamp());
+        }
+
         while (cur_idx_ < rids_.size()) {
             // Get the record before deletion
             auto record = fh_->get_record(rids_[cur_idx_], context_);
-            Transaction *txn = context_ == nullptr ? nullptr : context_->txn_;
             if (record == nullptr) {
                 if (index_maintenance::is_mvcc_txn(context_) && txn != nullptr) {
                     throw TransactionAbortException(txn->get_transaction_id(),

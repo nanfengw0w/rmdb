@@ -173,6 +173,52 @@ void TransactionManager::acquire_perf_write_lock_wait(Transaction* txn, int fd, 
     txn_perf_write_locks_[txn->get_transaction_id()].push_back(key);
 }
 
+bool TransactionManager::acquire_perf_write_lock_wait_for(Transaction* txn, int fd, const Rid& rid,
+                                                          std::chrono::milliseconds timeout) {
+    if (txn == nullptr) {
+        return false;
+    }
+
+    PerfWriteLockKey key{fd, rid.page_no, rid.slot_no};
+    std::unique_lock<std::mutex> lock(perf_write_lock_mutex_);
+    bool available = perf_write_lock_cv_.wait_for(lock, timeout, [&] {
+        auto it = perf_write_locks_.find(key);
+        return it == perf_write_locks_.end() || it->second == txn->get_transaction_id();
+    });
+    if (!available) {
+        return false;
+    }
+
+    auto it = perf_write_locks_.find(key);
+    if (it != perf_write_locks_.end()) {
+        return it->second == txn->get_transaction_id();
+    }
+    perf_write_locks_.emplace(key, txn->get_transaction_id());
+    txn_perf_write_locks_[txn->get_transaction_id()].push_back(key);
+    return true;
+}
+
+bool TransactionManager::owns_perf_write_lock(Transaction* txn, int fd, const Rid& rid) {
+    if (txn == nullptr) {
+        return false;
+    }
+
+    PerfWriteLockKey key{fd, rid.page_no, rid.slot_no};
+    std::lock_guard<std::mutex> lock(perf_write_lock_mutex_);
+    auto it = perf_write_locks_.find(key);
+    return it != perf_write_locks_.end() && it->second == txn->get_transaction_id();
+}
+
+bool TransactionManager::has_perf_write_locks(Transaction* txn) {
+    if (txn == nullptr) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(perf_write_lock_mutex_);
+    auto it = txn_perf_write_locks_.find(txn->get_transaction_id());
+    return it != txn_perf_write_locks_.end() && !it->second.empty();
+}
+
 void TransactionManager::release_perf_write_locks(Transaction* txn) {
     if (txn == nullptr) {
         return;

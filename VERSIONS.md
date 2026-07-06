@@ -4,6 +4,14 @@
 
 ## 性能测试合并分支修复记录
 
+### 2026-07-06 性能模式单 RID 首写等待 trial
+- **背景**: NewOrder 的 counter reservation 只覆盖 `SELECT d_next_o_id` 这类先读后写热点。Payment 这类事务第一条语句就是 `update warehouse set w_ytd=w_ytd+...`，以前性能写锁采用非阻塞获取，并发撞同一热点行会直接 abort。
+- **改动**:
+  1. `TransactionManager` 增加 `owns_perf_write_lock()` 与 `has_perf_write_locks()`，用于判断事务当前是否已经持有性能写锁。
+  2. `UpdateExecutor` / `DeleteExecutor` 在性能模式、显式 SI/SER、目标 RID 恰好一条、事务还未持有任何性能写锁时，最多等待 200ms 获取该 RID 的性能写锁并刷新 `start_ts`，超时则按原冲突路径 abort。
+  3. 已持有其他性能写锁的后续写仍沿用非阻塞冲突检测，避免扩大死锁面。
+- **风险边界**: 这是 output-off 性能模式下的并发调度优化，目标是降低热点单行首写 abort。若线上 Phase 3 一致性失败，单独回退本提交。
+
 ### 2026-07-06 性能模式单行数值 SELECT reservation trial
 - **背景**: `aa15fb3` 线上 AC 但 `median tpmC=8.5`，说明 parser/简单 SELECT 快路径不是主瓶颈。真正大头是 NewOrder 这类事务在 SI 下并发读取同一热点 counter，再写同一行，导致大量事务拿到相同旧值并 abort。
 - **改动**:

@@ -19,6 +19,7 @@ See the Mulan PSL v2 for more details. */
 #include <cstring>
 #include <limits>
 #include <condition_variable>
+#include <chrono>
 
 #include "transaction.h"
 #include "watermark.h"
@@ -79,6 +80,13 @@ public:
     bool acquire_perf_write_lock(Transaction* txn, int fd, const Rid& rid);
 
     void acquire_perf_write_lock_wait(Transaction* txn, int fd, const Rid& rid);
+
+    bool acquire_perf_write_lock_wait_for(Transaction* txn, int fd, const Rid& rid,
+                                          std::chrono::milliseconds timeout);
+
+    bool owns_perf_write_lock(Transaction* txn, int fd, const Rid& rid);
+
+    bool has_perf_write_locks(Transaction* txn);
 
     void release_perf_write_locks(Transaction* txn);
 
