@@ -82,15 +82,6 @@ class SeqScanExecutor : public AbstractExecutor {
             }
         }
 
-        // 调试：输出快速路径状态
-        if (tab_name_.find("stock") != std::string::npos && context != nullptr) {
-            static bool logged = false;
-            if (!logged) {
-                fprintf(stderr, "[DEBUG] SeqScan on %s: use_fast_path=%d, conds=%zu\n",
-                        tab_name_.c_str(), use_fast_path_, conds_.size());
-                logged = true;
-            }
-        }
     }
 
     void beginTuple() override {
