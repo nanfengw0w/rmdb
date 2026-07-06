@@ -4,6 +4,14 @@
 
 ## 性能测试合并分支修复记录
 
+### 2026-07-06 性能模式 simple UPDATE 快路径 trial
+- **背景**: TPCC 的 Payment/NewOrder/Delivery 都有大量单表 `UPDATE ... SET ... WHERE ...`。之前性能模式只有 fast insert/select，UPDATE 仍进入完整 parser/analyzer/planner/portal 路径。
+- **改动**:
+  1. `rmdb.cpp` 增加 simple UPDATE 局部解析，支持字面量赋值、`col=col+N`、`col+=N` 等自引用数值更新。
+  2. fast UPDATE 只在 `set output_file off` 后启用，解析失败自动回落旧路径。
+  3. 执行阶段仍复用 `UpdateExecutor`、`write_index_probe`、MVCC、唯一索引维护和 WAL，不跳过正确性检查。
+- **风险边界**: 这是 parser/planner 绕行优化，不应改变 SQL 语义；若线上 Phase 1/3 WA，优先回退本提交。
+
 ### 2026-07-06 性能模式单 RID 首写等待 trial
 - **背景**: NewOrder 的 counter reservation 只覆盖 `SELECT d_next_o_id` 这类先读后写热点。Payment 这类事务第一条语句就是 `update warehouse set w_ytd=w_ytd+...`，以前性能写锁采用非阻塞获取，并发撞同一热点行会直接 abort。
 - **改动**:

@@ -797,6 +797,199 @@ static void execute_fast_insert_direct(const std::string &tab_name, std::vector<
     }
 }
 
+static bool prepare_fast_set_clause_local(TabMeta &tab, const std::string &tab_name, SetClause &clause) {
+    if (clause.lhs.tab_name.empty()) {
+        clause.lhs.tab_name = tab_name;
+    }
+    if (clause.lhs.tab_name != tab_name) {
+        return false;
+    }
+
+    auto col = tab.get_col(clause.lhs.col_name);
+    if (col == tab.cols.end()) {
+        throw ColumnNotFoundError(clause.lhs.col_name);
+    }
+
+    if (clause.op == ArithOp::NO_OP) {
+        if (col->type == TYPE_FLOAT && clause.rhs.type == TYPE_INT) {
+            clause.rhs.set_float(static_cast<float>(clause.rhs.int_val));
+        }
+        if (col->type != clause.rhs.type) {
+            throw IncompatibleTypeError(coltype2str(col->type), coltype2str(clause.rhs.type));
+        }
+    } else {
+        if (col->type != TYPE_INT && col->type != TYPE_FLOAT) {
+            throw IncompatibleTypeError(coltype2str(col->type), "numeric");
+        }
+        if (clause.rhs.type != TYPE_INT && clause.rhs.type != TYPE_FLOAT) {
+            throw IncompatibleTypeError(coltype2str(clause.rhs.type), "numeric");
+        }
+    }
+    return true;
+}
+
+static bool try_parse_simple_update_local(SmManager *sm_mgr, const std::string &sql,
+                                          std::string &tab_name,
+                                          std::vector<SetClause> &set_clauses,
+                                          std::vector<Condition> &conds) {
+    if (sm_mgr == nullptr) {
+        return false;
+    }
+    std::string raw = trim_local(sql);
+    while (!raw.empty() && raw.back() == ';') {
+        raw.pop_back();
+        raw = trim_local(raw);
+    }
+    std::string lower = lower_local(raw);
+    if (lower.rfind("update ", 0) != 0) {
+        return false;
+    }
+
+    size_t set_pos = find_keyword_local(lower, " set ", 0);
+    size_t where_pos = set_pos == std::string::npos ? std::string::npos
+                                                    : find_keyword_local(lower, " where ", set_pos + 5);
+    if (set_pos == std::string::npos || where_pos == std::string::npos) {
+        return false;
+    }
+
+    tab_name = trim_local(raw.substr(7, set_pos - 7));
+    std::string set_part = trim_local(raw.substr(set_pos + 5, where_pos - (set_pos + 5)));
+    std::string where_part = trim_local(raw.substr(where_pos + 7));
+    if (tab_name.empty() || set_part.empty() || where_part.empty() ||
+        tab_name.find(',') != std::string::npos ||
+        tab_name.find(' ') != std::string::npos ||
+        tab_name.find('\t') != std::string::npos) {
+        return false;
+    }
+
+    std::string real_tab_name = sm_mgr->resolve_table_name(tab_name);
+    TabMeta &tab = sm_mgr->db_.get_table(real_tab_name);
+
+    set_clauses.clear();
+    for (const auto &assignment : split_commas_local(set_part)) {
+        size_t eq_pos = find_eq_local(assignment);
+        if (eq_pos == std::string::npos) {
+            return false;
+        }
+
+        bool compound_assignment = false;
+        ArithOp compound_op = ArithOp::NO_OP;
+        size_t lhs_end = eq_pos;
+        if (eq_pos > 0) {
+            size_t op_pos = eq_pos;
+            while (op_pos > 0 && std::isspace(static_cast<unsigned char>(assignment[op_pos - 1]))) {
+                op_pos--;
+            }
+            if (op_pos > 0) {
+                char op_ch = assignment[op_pos - 1];
+                if (op_ch == '+' || op_ch == '-' || op_ch == '*' || op_ch == '/') {
+                    compound_assignment = true;
+                    compound_op = op_ch == '+' ? ArithOp::ADD :
+                                  op_ch == '-' ? ArithOp::SUB :
+                                  op_ch == '*' ? ArithOp::MUL : ArithOp::DIV;
+                    lhs_end = op_pos - 1;
+                }
+            }
+        }
+
+        std::string lhs_text = trim_local(assignment.substr(0, lhs_end));
+        std::string rhs_text = trim_local(assignment.substr(eq_pos + 1));
+        if (lhs_text.empty() || rhs_text.empty()) {
+            return false;
+        }
+
+        TabCol lhs_col = parse_tab_col_local(lhs_text, tab_name);
+        if (lhs_col.tab_name.empty()) {
+            lhs_col.tab_name = tab_name;
+        }
+        if (lhs_col.tab_name != tab_name) {
+            return false;
+        }
+
+        SetClause base_clause;
+        base_clause.lhs = lhs_col;
+        base_clause.op = ArithOp::NO_OP;
+
+        if (compound_assignment) {
+            if (!parse_literal_local(rhs_text, base_clause.rhs)) {
+                return false;
+            }
+            base_clause.op = compound_op;
+            if (!prepare_fast_set_clause_local(tab, tab_name, base_clause)) {
+                return false;
+            }
+            set_clauses.push_back(std::move(base_clause));
+            continue;
+        }
+
+        std::vector<std::pair<ArithOp, Value>> arithmetic_terms;
+        if (parse_lhs_arithmetic_terms_local(rhs_text, lhs_col.col_name, arithmetic_terms)) {
+            for (auto &term : arithmetic_terms) {
+                SetClause clause = base_clause;
+                clause.op = term.first;
+                clause.rhs = std::move(term.second);
+                if (!prepare_fast_set_clause_local(tab, tab_name, clause)) {
+                    return false;
+                }
+                set_clauses.push_back(std::move(clause));
+            }
+            continue;
+        }
+
+        if (!parse_literal_local(rhs_text, base_clause.rhs)) {
+            return false;
+        }
+        if (!prepare_fast_set_clause_local(tab, tab_name, base_clause)) {
+            return false;
+        }
+        set_clauses.push_back(std::move(base_clause));
+    }
+    if (set_clauses.empty()) {
+        return false;
+    }
+
+    conds.clear();
+    for (const auto &part : split_and_local(where_part)) {
+        if (part.empty()) {
+            return false;
+        }
+        Condition cond;
+        if (!parse_comp_condition_local(part, tab_name, cond)) {
+            return false;
+        }
+        if (!prepare_fast_condition_local(tab, tab_name, cond)) {
+            return false;
+        }
+        conds.push_back(std::move(cond));
+    }
+    return !conds.empty();
+}
+
+static void execute_fast_update_direct(const std::string &tab_name,
+                                       std::vector<SetClause> &set_clauses,
+                                       std::vector<Condition> &conds,
+                                       Context *context) {
+    std::string real_tab_name = sm_manager->resolve_table_name(tab_name);
+    TabMeta &tab = sm_manager->db_.get_table(real_tab_name);
+    std::vector<std::string> index_col_names;
+    bool index_exist = choose_fast_select_index_local(tab, tab_name, conds, index_col_names);
+    auto scan = std::make_shared<ScanPlan>(index_exist ? T_IndexScan : T_SeqScan,
+                                           sm_manager.get(), tab_name, conds, index_col_names);
+    auto dml_plan = std::make_shared<DMLPlan>(T_Update, scan, tab_name,
+                                              std::vector<Value>(), conds, set_clauses);
+
+    std::vector<Rid> rids;
+    if (!write_index_probe::collect_exact_write_rids(sm_manager.get(), dml_plan, context, rids)) {
+        auto scan_exec = portal->convert_plan_executor(scan, context);
+        for (scan_exec->beginTuple(); !scan_exec->is_end(); scan_exec->nextTuple()) {
+            rids.push_back(scan_exec->rid());
+        }
+    }
+
+    UpdateExecutor executor(sm_manager.get(), tab_name, set_clauses, conds, rids, context);
+    executor.Next();
+}
+
 static bool try_parse_load_command_local(const std::string &sql, std::string &file_name,
                                          std::string &tab_name) {
     std::string raw = trim_local(sql);
@@ -1100,6 +1293,66 @@ static bool try_handle_fast_insert(const std::string &sql, txn_id_t *txn_id,
     return true;
 }
 
+static bool try_handle_fast_update(const std::string &sql, txn_id_t *txn_id,
+                                   char *data_send, int *offset, int fd,
+                                   bool *txn_failed) {
+    if (enable_output_file.load()) {
+        return false;
+    }
+
+    std::string tab_name;
+    std::vector<SetClause> set_clauses;
+    std::vector<Condition> conds;
+    try {
+        if (!try_parse_simple_update_local(sm_manager.get(), sql, tab_name, set_clauses, conds)) {
+            return false;
+        }
+    } catch (...) {
+        return false;
+    }
+
+    memset(data_send, '\0', BUFFER_LENGTH);
+    *offset = 0;
+    auto context = std::make_unique<Context>(lock_manager.get(), log_manager.get(), nullptr, data_send, offset);
+    SetTransaction(txn_id, context.get());
+
+    try {
+        execute_fast_update_direct(tab_name, set_clauses, conds, context.get());
+        if (context->txn_ != nullptr && context->txn_->get_txn_mode() == false &&
+            context->txn_->get_state() != TransactionState::COMMITTED &&
+            context->txn_->get_state() != TransactionState::ABORTED) {
+            txn_manager->commit(context->txn_, context->log_mgr_);
+            clear_fast_autocommit_state(context->txn_);
+        }
+    } catch (TransactionAbortException &e) {
+        set_response(data_send, offset, "abort\n");
+        abort_failed_explicit_txn(context.get(), txn_failed);
+        if (!is_explicit_txn_context(context.get())) {
+            txn_manager->abort(context->txn_, log_manager.get());
+        }
+        std::cout << e.GetInfo() << std::endl;
+        append_output_line("abort\n");
+    } catch (RMDBError &e) {
+        abort_failed_explicit_txn(context.get(), txn_failed);
+        std::cerr << e.what() << std::endl;
+        set_response(data_send, offset, std::string(e.what()) + "\n");
+        append_output_line("failure\n");
+    } catch (std::exception &e) {
+        abort_failed_explicit_txn(context.get(), txn_failed);
+        std::cerr << "Standard exception: " << e.what() << std::endl;
+        set_response(data_send, offset, std::string("Error: ") + e.what() + "\n");
+        append_output_line("failure\n");
+    } catch (...) {
+        abort_failed_explicit_txn(context.get(), txn_failed);
+        std::cerr << "Unknown exception caught" << std::endl;
+        set_response(data_send, offset, "Error: Unknown error\n");
+        append_output_line("failure\n");
+    }
+
+    write(fd, data_send, *offset + 1);
+    return true;
+}
+
 static bool try_handle_fast_select(const std::string &sql, txn_id_t *txn_id,
                                    char *data_send, int *offset, int fd,
                                    bool *txn_failed) {
@@ -1386,6 +1639,10 @@ void *client_handler(void *sock_fd) {
         }
 
         if (try_handle_fast_insert(std::string(data_recv), &txn_id, data_send, &offset, fd, &txn_failed)) {
+            continue;
+        }
+
+        if (try_handle_fast_update(std::string(data_recv), &txn_id, data_send, &offset, fd, &txn_failed)) {
             continue;
         }
 
