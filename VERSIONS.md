@@ -4,6 +4,14 @@
 
 ## 性能测试合并分支修复记录
 
+### 2026-07-06 性能模式 simple DELETE 快路径 trial
+- **背景**: Delivery 事务会按主键删除 `new_orders`，原路径仍经过完整 parser/analyzer/planner。
+- **改动**:
+  1. `rmdb.cpp` 增加 simple `DELETE FROM tab WHERE ...` 局部解析。
+  2. 仅在 `set output_file off` 后启用，解析失败自动回落旧路径。
+  3. 执行阶段仍复用 `DeleteExecutor`、`write_index_probe`、MVCC、索引维护和 WAL。
+- **风险边界**: 只优化单表带 WHERE 的 DELETE，普通输出模式不启用；若线上 WA，单独回退本提交。
+
 ### 2026-07-06 性能模式 simple UPDATE 快路径 trial
 - **背景**: TPCC 的 Payment/NewOrder/Delivery 都有大量单表 `UPDATE ... SET ... WHERE ...`。之前性能模式只有 fast insert/select，UPDATE 仍进入完整 parser/analyzer/planner/portal 路径。
 - **改动**:

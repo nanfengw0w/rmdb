@@ -990,6 +990,81 @@ static void execute_fast_update_direct(const std::string &tab_name,
     executor.Next();
 }
 
+static bool try_parse_simple_delete_local(SmManager *sm_mgr, const std::string &sql,
+                                          std::string &tab_name,
+                                          std::vector<Condition> &conds) {
+    if (sm_mgr == nullptr) {
+        return false;
+    }
+    std::string raw = trim_local(sql);
+    while (!raw.empty() && raw.back() == ';') {
+        raw.pop_back();
+        raw = trim_local(raw);
+    }
+    std::string lower = lower_local(raw);
+    const std::string prefix = "delete from ";
+    if (lower.rfind(prefix, 0) != 0) {
+        return false;
+    }
+
+    size_t where_pos = find_keyword_local(lower, " where ", prefix.size());
+    if (where_pos == std::string::npos) {
+        return false;
+    }
+
+    tab_name = trim_local(raw.substr(prefix.size(), where_pos - prefix.size()));
+    std::string where_part = trim_local(raw.substr(where_pos + 7));
+    if (tab_name.empty() || where_part.empty() ||
+        tab_name.find(',') != std::string::npos ||
+        tab_name.find(' ') != std::string::npos ||
+        tab_name.find('\t') != std::string::npos) {
+        return false;
+    }
+
+    std::string real_tab_name = sm_mgr->resolve_table_name(tab_name);
+    TabMeta &tab = sm_mgr->db_.get_table(real_tab_name);
+    conds.clear();
+    for (const auto &part : split_and_local(where_part)) {
+        if (part.empty()) {
+            return false;
+        }
+        Condition cond;
+        if (!parse_comp_condition_local(part, tab_name, cond)) {
+            return false;
+        }
+        if (!prepare_fast_condition_local(tab, tab_name, cond)) {
+            return false;
+        }
+        conds.push_back(std::move(cond));
+    }
+    return !conds.empty();
+}
+
+static void execute_fast_delete_direct(const std::string &tab_name,
+                                       std::vector<Condition> &conds,
+                                       Context *context) {
+    std::string real_tab_name = sm_manager->resolve_table_name(tab_name);
+    TabMeta &tab = sm_manager->db_.get_table(real_tab_name);
+    std::vector<std::string> index_col_names;
+    bool index_exist = choose_fast_select_index_local(tab, tab_name, conds, index_col_names);
+    auto scan = std::make_shared<ScanPlan>(index_exist ? T_IndexScan : T_SeqScan,
+                                           sm_manager.get(), tab_name, conds, index_col_names);
+    auto dml_plan = std::make_shared<DMLPlan>(T_Delete, scan, tab_name,
+                                              std::vector<Value>(), conds,
+                                              std::vector<SetClause>());
+
+    std::vector<Rid> rids;
+    if (!write_index_probe::collect_exact_write_rids(sm_manager.get(), dml_plan, context, rids)) {
+        auto scan_exec = portal->convert_plan_executor(scan, context);
+        for (scan_exec->beginTuple(); !scan_exec->is_end(); scan_exec->nextTuple()) {
+            rids.push_back(scan_exec->rid());
+        }
+    }
+
+    DeleteExecutor executor(sm_manager.get(), tab_name, conds, rids, context);
+    executor.Next();
+}
+
 static bool try_parse_load_command_local(const std::string &sql, std::string &file_name,
                                          std::string &tab_name) {
     std::string raw = trim_local(sql);
@@ -1353,6 +1428,65 @@ static bool try_handle_fast_update(const std::string &sql, txn_id_t *txn_id,
     return true;
 }
 
+static bool try_handle_fast_delete(const std::string &sql, txn_id_t *txn_id,
+                                   char *data_send, int *offset, int fd,
+                                   bool *txn_failed) {
+    if (enable_output_file.load()) {
+        return false;
+    }
+
+    std::string tab_name;
+    std::vector<Condition> conds;
+    try {
+        if (!try_parse_simple_delete_local(sm_manager.get(), sql, tab_name, conds)) {
+            return false;
+        }
+    } catch (...) {
+        return false;
+    }
+
+    memset(data_send, '\0', BUFFER_LENGTH);
+    *offset = 0;
+    auto context = std::make_unique<Context>(lock_manager.get(), log_manager.get(), nullptr, data_send, offset);
+    SetTransaction(txn_id, context.get());
+
+    try {
+        execute_fast_delete_direct(tab_name, conds, context.get());
+        if (context->txn_ != nullptr && context->txn_->get_txn_mode() == false &&
+            context->txn_->get_state() != TransactionState::COMMITTED &&
+            context->txn_->get_state() != TransactionState::ABORTED) {
+            txn_manager->commit(context->txn_, context->log_mgr_);
+            clear_fast_autocommit_state(context->txn_);
+        }
+    } catch (TransactionAbortException &e) {
+        set_response(data_send, offset, "abort\n");
+        abort_failed_explicit_txn(context.get(), txn_failed);
+        if (!is_explicit_txn_context(context.get())) {
+            txn_manager->abort(context->txn_, log_manager.get());
+        }
+        std::cout << e.GetInfo() << std::endl;
+        append_output_line("abort\n");
+    } catch (RMDBError &e) {
+        abort_failed_explicit_txn(context.get(), txn_failed);
+        std::cerr << e.what() << std::endl;
+        set_response(data_send, offset, std::string(e.what()) + "\n");
+        append_output_line("failure\n");
+    } catch (std::exception &e) {
+        abort_failed_explicit_txn(context.get(), txn_failed);
+        std::cerr << "Standard exception: " << e.what() << std::endl;
+        set_response(data_send, offset, std::string("Error: ") + e.what() + "\n");
+        append_output_line("failure\n");
+    } catch (...) {
+        abort_failed_explicit_txn(context.get(), txn_failed);
+        std::cerr << "Unknown exception caught" << std::endl;
+        set_response(data_send, offset, "Error: Unknown error\n");
+        append_output_line("failure\n");
+    }
+
+    write(fd, data_send, *offset + 1);
+    return true;
+}
+
 static bool try_handle_fast_select(const std::string &sql, txn_id_t *txn_id,
                                    char *data_send, int *offset, int fd,
                                    bool *txn_failed) {
@@ -1643,6 +1777,10 @@ void *client_handler(void *sock_fd) {
         }
 
         if (try_handle_fast_update(std::string(data_recv), &txn_id, data_send, &offset, fd, &txn_failed)) {
+            continue;
+        }
+
+        if (try_handle_fast_delete(std::string(data_recv), &txn_id, data_send, &offset, fd, &txn_failed)) {
             continue;
         }
 
