@@ -182,7 +182,7 @@ class SeqScanExecutor : public AbstractExecutor {
     }
 
     // 快速路径：避免每次查找列偏移
-    bool eval_conds_fast(RmRecord *record) {
+    inline bool eval_conds_fast(RmRecord *record) {
         for (const auto &info : fast_cond_cache_) {
             const char *lhs_buf = record->data + info.lhs_offset;
             int cmp = compare_value(lhs_buf, info.rhs_data, info.lhs_type, info.lhs_len);
@@ -227,7 +227,7 @@ class SeqScanExecutor : public AbstractExecutor {
         return const_cast<ColMeta&>(*pos);
     }
 
-    int compare_value(const char *a, const char *b, ColType type, int len) {
+    inline int compare_value(const char *a, const char *b, ColType type, int len) {
         if (type == TYPE_INT) {
             int va = *(int *)a;
             int vb = *(int *)b;
@@ -242,7 +242,7 @@ class SeqScanExecutor : public AbstractExecutor {
         return 0;
     }
 
-    bool eval_cmp(int cmp, CompOp op) {
+    inline bool eval_cmp(int cmp, CompOp op) {
         switch (op) {
             case OP_EQ: return cmp == 0;
             case OP_NE: return cmp != 0;
