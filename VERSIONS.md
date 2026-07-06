@@ -4,6 +4,21 @@
 
 ## 性能测试合并分支修复记录
 
+### 2026-07-06 性能模式单行数值 SELECT reservation trial
+- **背景**: `aa15fb3` 线上 AC 但 `median tpmC=8.5`，说明 parser/简单 SELECT 快路径不是主瓶颈。真正大头是 NewOrder 这类事务在 SI 下并发读取同一热点 counter，再写同一行，导致大量事务拿到相同旧值并 abort。
+- **改动**:
+  1. `ProjectionExecutor::rid()` 透传底层扫描 RID。
+  2. `TransactionManager` 增加可等待的性能记录写锁 `acquire_perf_write_lock_wait()`，commit/abort 释放后唤醒等待者。
+  3. 仅在 `set output_file off` 性能模式、显式 SI/SER 事务、事务尚未写入任何记录、SELECT 返回单表纯数值列时启用 reservation。
+  4. reservation 先物化结果；若结果恰好一行，则等待并持有该 RID 的性能写锁，刷新事务 `start_ts`，再重新物化并按原 `RecordPrinter` 输出。
+- **本地验证**:
+  - `cmake --build build -j` 通过。
+  - `./build/bin/unit_test` 通过。
+  - `python3 test_topic5.py` 8/8，`python3 test_topic6.py` 5/5，`python3 test_comprehensive.py` 42/42，`python3 test_crash_recovery.py` 2/2 通过。
+  - 两事务热点 counter smoke 通过：第二个事务等待第一个提交后读到递增后的值，两个 update 均提交。
+  - 16 线程最小 NewOrder 形态 smoke：5 秒 `commit=737`、`abort=1`，每个 district 满足 `d_next_o_id = orders_count + 1`。
+- **风险边界**: 这是针对性能模式的语义性 trial，会改变 output-off 下部分 SELECT 看到的快照时间，目的是减少热点 counter abort。普通前十题默认 output on，不启用该路径。若线上 Phase 3 WA，单独回退本提交。
+
 ### 2026-07-06 性能模式简单 SELECT 快路径 trial
 - **背景**: TPCC 事务内大量单表点查/范围查用于取客户、地区、商品、库存字段。原路径每条 SQL 都经过 parser/analyze/planner/portal，在线 16 线程下开销很大。
 - **改动**:

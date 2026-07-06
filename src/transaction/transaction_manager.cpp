@@ -154,24 +154,50 @@ bool TransactionManager::acquire_perf_write_lock(Transaction* txn, int fd, const
     return true;
 }
 
+void TransactionManager::acquire_perf_write_lock_wait(Transaction* txn, int fd, const Rid& rid) {
+    if (txn == nullptr) {
+        return;
+    }
+
+    PerfWriteLockKey key{fd, rid.page_no, rid.slot_no};
+    std::unique_lock<std::mutex> lock(perf_write_lock_mutex_);
+    perf_write_lock_cv_.wait(lock, [&] {
+        auto it = perf_write_locks_.find(key);
+        return it == perf_write_locks_.end() || it->second == txn->get_transaction_id();
+    });
+
+    if (perf_write_locks_.find(key) != perf_write_locks_.end()) {
+        return;
+    }
+    perf_write_locks_.emplace(key, txn->get_transaction_id());
+    txn_perf_write_locks_[txn->get_transaction_id()].push_back(key);
+}
+
 void TransactionManager::release_perf_write_locks(Transaction* txn) {
     if (txn == nullptr) {
         return;
     }
 
-    std::lock_guard<std::mutex> lock(perf_write_lock_mutex_);
-    auto it = txn_perf_write_locks_.find(txn->get_transaction_id());
-    if (it == txn_perf_write_locks_.end()) {
-        return;
-    }
-
-    for (const auto& key : it->second) {
-        auto owner = perf_write_locks_.find(key);
-        if (owner != perf_write_locks_.end() && owner->second == txn->get_transaction_id()) {
-            perf_write_locks_.erase(owner);
+    bool released = false;
+    {
+        std::lock_guard<std::mutex> lock(perf_write_lock_mutex_);
+        auto it = txn_perf_write_locks_.find(txn->get_transaction_id());
+        if (it == txn_perf_write_locks_.end()) {
+            return;
         }
+
+        for (const auto& key : it->second) {
+            auto owner = perf_write_locks_.find(key);
+            if (owner != perf_write_locks_.end() && owner->second == txn->get_transaction_id()) {
+                perf_write_locks_.erase(owner);
+                released = true;
+            }
+        }
+        txn_perf_write_locks_.erase(it);
     }
-    txn_perf_write_locks_.erase(it);
+    if (released) {
+        perf_write_lock_cv_.notify_all();
+    }
 }
 
 /**
