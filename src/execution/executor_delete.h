@@ -49,7 +49,7 @@ class DeleteExecutor : public AbstractExecutor {
             !g_txn_manager->owns_perf_write_lock(txn, fh_->GetFd(), rids_[0]) &&
             !g_txn_manager->has_perf_write_locks(txn)) {
             if (!g_txn_manager->acquire_perf_write_lock_wait_for(txn, fh_->GetFd(), rids_[0],
-                                                                 std::chrono::milliseconds(200))) {
+                                                                 std::chrono::milliseconds(20))) {
                 throw TransactionAbortException(txn->get_transaction_id(),
                     AbortReason::DEADLOCK_PREVENTION);
             }

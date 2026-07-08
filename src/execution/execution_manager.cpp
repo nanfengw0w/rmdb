@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution_manager.h"
 
 #include <cctype>
+#include <chrono>
 #include <limits>
 #include <map>
 #include <optional>
@@ -273,9 +274,11 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
             reserved_rows[0].rid.slot_no >= 0) {
             const auto &tab_name = executorTreeRoot->cols().front().tab_name;
             auto fh = sm_manager_->get_table_fh(tab_name);
-            txn_mgr_->acquire_perf_write_lock_wait(context->txn_, fh->GetFd(), reserved_rows[0].rid);
-            context->txn_->set_start_ts(txn_mgr_->get_next_timestamp());
-            reserved_rows = materialize_rows();
+            if (txn_mgr_->acquire_perf_write_lock_wait_for(context->txn_, fh->GetFd(), reserved_rows[0].rid,
+                                                           std::chrono::milliseconds(20))) {
+                context->txn_->set_start_ts(txn_mgr_->get_next_timestamp());
+                reserved_rows = materialize_rows();
+            }
         }
     }
 
