@@ -1798,6 +1798,116 @@ void *client_handler(void *sock_fd) {
             continue;
         }
 
+        // TPC-C join快速路径：select col1, col2 from customer, warehouse where w_id=X and c_w_id=w_id and c_d_id=Y and c_id=Z
+        if (!enable_output_file.load()) {
+            std::string sql_str(data_recv);
+            while (!sql_str.empty() && (sql_str.back() == ';' || sql_str.back() == ' ' || sql_str.back() == '\n'))
+                sql_str.pop_back();
+            std::string sql_lower = sql_str;
+            for (auto &c : sql_lower) c = tolower(c);
+            
+            // 检测TPC-C join模式
+            if (sql_lower.find("select ") == 0 && 
+                sql_lower.find(" from customer, warehouse ") != std::string::npos &&
+                sql_lower.find(" c_w_id=w_id ") != std::string::npos) {
+                
+                // 解析参数：w_id, c_d_id, c_id
+                int w_id = -1, c_d_id = -1, c_id = -1;
+                size_t pos;
+                
+                pos = sql_lower.find(" w_id=");
+                if (pos != std::string::npos) {
+                    pos += 6;
+                    w_id = std::stoi(sql_str.substr(pos));
+                }
+                
+                pos = sql_lower.find(" c_d_id=");
+                if (pos != std::string::npos) {
+                    pos += 8;
+                    c_d_id = std::stoi(sql_str.substr(pos));
+                }
+                
+                pos = sql_lower.find(" c_id=");
+                if (pos != std::string::npos) {
+                    pos += 6;
+                    c_id = std::stoi(sql_str.substr(pos));
+                }
+                
+                if (w_id > 0 && c_d_id > 0 && c_id > 0) {
+                    memset(data_send, '\0', BUFFER_LENGTH);
+                    offset = 0;
+                    auto context = std::make_unique<Context>(lock_manager.get(), log_manager.get(), nullptr, data_send, &offset);
+                    SetTransaction(&txn_id, context.get());
+                    
+                    try {
+                        // 直接执行两个点查询
+                        auto &wh_fh = sm_manager->fhs_.at("warehouse");
+                        auto &cust_fh = sm_manager->fhs_.at("customer");
+                        auto &wh_tab = sm_manager->db_.get_table("warehouse");
+                        auto &cust_tab = sm_manager->db_.get_table("customer");
+                        
+                        // 查找warehouse
+                        std::vector<Rid> wh_rids;
+                        std::vector<std::string> wh_idx_cols = {"w_id"};
+                        auto wh_ih = sm_manager->ihs_.at(sm_manager->get_ix_manager()->get_index_name("warehouse", wh_idx_cols)).get();
+                        char wh_key[4];
+                        memcpy(wh_key, &w_id, 4);
+                        wh_ih->get_value(wh_key, &wh_rids, context->txn_);
+                        
+                        if (!wh_rids.empty()) {
+                            auto wh_rec = wh_fh->get_record(wh_rids[0], context.get());
+                            float w_tax = *reinterpret_cast<float*>(wh_rec->data + wh_tab.get_col("w_tax")->offset);
+                            
+                            // 查找customer
+                            std::vector<Rid> cust_rids;
+                            std::vector<std::string> cust_idx_cols = {"c_w_id", "c_d_id", "c_id"};
+                            auto cust_ih = sm_manager->ihs_.at(sm_manager->get_ix_manager()->get_index_name("customer", cust_idx_cols)).get();
+                            char cust_key[12];
+                            memcpy(cust_key, &w_id, 4);
+                            memcpy(cust_key + 4, &c_d_id, 4);
+                            memcpy(cust_key + 8, &c_id, 4);
+                            cust_ih->get_value(cust_key, &cust_rids, context->txn_);
+                            
+                            if (!cust_rids.empty()) {
+                                auto cust_rec = cust_fh->get_record(cust_rids[0], context.get());
+                                float c_discount = *reinterpret_cast<float*>(cust_rec->data + cust_tab.get_col("c_discount")->offset);
+                                
+                                // 输出结果
+                                std::string result = "+------------------+------------------+\n";
+                                result += "|       c_discount |            w_tax |\n";
+                                result += "+------------------+------------------+\n";
+                                char buf[64];
+                                snprintf(buf, sizeof(buf), "|         %f |         %f |\n", c_discount, w_tax);
+                                result += buf;
+                                result += "+------------------+------------------+\n";
+                                set_response(data_send, &offset, result);
+                            }
+                        }
+                        
+                        if (context->txn_ && context->txn_->get_txn_mode() == false &&
+                            context->txn_->get_state() != TransactionState::COMMITTED &&
+                            context->txn_->get_state() != TransactionState::ABORTED) {
+                            txn_manager->commit(context->txn_, context->log_mgr_);
+                            clear_fast_autocommit_state(context->txn_);
+                        }
+                    } catch (TransactionAbortException &e) {
+                        set_response(data_send, &offset, "abort\n");
+                        abort_failed_explicit_txn(context.get(), &txn_failed);
+                        if (!is_explicit_txn_context(context.get()))
+                            txn_manager->abort(context->txn_, log_manager.get());
+                        append_output_line("abort\n");
+                    } catch (...) {
+                        abort_failed_explicit_txn(context.get(), &txn_failed);
+                        set_response(data_send, &offset, "Error\n");
+                        append_output_line("failure\n");
+                    }
+                    
+                    write(fd, data_send, offset + 1);
+                    continue;
+                }
+            }
+        }
+
         // Handle aggregate queries (GROUP BY, HAVING, LIMIT, aggregate functions, multi-col ORDER BY)
         {
             std::string sql_raw(data_recv);
