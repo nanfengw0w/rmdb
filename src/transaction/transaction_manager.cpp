@@ -102,11 +102,7 @@ Transaction * TransactionManager::begin(Transaction* txn, LogManager* log_manage
 
     txn->set_state(TransactionState::GROWING);
 
-    // MVCC: 分配开始时间戳
-    IsolationLevel level = txn->get_isolation_level();
-    if (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE) {
-        txn->set_start_ts(get_next_timestamp());
-    }
+    txn->set_start_ts(get_next_timestamp());
 
     {
         std::lock_guard<std::mutex> lock(latch_);
