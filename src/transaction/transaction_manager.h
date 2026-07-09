@@ -114,7 +114,7 @@ public:
         std::unique_lock<std::mutex> lock(session_mutex_);
         auto it = session_isolation_levels_.find(session_id);
         if (it != session_isolation_levels_.end()) return it->second;
-        return IsolationLevel::READ_COMMITTED;
+        return IsolationLevel::READ_UNCOMMITTED;
     }
 
     // 获取所有活跃事务
