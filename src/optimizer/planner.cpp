@@ -423,8 +423,10 @@ std::shared_ptr<Plan> Planner::do_planner(std::shared_ptr<Query> query, Context 
         plannerRoot = std::make_shared<DDLPlan>(T_DropIndex, x->tab_name, x->col_names, std::vector<ColDef>());
     } else if (auto x = std::dynamic_pointer_cast<ast::InsertStmt>(query->parse)) {
         // insert;
-        plannerRoot = std::make_shared<DMLPlan>(T_Insert, std::shared_ptr<Plan>(),  x->tab_name,  
+        plannerRoot = std::make_shared<DMLPlan>(T_Insert, std::shared_ptr<Plan>(),  x->tab_name,
                                                     query->values, std::vector<Condition>(), std::vector<SetClause>());
+    } else if (auto x = std::dynamic_pointer_cast<ast::LoadStmt>(query->parse)) {
+        plannerRoot = std::make_shared<LoadPlan>(x->file_name, x->tab_name);
     } else if (auto x = std::dynamic_pointer_cast<ast::DeleteStmt>(query->parse)) {
         // delete;
         // 生成表扫描方式

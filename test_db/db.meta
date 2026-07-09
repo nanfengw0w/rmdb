@@ -1,2 +1,41 @@
 test_db
-0
+2
+stock
+17
+stock s_i_id 0 4 0 1
+stock s_w_id 0 4 4 1
+stock s_quantity 0 4 8 0
+stock s_dist_01 2 24 12 0
+stock s_dist_02 2 24 36 0
+stock s_dist_03 2 24 60 0
+stock s_dist_04 2 24 84 0
+stock s_dist_05 2 24 108 0
+stock s_dist_06 2 24 132 0
+stock s_dist_07 2 24 156 0
+stock s_dist_08 2 24 180 0
+stock s_dist_09 2 24 204 0
+stock s_dist_10 2 24 228 0
+stock s_ytd 1 4 252 0
+stock s_order_cnt 0 4 256 0
+stock s_remote_cnt 0 4 260 0
+stock s_data 2 50 264 0
+1
+stock 8 2
+stock s_w_id 0 4 4 0
+stock s_i_id 0 4 0 0
+
+warehouse
+9
+warehouse w_id 0 4 0 1
+warehouse w_name 2 10 4 0
+warehouse w_street_1 2 20 14 0
+warehouse w_street_2 2 20 34 0
+warehouse w_city 2 20 54 0
+warehouse w_state 2 2 74 0
+warehouse w_zip 2 9 76 0
+warehouse w_tax 1 4 85 0
+warehouse w_ytd 1 4 89 0
+1
+warehouse 4 1
+warehouse w_id 0 4 0 0
+

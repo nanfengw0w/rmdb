@@ -21,7 +21,7 @@ using namespace ast;
 %define parse.error verbose
 
 // keywords
-%token SHOW TABLES CREATE TABLE DROP DESC INSERT INTO VALUES DELETE FROM ASC ORDER BY
+%token SHOW TABLES CREATE TABLE DROP DESC INSERT LOAD INTO VALUES DELETE FROM ASC ORDER BY
 WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX AND JOIN EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ORDER_BY ENABLE_NESTLOOP ENABLE_SORTMERGE
 TRANSACTION ISOLATION LEVEL SNAPSHOT SERIALIZABLE
 // non-keywords
@@ -158,6 +158,10 @@ dml:
         INSERT INTO tbName VALUES '(' valueList ')'
     {
         $$ = std::make_shared<InsertStmt>($3, $6);
+    }
+    |   LOAD fileName INTO tbName
+    {
+        $$ = std::make_shared<LoadStmt>($2, $4);
     }
     |   DELETE FROM tbName optWhereClause
     {

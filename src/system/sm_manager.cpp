@@ -20,6 +20,7 @@ See the Mulan PSL v2 for more details. */
 #include "record/rm.h"
 #include "record_printer.h"
 #include "transaction/version_manager.h"
+#include "transaction/transaction_manager.h"
 
 namespace {
 
@@ -51,6 +52,79 @@ bool column_is_still_indexed(const TabMeta &tab, const std::string &col_name) {
         }
     }
     return false;
+}
+
+}  // namespace
+
+namespace {
+
+void make_index_key(const IndexMeta &index, const RmRecord *rec, char *key) {
+    int offset = 0;
+    for (auto &col : index.cols) {
+        memcpy(key + offset, rec->data + col.offset, col.len);
+        offset += col.len;
+    }
+}
+
+void parse_csv_line(const std::string &line, std::vector<std::string> &fields) {
+    fields.clear();
+    size_t start = 0;
+    for (size_t i = 0; i <= line.size(); ++i) {
+        if (i == line.size() || line[i] == ',') {
+            size_t len = i - start;
+            if (len > 0 && line[start + len - 1] == '\r') {
+                len--;
+            }
+            fields.emplace_back(line.data() + start, len);
+            start = i + 1;
+        }
+    }
+}
+
+struct LoadIndexEntry {
+    const IndexMeta *index;
+    IxIndexHandle *ih;
+    std::vector<char> key;
+};
+
+bool is_csv_header(const std::vector<std::string> &fields, const TabMeta &tab) {
+    if (fields.size() != tab.cols.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < fields.size(); ++i) {
+        if (fields[i] != tab.cols[i].name) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void write_csv_field(const std::string &field, const ColMeta &col, RmRecord &rec) {
+    char *dest = rec.data + col.offset;
+    if (col.type == TYPE_INT) {
+        char *end = nullptr;
+        errno = 0;
+        long value = std::strtol(field.c_str(), &end, 10);
+        if (end == field.c_str() || *end != '\0' || errno != 0) {
+            throw IncompatibleTypeError(coltype2str(col.type), "STRING");
+        }
+        int int_value = static_cast<int>(value);
+        memcpy(dest, &int_value, sizeof(int));
+    } else if (col.type == TYPE_FLOAT) {
+        char *end = nullptr;
+        errno = 0;
+        float value = std::strtof(field.c_str(), &end);
+        if (end == field.c_str() || *end != '\0' || errno != 0) {
+            throw IncompatibleTypeError(coltype2str(col.type), "STRING");
+        }
+        memcpy(dest, &value, sizeof(float));
+    } else {
+        if ((int)field.size() > col.len) {
+            throw StringOverflowError();
+        }
+        memset(dest, 0, col.len);
+        memcpy(dest, field.data(), field.size());
+    }
 }
 
 }  // namespace
@@ -505,4 +579,83 @@ void SmManager::drop_index(const std::string& tab_name, const std::vector<ColMet
         col_names.push_back(col.name);
     }
     drop_index(tab_name, col_names, context);
+}
+
+void SmManager::load_csv(const std::string &file_name, const std::string &tab_name, Context *context) {
+    if (!db_.is_table(tab_name)) {
+        throw TableNotFoundError(tab_name);
+    }
+    std::ifstream ifs(file_name);
+    if (!ifs.is_open()) {
+        throw FileNotFoundError(file_name);
+    }
+
+    TabMeta &tab = db_.get_table(tab_name);
+    RmFileHandle *fh = fhs_.at(tab_name).get();
+    std::vector<LoadIndexEntry> load_indexes;
+    load_indexes.reserve(tab.indexes.size());
+    for (auto &index : tab.indexes) {
+        auto ih = ihs_.at(ix_manager_->get_index_name(tab_name, index.cols)).get();
+        load_indexes.push_back({&index, ih, std::vector<char>(index.col_tot_len)});
+    }
+    std::string line;
+    std::vector<std::string> fields;
+    fields.reserve(tab.cols.size());
+    bool first_line = true;
+    bool changed = false;
+    try {
+        while (std::getline(ifs, line)) {
+            if (line.empty() || line == "\r") {
+                continue;
+            }
+            parse_csv_line(line, fields);
+            if (first_line) {
+                first_line = false;
+                if (is_csv_header(fields, tab)) {
+                    continue;
+                }
+            }
+            if (fields.size() != tab.cols.size()) {
+                throw InvalidValueCountError();
+            }
+
+            RmRecord rec(fh->get_file_hdr().record_size);
+            for (size_t i = 0; i < fields.size(); ++i) {
+                write_csv_field(fields[i], tab.cols[i], rec);
+            }
+
+            Transaction *txn = context == nullptr ? nullptr : context->txn_;
+
+            for (auto &load_index : load_indexes) {
+                make_index_key(*load_index.index, &rec, load_index.key.data());
+                std::vector<Rid> result;
+                if (load_index.ih->get_value(load_index.key.data(), &result, txn)) {
+                    throw IndexExistsError(tab_name, index_col_names(load_index.index->cols));
+                }
+            }
+
+            Rid rid = fh->insert_record(rec.data, context);
+
+            for (size_t i = 0; i < load_indexes.size(); ++i) {
+                auto &load_index = load_indexes[i];
+                if (load_index.ih->insert_entry(load_index.key.data(), rid, txn) == IX_NO_PAGE) {
+                    for (size_t j = 0; j < i; ++j) {
+                        load_indexes[j].ih->delete_entry(load_indexes[j].key.data(), txn);
+                    }
+                    fh->delete_record(rid, context);
+                    throw IndexExistsError(tab_name, index_col_names(load_index.index->cols));
+                }
+            }
+
+            if (txn != nullptr) {
+                txn->append_write_record(new WriteRecord(WType::INSERT_TUPLE, tab_name, rid));
+            }
+            changed = true;
+        }
+    } catch (RMDBError &e) {
+        if (changed) {
+            throw std::runtime_error(e.what());
+        }
+        throw;
+    }
 }

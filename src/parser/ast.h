@@ -256,6 +256,14 @@ struct SetIsolationLevel : public TreeNode {
     SetIsolationLevel(int level) : level_(level) {}
 };
 
+struct LoadStmt : public TreeNode {
+    std::string file_name;
+    std::string tab_name;
+
+    LoadStmt(std::string file_name_, std::string tab_name_) :
+            file_name(std::move(file_name_)), tab_name(std::move(tab_name_)) {}
+};
+
 // Semantic value
 struct SemValue {
     int sv_int;
