@@ -78,7 +78,7 @@ struct UndoLog {
 
 class Transaction {
    public:
-    explicit Transaction(txn_id_t txn_id, IsolationLevel isolation_level = IsolationLevel::READ_UNCOMMITTED)
+    explicit Transaction(txn_id_t txn_id, IsolationLevel isolation_level = IsolationLevel::SERIALIZABLE)
         : state_(TransactionState::DEFAULT), isolation_level_(isolation_level), txn_id_(txn_id) {
         write_set_ = std::make_shared<std::deque<WriteRecord *>>();
         lock_set_ = std::make_shared<std::unordered_set<LockDataId>>();
