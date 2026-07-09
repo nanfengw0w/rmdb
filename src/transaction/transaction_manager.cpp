@@ -108,7 +108,10 @@ Transaction * TransactionManager::begin(Transaction* txn, LogManager* log_manage
         txn->set_start_ts(get_next_timestamp());
     }
 
-    txn_map[txn->get_transaction_id()] = txn;
+    {
+        std::lock_guard<std::mutex> lock(latch_);
+        txn_map[txn->get_transaction_id()] = txn;
+    }
 
     // WAL begin records are emitted lazily before the first data log. Read-only
     // transactions should not contend on the WAL buffer.
