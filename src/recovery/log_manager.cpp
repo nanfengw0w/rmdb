@@ -55,6 +55,5 @@ void LogManager::flush_log_to_disk_unlocked() {
         disk_manager_->write_log(log_buffer_.buffer_, log_buffer_.offset_);
         persist_lsn_ = global_lsn_ - 1;
         log_buffer_.offset_ = 0;
-        memset(log_buffer_.buffer_, 0, LOG_BUFFER_SIZE);
     }
 }

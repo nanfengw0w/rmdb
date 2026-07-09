@@ -195,13 +195,11 @@ void DiskManager::write_log(char *log_data, int size) {
     std::lock_guard<std::mutex> lock(log_latch_);
     if (log_fd_ == -1) {
         log_fd_ = open_file(LOG_FILE_NAME);
+        off_t end = lseek(log_fd_, 0, SEEK_END);
+        log_offset_ = end < 0 ? 0 : end;
     }
 
-    struct stat stat_buf;
-    if (fstat(log_fd_, &stat_buf) < 0) {
-        throw UnixError();
-    }
-    off_t offset = stat_buf.st_size;
+    off_t offset = log_offset_;
     int written = 0;
     while (written < size) {
         ssize_t bytes_write = pwrite(log_fd_, log_data + written, size - written, offset + written);
@@ -213,6 +211,6 @@ void DiskManager::write_log(char *log_data, int size) {
         }
         written += static_cast<int>(bytes_write);
     }
+    log_offset_ += written;
 }
-
 

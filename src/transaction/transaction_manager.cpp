@@ -272,12 +272,16 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
 
     txn->set_state(TransactionState::COMMITTED);
 
-    // WAL: Write commit log record and flush
+    bool has_writes = txn->get_write_set() != nullptr && !txn->get_write_set()->empty();
+
+    // WAL: read-only transactions do not need a durable commit record.
     if (log_manager != nullptr) {
-        CommitLogRecord commit_log(txn->get_transaction_id(), txn->get_prev_lsn());
-        lsn_t lsn = log_manager->add_log_to_buffer(&commit_log);
-        txn->set_prev_lsn(lsn);
-        log_manager->flush_log_to_disk();
+        if (has_writes) {
+            CommitLogRecord commit_log(txn->get_transaction_id(), txn->get_prev_lsn());
+            lsn_t lsn = log_manager->add_log_to_buffer(&commit_log);
+            txn->set_prev_lsn(lsn);
+            log_manager->flush_log_to_disk();
+        }
         log_manager->remove_active_txn(txn->get_transaction_id());
     }
 

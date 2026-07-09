@@ -4,6 +4,18 @@
 
 ## 性能测试合并分支修复记录
 
+### 2026-07-09 WAL 刷盘热路径小步优化
+- **背景**: 当前 `mimo` 稳定基线约 `54.5 tpmC`，继续优化时优先选择不改变事务调度语义的热路径。commit 阶段每次 WAL flush 都会执行固定额外工作，影响所有写事务和只读事务。
+- **改动**:
+  1. `LogManager::flush_log_to_disk_unlocked()` 不再在每次 flush 后 `memset` 清空 4MB 日志缓冲区；后续写入只依赖 `offset_`，有效区间会被序列化覆盖。
+  2. `DiskManager::write_log()` 使用 `log_latch_` 保护的内存追加偏移，避免每次 WAL 写入都 `fstat()` 获取文件大小。
+  3. `TransactionManager::commit()` 对没有写集合的只读事务跳过 commit log 和 WAL flush，只移出 active txn；只读事务没有 redo/undo 内容，不需要持久化提交记录。
+- **本地验证**:
+  - `cmake --build build -j` 通过，`./build/bin/unit_test` 5/5 通过。
+  - `python3 test_topic5.py` 8/8，`python3 test_topic6.py` 5/5，`python3 test_comprehensive.py` 42/42，`python3 test_crash_recovery.py` 2/2 通过。
+  - 本地小事务 WAL 压测：1200 个显式 insert+commit 约 4510 TPS，p50 0.123ms，p95 0.450ms。
+- **风险边界**: 不改变 MVCC 可见性、写写冲突、索引维护或 SQL 输出；只减少 WAL/commit 热路径 CPU 和系统调用开销。若线上异常，单独回退本提交。
+
 ### 2026-07-06 性能模式 simple DELETE 快路径 trial
 - **背景**: Delivery 事务会按主键删除 `new_orders`，原路径仍经过完整 parser/analyzer/planner。
 - **改动**:

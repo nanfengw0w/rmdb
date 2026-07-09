@@ -70,7 +70,11 @@ class DiskManager {
 
     void write_log(char *log_data, int size);
 
-    void SetLogFd(int log_fd) { log_fd_ = log_fd; }
+    void SetLogFd(int log_fd) {
+        log_fd_ = log_fd;
+        off_t end = lseek(log_fd_, 0, SEEK_END);
+        log_offset_ = end < 0 ? 0 : end;
+    }
 
     int GetLogFd() { return log_fd_; }
 
@@ -96,6 +100,7 @@ class DiskManager {
     std::unordered_map<int, std::string> fd2path_;  //<Page fd,Page文件磁盘路径>哈希表
 
     int log_fd_ = -1;                             // WAL日志文件的文件句柄，默认为-1，代表未打开日志文件
+    off_t log_offset_ = 0;                        // WAL日志追加偏移，由log_latch_保护
     std::mutex log_latch_;                        // 保护日志文件追加位置
     std::atomic<page_id_t> fd2pageno_[MAX_FD]{};  // 文件中已经分配的页面个数，初始值为0
 };
