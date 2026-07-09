@@ -31,6 +31,7 @@ class BufferPoolManager {
     std::list<frame_id_t> free_list_;   // 空闲帧编号的链表
     DiskManager *disk_manager_;
     Replacer *replacer_;    // buffer_pool的置换策略，当前赛题中为LRU置换策略
+    std::vector<char> in_replacer_;  // 懒加载LRU：标记哪些帧在LRU候选列表中
     std::mutex latch_;      // 用于共享数据结构的并发控制
 
    public:
@@ -38,6 +39,7 @@ class BufferPoolManager {
         : pool_size_(pool_size), disk_manager_(disk_manager) {
         // 为buffer pool分配一块连续的内存空间
         pages_ = new Page[pool_size_];
+        in_replacer_.assign(pool_size_, 0);
         // 可以被Replacer改变
         if (REPLACER_TYPE.compare("LRU"))
             replacer_ = new LRUReplacer(pool_size_);
@@ -80,4 +82,6 @@ class BufferPoolManager {
     bool find_victim_page(frame_id_t* frame_id);
 
     void update_page(Page* page, PageId new_page_id, frame_id_t new_frame_id);
+    
+    void seed_replacer_candidates();
 };
