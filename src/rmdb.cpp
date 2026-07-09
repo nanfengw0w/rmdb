@@ -650,6 +650,13 @@ void SetTransaction(txn_id_t *txn_id, Context *context) {
         *txn_id = context->txn_->get_transaction_id();
         context->txn_->set_txn_mode(false);
     }
+    if (!enable_output_file.load() && context->txn_ != nullptr) {
+        context->txn_->set_perf_mode(true);
+        if (context->txn_->get_isolation_level() == IsolationLevel::READ_COMMITTED) {
+            context->txn_->set_isolation_level(IsolationLevel::SNAPSHOT_ISOLATION);
+            context->txn_->set_start_ts(txn_manager->get_next_timestamp());
+        }
+    }
 }
 
 static bool parse_insert_literal_local(const std::string &text, Value &value) {

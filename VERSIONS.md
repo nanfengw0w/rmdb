@@ -4,6 +4,12 @@
 
 ## 性能测试合并分支修复记录
 
+### 2026-07-09 性能模式事务标记前置
+- **背景**: `set output_file off` 后 simple SELECT 会构造 `IndexScan`，但 `Portal::convert_plan_executor()` 在 SI 下只有事务 `perf_mode=true` 才允许真正使用 IndexScan。此前部分 fast path 事务创建后没有及时设置 `perf_mode`，导致 item/stock 点查仍可能被强制回退到 SeqScan。
+- **改动**: 在 `SetTransaction()` 创建/获取事务后，若当前为 output-off 性能阶段，立即设置 `txn->set_perf_mode(true)`；默认 `READ_COMMITTED` 事务同步切到 `SNAPSHOT_ISOLATION` 并刷新 `start_ts`，保证后续 fast SELECT/UPDATE/DELETE 使用一致的性能事务上下文。
+- **本地验证**: `cmake --build build -j` 通过；`timing_analysis.py` 单线程 NewOrder 从此前 item/stock SELECT 占用约 1.4s 级别，降到约 2.3-5.2ms/笔；`timing_analysis_mt.py` 在空订单 timing 库下 16 线程微基准约 22k tpmC，但该脚本只用于热路径定位，不等价于线上完整 TPCC。
+- **风险边界**: 仅在 `set output_file off` 后启用，不影响普通题目输出模式；不跳过 MVCC、写写冲突、索引维护或 WAL。
+
 ### 2026-07-09 WAL 刷盘热路径小步优化
 - **背景**: 当前 `mimo` 稳定基线约 `54.5 tpmC`，继续优化时优先选择不改变事务调度语义的热路径。commit 阶段每次 WAL flush 都会执行固定额外工作，影响所有写事务和只读事务。
 - **改动**:
