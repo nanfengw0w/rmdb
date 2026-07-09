@@ -10,6 +10,7 @@
   1. `LogManager::flush_log_to_disk_unlocked()` 不再在每次 flush 后 `memset` 清空 4MB 日志缓冲区；后续写入只依赖 `offset_`，有效区间会被序列化覆盖。
   2. `DiskManager::write_log()` 使用 `log_latch_` 保护的内存追加偏移，避免每次 WAL 写入都 `fstat()` 获取文件大小。
   3. `TransactionManager::commit()` 对没有写集合的只读事务跳过 commit log 和 WAL flush，只移出 active txn；只读事务没有 redo/undo 内容，不需要持久化提交记录。
+  4. `BEGIN` 日志改为首次写入前懒写；事务开始仍登记 active txn 供 checkpoint 等待，但纯只读事务不再写 begin/commit/abort WAL。
 - **本地验证**:
   - `cmake --build build -j` 通过，`./build/bin/unit_test` 5/5 通过。
   - `python3 test_topic5.py` 8/8，`python3 test_topic6.py` 5/5，`python3 test_comprehensive.py` 42/42，`python3 test_crash_recovery.py` 2/2 通过。

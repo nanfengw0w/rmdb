@@ -110,15 +110,22 @@ Transaction * TransactionManager::begin(Transaction* txn, LogManager* log_manage
 
     txn_map[txn->get_transaction_id()] = txn;
 
-    // WAL: Write begin log record (flushed at commit or when buffer is full)
+    // WAL begin records are emitted lazily before the first data log. Read-only
+    // transactions should not contend on the WAL buffer.
     if (log_manager != nullptr) {
         log_manager->add_active_txn(txn->get_transaction_id());
-        BeginLogRecord begin_log(txn->get_transaction_id());
-        lsn_t lsn = log_manager->add_log_to_buffer(&begin_log);
-        txn->set_prev_lsn(lsn);
     }
 
     return txn;
+}
+
+void TransactionManager::ensure_txn_begin_logged(Transaction* txn, LogManager* log_manager) {
+    if (txn == nullptr || log_manager == nullptr || txn->get_prev_lsn() != INVALID_LSN) {
+        return;
+    }
+    BeginLogRecord begin_log(txn->get_transaction_id());
+    lsn_t lsn = log_manager->add_log_to_buffer(&begin_log);
+    txn->set_prev_lsn(lsn);
 }
 
 void TransactionManager::acquire_explicit_txn_lock(Transaction* txn) {
@@ -277,6 +284,7 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     // WAL: read-only transactions do not need a durable commit record.
     if (log_manager != nullptr) {
         if (has_writes) {
+            ensure_txn_begin_logged(txn, log_manager);
             CommitLogRecord commit_log(txn->get_transaction_id(), txn->get_prev_lsn());
             lsn_t lsn = log_manager->add_log_to_buffer(&commit_log);
             txn->set_prev_lsn(lsn);
@@ -387,10 +395,12 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
     txn->rw_deps_.clear();
 
     // WAL: Write abort log record
-    if (log_manager != nullptr) {
+    if (log_manager != nullptr && txn->get_prev_lsn() != INVALID_LSN) {
         AbortLogRecord abort_log(txn->get_transaction_id(), txn->get_prev_lsn());
         lsn_t lsn = log_manager->add_log_to_buffer(&abort_log);
         txn->set_prev_lsn(lsn);
+    }
+    if (log_manager != nullptr) {
         log_manager->remove_active_txn(txn->get_transaction_id());
     }
 

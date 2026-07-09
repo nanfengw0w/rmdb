@@ -84,6 +84,9 @@ class DeleteExecutor : public AbstractExecutor {
 
             // WAL: Write delete log record to buffer (flushed at commit or when buffer is full)
             if (context_ != nullptr && context_->txn_ != nullptr && context_->log_mgr_ != nullptr) {
+                if (g_txn_manager != nullptr) {
+                    g_txn_manager->ensure_txn_begin_logged(context_->txn_, context_->log_mgr_);
+                }
                 DeleteLogRecord delete_log(context_->txn_->get_transaction_id(), *record,
                                            rids_[cur_idx_], tab_name_);
                 lsn_t lsn = context_->log_mgr_->add_log_to_buffer(&delete_log);

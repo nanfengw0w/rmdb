@@ -768,6 +768,9 @@ static void execute_fast_insert_direct(const std::string &tab_name, std::vector<
     Rid rid = fh->insert_record(rec.data, context);
 
     if (context != nullptr && context->txn_ != nullptr && context->log_mgr_ != nullptr) {
+        if (g_txn_manager != nullptr) {
+            g_txn_manager->ensure_txn_begin_logged(context->txn_, context->log_mgr_);
+        }
         InsertLogRecord insert_log(context->txn_->get_transaction_id(), rec, rid, tab_name);
         lsn_t lsn = context->log_mgr_->add_log_to_buffer(&insert_log);
         context->txn_->set_prev_lsn(lsn);

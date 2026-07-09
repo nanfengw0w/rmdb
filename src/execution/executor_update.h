@@ -205,6 +205,9 @@ class UpdateExecutor : public AbstractExecutor {
 
             // WAL: Write update log record to buffer (flushed at commit or when buffer is full)
             if (txn != nullptr && context_->log_mgr_ != nullptr) {
+                if (g_txn_manager != nullptr) {
+                    g_txn_manager->ensure_txn_begin_logged(txn, context_->log_mgr_);
+                }
                 UpdateLogRecord update_log(txn->get_transaction_id(), *pending.old_record,
                                            *pending.new_record, pending.rid, tab_name_);
                 lsn_t lsn = context_->log_mgr_->add_log_to_buffer(&update_log);
