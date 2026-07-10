@@ -9,6 +9,7 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <unistd.h>
@@ -1424,6 +1425,12 @@ static bool try_handle_fast_select(const std::string &sql, txn_id_t *txn_id,
 void *client_handler(void *sock_fd) {
     std::unique_ptr<int> fd_holder(static_cast<int *>(sock_fd));
     int fd = *fd_holder;
+
+    // The server uses a request/response protocol with many small SQL messages.
+    // Disable Nagle per TCP connection so writes are sent without an avoidable
+    // batching delay; this does not change any database semantics.
+    int tcp_nodelay = 1;
+    (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &tcp_nodelay, sizeof(tcp_nodelay));
 
     int i_recvBytes;
     // 接收客户端发送的请求
