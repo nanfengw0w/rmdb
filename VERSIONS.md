@@ -549,3 +549,9 @@
 - **关键细节**: 事务对象在执行 `BEGIN` 前已由 `SetTransaction()` 创建并分配 start_ts。若线程先创建事务再等待串行锁，拿到锁时快照会过旧，串行执行也会误判冲突。因此在拿到锁后必须刷新 SI/SER 的 start_ts。
 - **本地验证**: 普通模式两个会话同时 `begin` 不阻塞；output-off 下 16 线程 NewOrder/Delivery 混跑无 abort，`d_next_o_id/max(o_id)/new_orders/order_line` 不变量全部通过。
 - **教训**: 这是保正确优先的性能模式，能先让 Phase 3 AC；后续提升 tpmC 时，应在这个门禁基础上逐步拆锁，而不是直接恢复全并发。
+
+### 13. 2026-07-10：回调 Buffer Pool 以修复 load_data 阶段内存失败
+- **现象**: `load_data` 在 Phase 2 失败，评测记录的 RMDB RSS 为 `2.225811 GB`，而功能测试仍然通过。
+- **定位**: `BUFFER_POOL_SIZE=524288` 会预分配约 2GB 的 4KB 页面；大数据加载时再叠加页表、LRU、索引和运行时对象，触发评测环境内存压力/换页，导致加载超时或失败。
+- **修复**: 将 `BUFFER_POOL_SIZE` 调整为 `262144`（约 1GB），与高性能 `tpcc` 参考分支的内存配置一致；保留当前事务、索引、执行器和 WAL/MVCC 优化。
+- **教训**: Buffer Pool 不是越大越快。评测需要同时容纳加载期的索引和事务工作集，固定 2GB 会先损害可用性；后续应以 RSS 和 load_data 通过为门禁再评估缓存大小。
