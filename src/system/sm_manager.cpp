@@ -658,4 +658,23 @@ void SmManager::load_csv(const std::string &file_name, const std::string &tab_na
         }
         throw;
     }
+
+    // LOAD is a system-level bulk operation and is invoked without a
+    // transaction context.  Its records and indexes may still be dirty in
+    // the buffer pool, while the file headers still contain the old page
+    // counts.  Persist the complete table state before acknowledging LOAD;
+    // otherwise a restart can reopen an apparently empty table even though
+    // the load succeeded in memory.
+    if (context == nullptr && changed) {
+        const int table_fd = fh->GetFd();
+        disk_manager_->write_page(table_fd, RM_FILE_HDR_PAGE,
+                                   reinterpret_cast<const char *>(&fh->get_file_hdr_ref()),
+                                   sizeof(RmFileHdr));
+        buffer_pool_manager_->flush_all_pages(table_fd);
+
+        for (const auto &load_index : load_indexes) {
+            load_index.ih->flush_file_header();
+            buffer_pool_manager_->flush_all_pages(load_index.ih->GetFd());
+        }
+    }
 }
