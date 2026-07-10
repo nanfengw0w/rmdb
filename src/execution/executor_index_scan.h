@@ -13,6 +13,7 @@ See the Mulan PSL v2 for more details. */
 #include <algorithm>
 #include <limits>
 #include <map>
+#include <memory>
 #include <optional>
 
 #include "execution_defs.h"
@@ -39,7 +40,11 @@ class IndexScanExecutor : public AbstractExecutor {
     IxIndexHandle *ih_;
 
     Rid rid_;
-    std::vector<Rid> matched_rids_;
+    struct MatchedRecord {
+        Rid rid;
+        std::unique_ptr<RmRecord> record;
+    };
+    std::vector<MatchedRecord> matched_records_;
     size_t matched_pos_;
     bool is_end_;
     std::optional<std::vector<char>> runtime_first_col_value_;
@@ -92,7 +97,7 @@ class IndexScanExecutor : public AbstractExecutor {
     }
 
     void beginTuple() override {
-        matched_rids_.clear();
+        matched_records_.clear();
         matched_pos_ = 0;
         is_end_ = true;
         track_predicate_read();
@@ -117,7 +122,7 @@ class IndexScanExecutor : public AbstractExecutor {
                     auto record = fh_->get_record(candidate_rid, context_);
                     if (record != nullptr && eval_conds(record.get(), fed_conds_)) {
                         track_record_read(candidate_rid);
-                        matched_rids_.push_back(candidate_rid);
+                        matched_records_.push_back({candidate_rid, std::move(record)});
                     }
                 }
             }
@@ -150,15 +155,18 @@ class IndexScanExecutor : public AbstractExecutor {
             return;
         }
         matched_pos_++;
-        if (matched_pos_ >= matched_rids_.size()) {
+        if (matched_pos_ >= matched_records_.size()) {
             is_end_ = true;
             return;
         }
-        rid_ = matched_rids_[matched_pos_];
+        rid_ = matched_records_[matched_pos_].rid;
     }
 
     std::unique_ptr<RmRecord> Next() override {
-        return fh_->get_record(rid_, context_);
+        if (is_end_) {
+            return nullptr;
+        }
+        return std::make_unique<RmRecord>(*matched_records_[matched_pos_].record);
     }
 
     Rid &rid() override { return rid_; }
@@ -202,7 +210,7 @@ class IndexScanExecutor : public AbstractExecutor {
             auto record = fh_->get_record(candidate_rid, context_);
             if (record != nullptr && eval_conds(record.get(), fed_conds_)) {
                 track_record_read(candidate_rid);
-                matched_rids_.push_back(candidate_rid);
+                matched_records_.push_back({candidate_rid, std::move(record)});
             }
             index_scan.next();
         }
@@ -494,16 +502,21 @@ class IndexScanExecutor : public AbstractExecutor {
     }
 
     void finish_materialized_scan() {
-        std::sort(matched_rids_.begin(), matched_rids_.end(), index_maintenance::rid_less);
-        matched_rids_.erase(std::unique(matched_rids_.begin(), matched_rids_.end(),
-                                        index_maintenance::same_rid),
-                            matched_rids_.end());
-        if (matched_rids_.empty()) {
+        std::sort(matched_records_.begin(), matched_records_.end(),
+                  [](const MatchedRecord &lhs, const MatchedRecord &rhs) {
+                      return index_maintenance::rid_less(lhs.rid, rhs.rid);
+                  });
+        matched_records_.erase(std::unique(matched_records_.begin(), matched_records_.end(),
+                                           [](const MatchedRecord &lhs, const MatchedRecord &rhs) {
+                                               return index_maintenance::same_rid(lhs.rid, rhs.rid);
+                                           }),
+                             matched_records_.end());
+        if (matched_records_.empty()) {
             is_end_ = true;
             return;
         }
         matched_pos_ = 0;
-        rid_ = matched_rids_[matched_pos_];
+        rid_ = matched_records_[matched_pos_].rid;
         is_end_ = false;
     }
 
