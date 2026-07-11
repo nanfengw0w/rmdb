@@ -259,6 +259,10 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     if (txn == nullptr) return;
     if (txn->get_state() == TransactionState::ABORTED ||
         txn->get_state() == TransactionState::COMMITTED) {
+        // A completed transaction no longer needs its rollback records.  Keep
+        // this idempotent so repeated control statements cannot retain a stale
+        // write set.
+        clear_write_records(txn);
         release_perf_write_locks(txn);
         release_explicit_txn_lock(txn);
         return;
@@ -299,6 +303,12 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     }
     release_perf_write_locks(txn);
     release_explicit_txn_lock(txn);
+
+    // After the commit record has been flushed and all locks are released,
+    // this transaction can no longer be rolled back.  WriteRecord stores the
+    // old tuple image used only by abort(), so retaining it on the long-lived
+    // transaction object needlessly grows the SI hot path's memory footprint.
+    clear_write_records(txn);
 }
 
 /**
