@@ -100,12 +100,12 @@ Transaction * TransactionManager::begin(Transaction* txn, LogManager* log_manage
     IsolationLevel session_level = get_session_isolation_level(session_id);
     txn->set_isolation_level(session_level);
 
-    txn->set_state(TransactionState::GROWING);
-
-    txn->set_start_ts(get_next_timestamp());
-
     {
         std::lock_guard<std::mutex> lock(latch_);
+        // Publish the transaction and its snapshot timestamp atomically with
+        // respect to the active-watermark scan used by version reclamation.
+        txn->set_state(TransactionState::GROWING);
+        txn->set_start_ts(next_timestamp_++);
         txn_map[txn->get_transaction_id()] = txn;
     }
 
@@ -280,7 +280,10 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
         vm.commit_transaction(txn->get_transaction_id(), commit_ts);
     }
 
-    txn->set_state(TransactionState::COMMITTED);
+    {
+        std::lock_guard<std::mutex> lock(latch_);
+        txn->set_state(TransactionState::COMMITTED);
+    }
 
     bool has_writes = txn->get_write_set() != nullptr && !txn->get_write_set()->empty();
 
@@ -309,6 +312,11 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     // old tuple image used only by abort(), so retaining it on the long-lived
     // transaction object needlessly grows the SI hot path's memory footprint.
     clear_write_records(txn);
+
+    if (level == IsolationLevel::SNAPSHOT_ISOLATION ||
+        level == IsolationLevel::SERIALIZABLE) {
+        VersionManager::instance().maybe_garbage_collect(get_mvcc_watermark());
+    }
 }
 
 /**
@@ -413,7 +421,10 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
         log_manager->remove_active_txn(txn->get_transaction_id());
     }
 
-    txn->set_state(TransactionState::ABORTED);
+    {
+        std::lock_guard<std::mutex> lock(latch_);
+        txn->set_state(TransactionState::ABORTED);
+    }
     clear_write_records(txn);
     release_perf_write_locks(txn);
     release_explicit_txn_lock(txn);

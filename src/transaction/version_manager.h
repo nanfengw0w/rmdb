@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -208,6 +209,69 @@ public:
                 }
             }
         }
+
+        committed_entries_since_gc_.fetch_add(keys.size(), std::memory_order_relaxed);
+    }
+
+    /**
+     * Reclaim committed version entries that no active MVCC snapshot can see.
+     *
+     * The table heap keeps the newest physical tuple, so old non-delete
+     * entries can be discarded once their commit timestamp is below the
+     * active snapshot watermark. A committed delete tombstone is retained as
+     * long as it is the newest entry for the key: MVCC deletes intentionally
+     * leave the bitmap set, and the tombstone is still needed to hide the
+     * physical tuple and stale index candidates. Uncommitted and newer
+     * entries are always retained.
+     */
+    size_t garbage_collect(timestamp_t watermark) {
+        size_t removed = 0;
+        for (int i = 0; i < NUM_SHARDS; ++i) {
+            std::lock_guard<std::mutex> lock(shards_[i].mutex);
+            auto &chains = shards_[i].version_chains;
+            for (auto chain_it = chains.begin(); chain_it != chains.end();) {
+                auto &chain = chain_it->second;
+                const size_t original_size = chain.size();
+                size_t write_pos = 0;
+                for (size_t read_pos = 0; read_pos < original_size; ++read_pos) {
+                    const auto &entry = chain[read_pos];
+                    const bool newest_delete =
+                        read_pos + 1 == original_size && entry.new_deleted_;
+                    const bool keep = entry.commit_ts_ == 0 ||
+                                      entry.commit_ts_ > watermark || newest_delete;
+                    if (!keep) {
+                        ++removed;
+                        continue;
+                    }
+                    if (write_pos != read_pos) {
+                        chain[write_pos] = std::move(chain[read_pos]);
+                    }
+                    ++write_pos;
+                }
+                chain.resize(write_pos);
+                if (chain.empty()) {
+                    chain_it = chains.erase(chain_it);
+                } else {
+                    ++chain_it;
+                }
+            }
+        }
+        return removed;
+    }
+
+    /** Avoid a full version-chain scan on every commit. */
+    size_t maybe_garbage_collect(timestamp_t watermark) {
+        constexpr size_t GC_ENTRY_THRESHOLD = 1024;
+        size_t pending = committed_entries_since_gc_.load(std::memory_order_relaxed);
+        while (pending >= GC_ENTRY_THRESHOLD) {
+            if (!committed_entries_since_gc_.compare_exchange_weak(
+                    pending, pending - GC_ENTRY_THRESHOLD,
+                    std::memory_order_relaxed, std::memory_order_relaxed)) {
+                continue;
+            }
+            return garbage_collect(watermark);
+        }
+        return 0;
     }
 
     /**
@@ -505,4 +569,6 @@ private:
 
     // 每个 SI 写只登记到所属事务 ID 的分片，避免无关事务竞争同一把全局锁。
     TxnShard txn_shards_[NUM_TXN_SHARDS];
+
+    std::atomic<size_t> committed_entries_since_gc_{0};
 };

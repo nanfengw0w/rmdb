@@ -129,6 +129,28 @@ public:
         return result;
     }
 
+    /**
+     * Return the oldest start timestamp among active transactions that use
+     * MVCC visibility. A max value means no such snapshot is active.
+     * Transaction registration and this scan share latch_ so a new snapshot
+     * cannot be missed while version reclamation is deciding its watermark.
+     */
+    timestamp_t get_mvcc_watermark() {
+        std::lock_guard<std::mutex> lock(latch_);
+        timestamp_t watermark = std::numeric_limits<timestamp_t>::max();
+        for (const auto &[id, txn] : txn_map) {
+            (void)id;
+            if (txn == nullptr || txn->get_state() != TransactionState::GROWING) {
+                continue;
+            }
+            if (txn->get_isolation_level() == IsolationLevel::READ_UNCOMMITTED) {
+                continue;
+            }
+            watermark = std::min(watermark, txn->get_start_ts());
+        }
+        return watermark;
+    }
+
     // SSI: 检查危险结构
     bool check_dangerous_structure(Transaction* txn);
 
