@@ -132,8 +132,9 @@ public:
 
         chain.push_back(std::move(entry));
         {
-            std::lock_guard<std::mutex> txn_lock(txn_mutex_);
-            txn_versions_[txn->get_transaction_id()].push_back(key);
+            auto &txn_shard = get_txn_shard(txn->get_transaction_id());
+            std::lock_guard<std::mutex> txn_lock(txn_shard.mutex);
+            txn_shard.versions[txn->get_transaction_id()].push_back(key);
         }
         return true;
     }
@@ -163,8 +164,9 @@ public:
 
         chain.push_back(std::move(entry));
         {
-            std::lock_guard<std::mutex> txn_lock(txn_mutex_);
-            txn_versions_[txn->get_transaction_id()].push_back(key);
+            auto &txn_shard = get_txn_shard(txn->get_transaction_id());
+            std::lock_guard<std::mutex> txn_lock(txn_shard.mutex);
+            txn_shard.versions[txn->get_transaction_id()].push_back(key);
         }
     }
 
@@ -174,13 +176,14 @@ public:
     void commit_transaction(txn_id_t txn_id, timestamp_t commit_ts) {
         std::vector<VersionKey> keys;
         {
-            std::lock_guard<std::mutex> txn_lock(txn_mutex_);
-            auto txn_it = txn_versions_.find(txn_id);
-            if (txn_it == txn_versions_.end()) {
+            auto &txn_shard = get_txn_shard(txn_id);
+            std::lock_guard<std::mutex> txn_lock(txn_shard.mutex);
+            auto txn_it = txn_shard.versions.find(txn_id);
+            if (txn_it == txn_shard.versions.end()) {
                 return;
             }
             keys = std::move(txn_it->second);
-            txn_versions_.erase(txn_it);
+            txn_shard.versions.erase(txn_it);
         }
 
         // 按分片分组处理
@@ -214,13 +217,14 @@ public:
     std::vector<std::tuple<int, Rid, std::shared_ptr<RmRecord>, bool>> abort_transaction(txn_id_t txn_id) {
         std::vector<VersionKey> keys;
         {
-            std::lock_guard<std::mutex> txn_lock(txn_mutex_);
-            auto txn_it = txn_versions_.find(txn_id);
-            if (txn_it == txn_versions_.end()) {
+            auto &txn_shard = get_txn_shard(txn_id);
+            std::lock_guard<std::mutex> txn_lock(txn_shard.mutex);
+            auto txn_it = txn_shard.versions.find(txn_id);
+            if (txn_it == txn_shard.versions.end()) {
                 return {};
             }
             keys = std::move(txn_it->second);
-            txn_versions_.erase(txn_it);
+            txn_shard.versions.erase(txn_it);
         }
 
         std::vector<std::tuple<int, Rid, std::shared_ptr<RmRecord>, bool>> to_restore;
@@ -425,16 +429,17 @@ public:
             }
         }
 
-        // 清理txn_versions_
-        {
-            std::lock_guard<std::mutex> txn_lock(txn_mutex_);
-            for (auto txn_it = txn_versions_.begin(); txn_it != txn_versions_.end(); ) {
+        // 清理按事务 ID 分片的版本键登记表。
+        for (int i = 0; i < NUM_TXN_SHARDS; ++i) {
+            std::lock_guard<std::mutex> txn_lock(txn_shards_[i].mutex);
+            auto &versions = txn_shards_[i].versions;
+            for (auto txn_it = versions.begin(); txn_it != versions.end(); ) {
                 auto& keys = txn_it->second;
                 keys.erase(std::remove_if(keys.begin(), keys.end(),
                                           [fd](const VersionKey& key) { return key.fd == fd; }),
                            keys.end());
                 if (keys.empty()) {
-                    txn_it = txn_versions_.erase(txn_it);
+                    txn_it = versions.erase(txn_it);
                 } else {
                     ++txn_it;
                 }
@@ -447,9 +452,9 @@ public:
             std::lock_guard<std::mutex> lock(shards_[i].mutex);
             shards_[i].version_chains.clear();
         }
-        {
-            std::lock_guard<std::mutex> txn_lock(txn_mutex_);
-            txn_versions_.clear();
+        for (int i = 0; i < NUM_TXN_SHARDS; ++i) {
+            std::lock_guard<std::mutex> txn_lock(txn_shards_[i].mutex);
+            txn_shards_[i].versions.clear();
         }
     }
 
@@ -459,10 +464,17 @@ private:
     // 分片锁配置
     static constexpr int NUM_SHARDS = 64;
     static constexpr int SHARD_MASK = NUM_SHARDS - 1;
+    static constexpr int NUM_TXN_SHARDS = 64;
+    static constexpr int TXN_SHARD_MASK = NUM_TXN_SHARDS - 1;
 
     struct Shard {
         std::mutex mutex;
         std::unordered_map<VersionKey, std::vector<VersionEntry>, VersionKeyHash> version_chains;
+    };
+
+    struct alignas(64) TxnShard {
+        std::mutex mutex;
+        std::unordered_map<txn_id_t, std::vector<VersionKey>> versions;
     };
 
     // 根据key计算分片索引
@@ -480,10 +492,17 @@ private:
         return get_shard(VersionKey{fd, rid.page_no, rid.slot_no});
     }
 
+    static int get_txn_shard_index(txn_id_t txn_id) {
+        return std::hash<txn_id_t>{}(txn_id) & TXN_SHARD_MASK;
+    }
+
+    TxnShard& get_txn_shard(txn_id_t txn_id) {
+        return txn_shards_[get_txn_shard_index(txn_id)];
+    }
+
     // 分片数组
     Shard shards_[NUM_SHARDS];
 
-    // txn_versions_ 使用单独的锁保护
-    std::mutex txn_mutex_;
-    std::unordered_map<txn_id_t, std::vector<VersionKey>> txn_versions_;
+    // 每个 SI 写只登记到所属事务 ID 的分片，避免无关事务竞争同一把全局锁。
+    TxnShard txn_shards_[NUM_TXN_SHARDS];
 };
