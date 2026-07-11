@@ -10,6 +10,9 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <array>
+#include <shared_mutex>
+
 #include "ix_defs.h"
 #include "transaction/transaction.h"
 
@@ -168,7 +171,13 @@ class IxIndexHandle {
     int fd_;                                    // 存储B+树的文件
     IxFileHdr* file_hdr_;                       // 存了root_page，但其初始化为2（第0页存FILE_HDR_PAGE，第1页存LEAF_HEADER_PAGE）
     std::mutex root_latch_;
-    std::mutex mutation_latch_;  // protects insert_entry/delete_entry from concurrent B+ tree corruption
+    // Shared for non-structural operations; exclusive only while the tree
+    // topology (split/coalesce/root) is changed.
+    mutable std::shared_mutex mutation_latch_;
+    // Leaf contents are protected independently when no structural change is
+    // needed.  This keeps unrelated hot leaves from serializing each other.
+    static constexpr size_t LEAF_LATCH_COUNT = 64;
+    mutable std::array<std::shared_mutex, LEAF_LATCH_COUNT> leaf_latches_;
 
    public:
     IxIndexHandle(DiskManager *disk_manager, BufferPoolManager *buffer_pool_manager, int fd);
@@ -235,6 +244,12 @@ class IxIndexHandle {
     void release_node_handle(IxNodeHandle &node);
 
     void maintain_child(IxNodeHandle *node, int child_idx);
+
+    std::shared_mutex &leaf_latch(page_id_t page_no) const {
+        return leaf_latches_[static_cast<size_t>(page_no) & (LEAF_LATCH_COUNT - 1)];
+    }
+
+    Iid leaf_end_unlocked() const;
 
     // for index test
     Rid get_rid(const Iid &iid) const;

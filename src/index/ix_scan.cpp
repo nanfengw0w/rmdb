@@ -20,11 +20,13 @@ void IxScan::next() {
     if (iid_.page_no != ih_->file_hdr_->last_leaf_ && iid_.slot_no == current_node_->get_size()) {
         // go to next leaf - save next_leaf before releasing current node
         page_id_t next_leaf = current_node_->get_next_leaf();
+        leaf_lock_.unlock();
         bpm_->unpin_page(current_node_->get_page_id(), false);
         delete current_node_;
         iid_.slot_no = 0;
         iid_.page_no = next_leaf;
         current_node_ = ih_->fetch_node(iid_.page_no);
+        leaf_lock_ = std::shared_lock<std::shared_mutex>(ih_->leaf_latch(iid_.page_no));
     }
 }
 

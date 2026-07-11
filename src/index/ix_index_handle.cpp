@@ -207,8 +207,10 @@ std::pair<IxNodeHandle *, bool> IxIndexHandle::find_leaf_page(const char *key, O
  * @return bool 返回目标键值对是否存在
  */
 bool IxIndexHandle::get_value(const char *key, std::vector<Rid> *result, Transaction *transaction) {
+    std::shared_lock<std::shared_mutex> tree_lock(mutation_latch_);
     auto [leaf, _] = find_leaf_page(key, Operation::FIND, transaction);
     if (leaf == nullptr) return false;
+    std::shared_lock<std::shared_mutex> leaf_lock(leaf_latch(leaf->get_page_no()));
     Rid *rid = nullptr;
     if (leaf->leaf_lookup(key, &rid)) {
         result->push_back(*rid);
@@ -332,23 +334,54 @@ void IxIndexHandle::insert_into_parent(IxNodeHandle *old_node, const char *key, 
  * @return page_id_t 插入到的叶结点的page_no
  */
 page_id_t IxIndexHandle::insert_entry(const char *key, const Rid &value, Transaction *transaction) {
-    std::lock_guard<std::mutex> lock(mutation_latch_);
+    // Fast path: a leaf with spare capacity only changes its own page.  The
+    // tree remains stable under a shared lock, while the leaf stripe prevents
+    // two writers from editing the same page concurrently.
+    {
+        std::shared_lock<std::shared_mutex> tree_lock(mutation_latch_);
+        auto [leaf, _] = find_leaf_page(key, Operation::INSERT, transaction);
+        if (leaf == nullptr) {
+            // Empty tree - should not happen after create_index initializes root
+            return -1;
+        }
+
+        std::unique_lock<std::shared_mutex> leaf_lock(leaf_latch(leaf->get_page_no()));
+        int pos = leaf->lower_bound(key);
+        bool duplicate = pos < leaf->get_size() &&
+                         ix_compare(leaf->get_key(pos), key,
+                                    file_hdr_->col_types_, file_hdr_->col_lens_) == 0;
+        if (duplicate || leaf->get_size() < leaf->get_max_size()) {
+            leaf->insert(key, value);
+            page_id_t result = leaf->get_page_no();
+            buffer_pool_manager_->unpin_page(leaf->get_page_id(), true);
+            delete leaf;
+            return result;
+        }
+
+        buffer_pool_manager_->unpin_page(leaf->get_page_id(), false);
+        delete leaf;
+    }
+
+    // Structural path: exclude all fast-path readers and writers, then find
+    // the leaf again because another operation may have split it while this
+    // operation was waiting for the exclusive tree lock.
+    std::unique_lock<std::shared_mutex> tree_lock(mutation_latch_);
     auto [leaf, _] = find_leaf_page(key, Operation::INSERT, transaction);
     if (leaf == nullptr) {
-        // Empty tree - should not happen after create_index initializes root
         return -1;
     }
 
     leaf->insert(key, value);
-
     if (leaf->get_size() > leaf->get_max_size()) {
         IxNodeHandle *new_node = split(leaf);
         insert_into_parent(leaf, new_node->get_key(0), new_node, transaction);
         buffer_pool_manager_->unpin_page(new_node->get_page_id(), true);
+        delete new_node;
     }
 
     page_id_t result = leaf->get_page_no();
     buffer_pool_manager_->unpin_page(leaf->get_page_id(), true);
+    delete leaf;
     return result;
 }
 
@@ -358,18 +391,50 @@ page_id_t IxIndexHandle::insert_entry(const char *key, const Rid &value, Transac
  * @param transaction 事务指针
  */
 bool IxIndexHandle::delete_entry(const char *key, Transaction *transaction) {
-    std::lock_guard<std::mutex> lock(mutation_latch_);
+    // Deleting from a non-root leaf above its minimum occupancy cannot change
+    // the tree topology, so it can use the same shared-tree/leaf-stripe path.
+    {
+        std::shared_lock<std::shared_mutex> tree_lock(mutation_latch_);
+        auto [leaf, _] = find_leaf_page(key, Operation::DELETE, transaction);
+        if (leaf == nullptr) return false;
+
+        std::unique_lock<std::shared_mutex> leaf_lock(leaf_latch(leaf->get_page_no()));
+        int pos = leaf->lower_bound(key);
+        if (pos >= leaf->get_size() ||
+            ix_compare(leaf->get_key(pos), key,
+                       file_hdr_->col_types_, file_hdr_->col_lens_) != 0) {
+            buffer_pool_manager_->unpin_page(leaf->get_page_id(), false);
+            delete leaf;
+            return false;
+        }
+
+        bool structural = !leaf->is_root_page() &&
+                          leaf->get_size() <= leaf->get_min_size();
+        if (!structural) {
+            leaf->remove(key);
+            buffer_pool_manager_->unpin_page(leaf->get_page_id(), true);
+            delete leaf;
+            return true;
+        }
+
+        buffer_pool_manager_->unpin_page(leaf->get_page_id(), false);
+        delete leaf;
+    }
+
+    // Structural path: re-find under the exclusive tree lock and perform the
+    // original coalesce/redistribute logic without competing page mutations.
+    std::unique_lock<std::shared_mutex> tree_lock(mutation_latch_);
     auto [leaf, _] = find_leaf_page(key, Operation::DELETE, transaction);
     if (leaf == nullptr) return false;
 
     leaf->remove(key);
-
     bool already_handled = coalesce_or_redistribute(leaf, transaction);
     if (!already_handled) {
         // coalesce_or_redistribute didn't touch the leaf's page, unpin it
         buffer_pool_manager_->unpin_page(leaf->get_page_id(), true);
     }
-    // If already_handled is true, the page was already unpinned/deleted by coalesce_or_redistribute
+    // If already_handled is true, the page was already unpinned/deleted by coalesce_or_redistribute.
+    delete leaf;
     return true;
 }
 
@@ -570,12 +635,18 @@ bool IxIndexHandle::coalesce(IxNodeHandle **neighbor_node, IxNodeHandle **node, 
  * @note iid和rid存的不是一个东西，rid是上层传过来的记录位置，iid是索引内部生成的索引槽位置
  */
 Rid IxIndexHandle::get_rid(const Iid &iid) const {
+    std::shared_lock<std::shared_mutex> tree_lock(mutation_latch_);
     IxNodeHandle *node = fetch_node(iid.page_no);
+    std::shared_lock<std::shared_mutex> leaf_lock(leaf_latch(iid.page_no));
     if (iid.slot_no >= node->get_size()) {
+        buffer_pool_manager_->unpin_page(node->get_page_id(), false);
+        delete node;
         throw IndexEntryNotFoundError();
     }
     buffer_pool_manager_->unpin_page(node->get_page_id(), false);  // unpin it!
-    return *node->get_rid(iid.slot_no);
+    Rid result = *node->get_rid(iid.slot_no);
+    delete node;
+    return result;
 }
 
 /**
@@ -587,11 +658,17 @@ Rid IxIndexHandle::get_rid(const Iid &iid) const {
  * 可用*(int *)key转换回去
  */
 Iid IxIndexHandle::lower_bound(const char *key) {
+    std::shared_lock<std::shared_mutex> tree_lock(mutation_latch_);
     auto [leaf, _] = find_leaf_page(key, Operation::FIND, nullptr);
-    if (leaf == nullptr) return leaf_end();
-    int slot = leaf->lower_bound(key);
-    Iid iid = {.page_no = leaf->get_page_no(), .slot_no = slot};
+    if (leaf == nullptr) return leaf_end_unlocked();
+    Iid iid;
+    {
+        std::shared_lock<std::shared_mutex> leaf_lock(leaf_latch(leaf->get_page_no()));
+        int slot = leaf->lower_bound(key);
+        iid = {.page_no = leaf->get_page_no(), .slot_no = slot};
+    }
     buffer_pool_manager_->unpin_page(leaf->get_page_id(), false);
+    delete leaf;
     return normalize_iid(iid);
 }
 
@@ -602,11 +679,17 @@ Iid IxIndexHandle::lower_bound(const char *key) {
  * @return Iid
  */
 Iid IxIndexHandle::upper_bound(const char *key) {
+    std::shared_lock<std::shared_mutex> tree_lock(mutation_latch_);
     auto [leaf, _] = find_leaf_page(key, Operation::FIND, nullptr);
-    if (leaf == nullptr) return leaf_end();
-    int slot = leaf->upper_bound(key);
-    Iid iid = {.page_no = leaf->get_page_no(), .slot_no = slot};
+    if (leaf == nullptr) return leaf_end_unlocked();
+    Iid iid;
+    {
+        std::shared_lock<std::shared_mutex> leaf_lock(leaf_latch(leaf->get_page_no()));
+        int slot = leaf->upper_bound(key);
+        iid = {.page_no = leaf->get_page_no(), .slot_no = slot};
+    }
     buffer_pool_manager_->unpin_page(leaf->get_page_id(), false);
+    delete leaf;
     return normalize_iid(iid);
 }
 
@@ -614,19 +697,22 @@ Iid IxIndexHandle::normalize_iid(const Iid &iid) const {
     Iid current = iid;
     while (true) {
         IxNodeHandle *node = fetch_node(current.page_no);
+        std::shared_lock<std::shared_mutex> leaf_lock(leaf_latch(current.page_no));
         int size = node->get_size();
         if (current.slot_no < size || current.page_no == file_hdr_->last_leaf_) {
             if (current.slot_no > size) {
                 current.slot_no = size;
             }
             buffer_pool_manager_->unpin_page(node->get_page_id(), false);
+            delete node;
             return current;
         }
 
         page_id_t next_leaf = node->get_next_leaf();
         buffer_pool_manager_->unpin_page(node->get_page_id(), false);
+        delete node;
         if (next_leaf == IX_LEAF_HEADER_PAGE || next_leaf == IX_NO_PAGE) {
-            return leaf_end();
+            return leaf_end_unlocked();
         }
         current.page_no = next_leaf;
         current.slot_no = 0;
@@ -639,11 +725,18 @@ Iid IxIndexHandle::normalize_iid(const Iid &iid) const {
  *
  * @return Iid
  */
-Iid IxIndexHandle::leaf_end() const {
+Iid IxIndexHandle::leaf_end_unlocked() const {
     IxNodeHandle *node = fetch_node(file_hdr_->last_leaf_);
+    std::shared_lock<std::shared_mutex> leaf_lock(leaf_latch(file_hdr_->last_leaf_));
     Iid iid = {.page_no = file_hdr_->last_leaf_, .slot_no = node->get_size()};
     buffer_pool_manager_->unpin_page(node->get_page_id(), false);  // unpin it!
+    delete node;
     return iid;
+}
+
+Iid IxIndexHandle::leaf_end() const {
+    std::shared_lock<std::shared_mutex> tree_lock(mutation_latch_);
+    return leaf_end_unlocked();
 }
 
 /**
@@ -653,6 +746,7 @@ Iid IxIndexHandle::leaf_end() const {
  * @return Iid
  */
 Iid IxIndexHandle::leaf_begin() const {
+    std::shared_lock<std::shared_mutex> tree_lock(mutation_latch_);
     Iid iid = {.page_no = file_hdr_->first_leaf_, .slot_no = 0};
     return iid;
 }
