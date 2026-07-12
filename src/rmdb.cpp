@@ -20,6 +20,7 @@ See the Mulan PSL v2 for more details. */
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -34,12 +35,18 @@ See the Mulan PSL v2 for more details. */
 #include "optimizer/planner.h"
 #include "portal.h"
 #include "analyze/analyze.h"
+#include <netinet/tcp.h>
 
 #define SOCK_PORT 8765
 #define MAX_CONN_LIMIT 64
 
 static bool should_exit = false;
 std::atomic<bool> enable_output_file{true};
+// Serialize one complete SQL request at a time.  Transactions still span
+// multiple requests, but parsing, planning, heap/index mutation, WAL work and
+// commit/abort for each request are kept in one scheduling critical section.
+// This also prevents unsynchronized heap-page inserts from racing each other.
+static std::mutex request_mutex;
 
 static void append_output_line(const std::string &line) {
     if (!enable_output_file.load()) {
@@ -1533,6 +1540,12 @@ void *client_handler(void *sock_fd) {
             }
         }
 
+        // Keep all database work for this request together.  The client
+        // session/transaction remains independent, so explicit transactions
+        // can still interleave at statement boundaries and MVCC decides
+        // whether a conflicting writer must abort.
+        std::unique_lock<std::mutex> request_lock(request_mutex);
+
         // Handle create static_checkpoint
         {
             std::string cmd_check(data_recv);
@@ -1947,10 +1960,13 @@ void *client_handler(void *sock_fd) {
     }
 
     // Clear
-    if (txn_id != INVALID_TXN_ID) {
-        Transaction *txn = txn_manager->get_transaction(txn_id);
-        if (txn != nullptr && txn->get_state() == TransactionState::GROWING) {
-            txn_manager->abort(txn, log_manager.get());
+    {
+        std::unique_lock<std::mutex> request_lock(request_mutex);
+        if (txn_id != INVALID_TXN_ID) {
+            Transaction *txn = txn_manager->get_transaction(txn_id);
+            if (txn != nullptr && txn->get_state() == TransactionState::GROWING) {
+                txn_manager->abort(txn, log_manager.get());
+            }
         }
     }
     std::cout << "Terminating current client_connection..." << std::endl;
@@ -2012,6 +2028,9 @@ void start_server() {
             std::cout << "Accept error!" << std::endl;
             continue;  // ignore current socket ,continue while loop.
         }
+
+        int tcp_no_delay = 1;
+        (void)setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &tcp_no_delay, sizeof(tcp_no_delay));
         
         // 和客户端建立连接，并开启一个线程负责处理客户端请求
         auto *client_fd = new int(sockfd);

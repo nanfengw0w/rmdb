@@ -10,28 +10,6 @@ See the Mulan PSL v2 for more details. */
 
 #include "rm_file_handle.h"
 #include "transaction/version_manager.h"
-#include "transaction/transaction_manager.h"
-
-namespace {
-
-bool should_use_perf_record_locks(Context* context) {
-    if (context == nullptr || context->txn_ == nullptr ||
-        !context->txn_->get_txn_mode() || !context->txn_->get_perf_mode()) {
-        return false;
-    }
-    auto level = context->txn_->get_isolation_level();
-    return level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE;
-}
-
-bool try_acquire_perf_record_write_lock(int fd, const Rid& rid, Context* context) {
-    auto txn_manager = TransactionManager::current();
-    if (!should_use_perf_record_locks(context) || txn_manager == nullptr) {
-        return true;
-    }
-    return txn_manager->acquire_perf_write_lock(context->txn_, fd, rid);
-}
-
-}  // namespace
 
 std::unique_ptr<RmRecord> RmFileHandle::get_record(const Rid& rid, Context* context) const {
     RmPageHandle page_handle = fetch_page_handle(rid.page_no);
@@ -141,12 +119,6 @@ void RmFileHandle::delete_record(const Rid& rid, Context* context) {
         throw RecordNotFoundError(rid.page_no, rid.slot_no);
     }
 
-    if (!try_acquire_perf_record_write_lock(fd_, rid, context)) {
-        buffer_pool_manager_->unpin_page(PageId{fd_, rid.page_no}, false);
-        throw TransactionAbortException(context->txn_->get_transaction_id(),
-            AbortReason::DEADLOCK_PREVENTION);
-    }
-
     bool mvcc_delete = false;
     // MVCC: 检查写写冲突并保存旧数据
     if (context != nullptr && context->txn_ != nullptr) {
@@ -192,12 +164,6 @@ void RmFileHandle::update_record(const Rid& rid, char* buf, Context* context) {
 
     if (!Bitmap::is_set(page_handle.bitmap, rid.slot_no)) {
         throw RecordNotFoundError(rid.page_no, rid.slot_no);
-    }
-
-    if (!try_acquire_perf_record_write_lock(fd_, rid, context)) {
-        buffer_pool_manager_->unpin_page(PageId{fd_, rid.page_no}, false);
-        throw TransactionAbortException(context->txn_->get_transaction_id(),
-            AbortReason::DEADLOCK_PREVENTION);
     }
 
     // MVCC: 检查写写冲突并保存旧数据
