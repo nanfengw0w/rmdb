@@ -87,6 +87,49 @@ void clear_write_records(Transaction *txn) {
 
 }  // namespace
 
+timestamp_t TransactionManager::oldest_active_start_ts() {
+    std::lock_guard<std::mutex> lock(latch_);
+    timestamp_t oldest = std::numeric_limits<timestamp_t>::max();
+    for (const auto &[id, active_txn] : txn_map) {
+        (void)id;
+        if (active_txn != nullptr && active_txn->get_state() == TransactionState::GROWING) {
+            oldest = std::min(oldest, active_txn->get_start_ts());
+        }
+    }
+    return oldest;
+}
+
+void TransactionManager::retire_transaction(Transaction *txn) {
+    if (txn == nullptr) {
+        return;
+    }
+
+    txn_id_t txn_id = txn->get_transaction_id();
+    // SSI readers/writers may still hold dependency edges to this object.
+    // Remove those edges before erasing the transaction map entry.
+    if (txn->get_isolation_level() == IsolationLevel::SERIALIZABLE) {
+        clear_ssi_state(txn_id);
+    }
+    txn->read_set_.clear();
+    txn->predicate_reads_.clear();
+    txn->ssi_writes_.clear();
+    txn->rw_deps_.clear();
+    clear_write_records(txn);
+
+    bool removed = false;
+    {
+        std::lock_guard<std::mutex> lock(latch_);
+        auto it = txn_map.find(txn_id);
+        if (it != txn_map.end() && it->second == txn) {
+            txn_map.erase(it);
+            removed = true;
+        }
+    }
+    if (removed) {
+        delete txn;
+    }
+}
+
 /**
  * @description: 事务的开始方法
  */
@@ -271,9 +314,10 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
         txn->set_commit_ts(commit_ts);
         txn->commit_order_ = global_commit_order_++;
 
-        // 提交版本管理器中的所有写操作
+        // 提交版本管理器中的所有写操作。回收水位包含当前事务本身，
+        // 因而即使调用方尚未从 txn_map 移除它也不会提前删除其快照所需的版本。
         auto& vm = VersionManager::instance();
-        vm.commit_transaction(txn->get_transaction_id(), commit_ts);
+        vm.commit_transaction(txn->get_transaction_id(), commit_ts, oldest_active_start_ts());
     }
 
     txn->set_state(TransactionState::COMMITTED);
@@ -299,6 +343,7 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     }
     release_perf_write_locks(txn);
     release_explicit_txn_lock(txn);
+    retire_transaction(txn);
 }
 
 /**
@@ -309,6 +354,7 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
 
     IsolationLevel level = txn->get_isolation_level();
     bool mvcc_abort = (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE);
+    timestamp_t reclaim_watermark = oldest_active_start_ts();
     if (mvcc_abort) {
         // Restore disk/index state before removing version entries, so concurrent
         // readers remain protected by the old-image version chain during abort.
@@ -344,7 +390,7 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
         }
 
         auto& vm = VersionManager::instance();
-        vm.abort_transaction(txn->get_transaction_id());
+        vm.abort_transaction(txn->get_transaction_id(), reclaim_watermark);
     } else {
         // 非MVCC模式：Undo all write operations in reverse order
         auto write_set = txn->get_write_set();
@@ -386,13 +432,6 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
         lock_manager_->unlock(txn, lock_data_id);
     }
 
-    // 清理 SSI 状态
-    clear_ssi_state(txn->get_transaction_id());
-    txn->read_set_.clear();
-    txn->predicate_reads_.clear();
-    txn->ssi_writes_.clear();
-    txn->rw_deps_.clear();
-
     // WAL: Write abort log record
     if (log_manager != nullptr && txn->get_prev_lsn() != INVALID_LSN) {
         AbortLogRecord abort_log(txn->get_transaction_id(), txn->get_prev_lsn());
@@ -404,9 +443,9 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
     }
 
     txn->set_state(TransactionState::ABORTED);
-    clear_write_records(txn);
     release_perf_write_locks(txn);
     release_explicit_txn_lock(txn);
+    retire_transaction(txn);
 }
 
 /**

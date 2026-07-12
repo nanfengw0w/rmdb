@@ -491,6 +491,9 @@ public:
 
 
 private:
+    void retire_transaction(Transaction *txn);
+    timestamp_t oldest_active_start_ts();
+
     ConcurrencyMode concurrency_mode_;      // 事务使用的并发控制算法，目前只需要考虑2PL
     std::atomic<txn_id_t> next_txn_id_{0};  // 用于分发事务ID
     std::atomic<timestamp_t> next_timestamp_{0};    // 用于分发事务时间戳

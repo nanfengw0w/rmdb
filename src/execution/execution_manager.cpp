@@ -150,18 +150,24 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t *txn_id, Co
             {
                 context->txn_ = txn_mgr_->get_transaction(*txn_id);
                 txn_mgr_->commit(context->txn_, context->log_mgr_);
+                *txn_id = INVALID_TXN_ID;
+                context->txn_ = nullptr;
                 break;
             }    
             case T_Transaction_rollback:
             {
                 context->txn_ = txn_mgr_->get_transaction(*txn_id);
                 txn_mgr_->abort(context->txn_, context->log_mgr_);
+                *txn_id = INVALID_TXN_ID;
+                context->txn_ = nullptr;
                 break;
             }    
             case T_Transaction_abort:
             {
                 context->txn_ = txn_mgr_->get_transaction(*txn_id);
                 txn_mgr_->abort(context->txn_, context->log_mgr_);
+                *txn_id = INVALID_TXN_ID;
+                context->txn_ = nullptr;
                 break;
             }     
             default:

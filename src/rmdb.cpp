@@ -1140,20 +1140,6 @@ static bool try_handle_load_command(const std::string &sql, char *data_send, int
     return true;
 }
 
-static void clear_fast_autocommit_state(Transaction *txn) {
-    if (txn == nullptr || txn->get_txn_mode() ||
-        txn->get_state() != TransactionState::COMMITTED ||
-        txn->get_isolation_level() != IsolationLevel::READ_COMMITTED) {
-        return;
-    }
-
-    auto write_set = txn->get_write_set();
-    for (auto *wr : *write_set) {
-        delete wr;
-    }
-    write_set->clear();
-}
-
 static bool is_explicit_txn_context(Context *context) {
     return context != nullptr && context->txn_ != nullptr && context->txn_->get_txn_mode();
 }
@@ -1165,10 +1151,12 @@ static void abort_failed_explicit_txn(Context *context, bool *txn_failed) {
     if (txn_failed != nullptr) {
         *txn_failed = true;
     }
-    if (context->txn_->get_state() != TransactionState::COMMITTED &&
-        context->txn_->get_state() != TransactionState::ABORTED) {
-        txn_manager->abort(context->txn_, log_manager.get());
+    Transaction *txn = context->txn_;
+    if (txn->get_state() != TransactionState::COMMITTED &&
+        txn->get_state() != TransactionState::ABORTED) {
+        txn_manager->abort(txn, log_manager.get());
     }
+    context->txn_ = nullptr;
 }
 
 static bool is_read_only_after_failed_txn(const std::string &control_cmd) {
@@ -1205,7 +1193,8 @@ static bool try_handle_fast_insert(const std::string &sql, txn_id_t *txn_id,
             context->txn_->get_state() != TransactionState::COMMITTED &&
             context->txn_->get_state() != TransactionState::ABORTED) {
             txn_manager->commit(context->txn_, context->log_mgr_);
-            clear_fast_autocommit_state(context->txn_);
+            context->txn_ = nullptr;
+            *txn_id = INVALID_TXN_ID;
         }
     } catch (TransactionAbortException &e) {
         set_response(data_send, offset, "abort\n");
@@ -1269,7 +1258,8 @@ static bool try_handle_fast_update(const std::string &sql, txn_id_t *txn_id,
             context->txn_->get_state() != TransactionState::COMMITTED &&
             context->txn_->get_state() != TransactionState::ABORTED) {
             txn_manager->commit(context->txn_, context->log_mgr_);
-            clear_fast_autocommit_state(context->txn_);
+            context->txn_ = nullptr;
+            *txn_id = INVALID_TXN_ID;
         }
     } catch (TransactionAbortException &e) {
         set_response(data_send, offset, "abort\n");
@@ -1328,7 +1318,8 @@ static bool try_handle_fast_delete(const std::string &sql, txn_id_t *txn_id,
             context->txn_->get_state() != TransactionState::COMMITTED &&
             context->txn_->get_state() != TransactionState::ABORTED) {
             txn_manager->commit(context->txn_, context->log_mgr_);
-            clear_fast_autocommit_state(context->txn_);
+            context->txn_ = nullptr;
+            *txn_id = INVALID_TXN_ID;
         }
     } catch (TransactionAbortException &e) {
         set_response(data_send, offset, "abort\n");
@@ -1397,7 +1388,8 @@ static bool try_handle_fast_select(const std::string &sql, txn_id_t *txn_id,
             context->txn_->get_state() != TransactionState::COMMITTED &&
             context->txn_->get_state() != TransactionState::ABORTED) {
             txn_manager->commit(context->txn_, context->log_mgr_);
-            clear_fast_autocommit_state(context->txn_);
+            context->txn_ = nullptr;
+            *txn_id = INVALID_TXN_ID;
         }
     } catch (TransactionAbortException &e) {
         set_response(data_send, offset, "abort\n");
@@ -1732,6 +1724,8 @@ void *client_handler(void *sock_fd) {
                        context_agg->txn_->get_state() != TransactionState::COMMITTED &&
                        context_agg->txn_->get_state() != TransactionState::ABORTED) {
                         txn_manager->commit(context_agg->txn_, context_agg->log_mgr_);
+                        context_agg->txn_ = nullptr;
+                        txn_id = INVALID_TXN_ID;
                     }
                     continue;
                 } catch (TransactionAbortException &e) {
@@ -1851,6 +1845,8 @@ void *client_handler(void *sock_fd) {
             {
                 try {
                     txn_manager->commit(context->txn_, context->log_mgr_);
+                    context->txn_ = nullptr;
+                    txn_id = INVALID_TXN_ID;
                 } catch (std::exception &e) {
                     std::cerr << "Auto commit failed: " << e.what() << std::endl;
                 } catch (...) {
@@ -1951,6 +1947,8 @@ void *client_handler(void *sock_fd) {
         {
             try {
                 txn_manager->commit(context->txn_, context->log_mgr_);
+                context->txn_ = nullptr;
+                txn_id = INVALID_TXN_ID;
             } catch (std::exception &e) {
                 std::cerr << "Auto commit failed: " << e.what() << std::endl;
             } catch (...) {

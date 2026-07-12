@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include <algorithm>
+#include <limits>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
@@ -198,7 +199,8 @@ public:
     /**
      * @brief 提交事务的所有写操作
      */
-    void commit_transaction(txn_id_t txn_id, timestamp_t commit_ts) {
+    void commit_transaction(txn_id_t txn_id, timestamp_t commit_ts,
+                            timestamp_t reclaim_watermark = std::numeric_limits<timestamp_t>::max()) {
         std::vector<VersionKey> keys;
         {
             auto &txn_shard = get_txn_shard(txn_id);
@@ -240,6 +242,7 @@ public:
                         }
                     }
                 }
+                prune_chain(chain, reclaim_watermark);
             }
         }
 
@@ -261,7 +264,9 @@ public:
      * @brief 回滚事务的所有写操作
      * @return 需要恢复的记录列表 (fd, rid, old_data, is_deleted)
      */
-    std::vector<std::tuple<int, Rid, std::shared_ptr<RmRecord>, bool>> abort_transaction(txn_id_t txn_id) {
+    std::vector<std::tuple<int, Rid, std::shared_ptr<RmRecord>, bool>> abort_transaction(
+        txn_id_t txn_id,
+        timestamp_t reclaim_watermark = std::numeric_limits<timestamp_t>::max()) {
         std::vector<VersionKey> keys;
         {
             auto &txn_shard = get_txn_shard(txn_id);
@@ -318,6 +323,8 @@ public:
 
                 if (chain.empty()) {
                     shards_[i].version_chains.erase(it);
+                } else {
+                    prune_chain(chain, reclaim_watermark);
                 }
             }
         }
@@ -532,6 +539,39 @@ public:
 
 private:
     VersionManager() = default;
+
+    // Keep every in-progress version and every version newer than the oldest
+    // active snapshot.  Once a committed version is at or before that
+    // watermark, all active transactions can already see it, so only the
+    // newest such committed entry is needed as the conflict/deletion anchor.
+    static void prune_chain(std::vector<VersionEntry> &chain, timestamp_t watermark) {
+        if (chain.size() <= 1) {
+            return;
+        }
+
+        size_t newest_committed = chain.size();
+        for (size_t i = chain.size(); i > 0; --i) {
+            if (chain[i - 1].commit_ts_ != 0) {
+                newest_committed = i - 1;
+                break;
+            }
+        }
+        if (newest_committed == chain.size()) {
+            return;
+        }
+
+        std::vector<VersionEntry> retained;
+        retained.reserve(chain.size());
+        for (size_t i = 0; i < chain.size(); ++i) {
+            const auto &entry = chain[i];
+            if (entry.commit_ts_ == 0 || entry.commit_ts_ > watermark || i == newest_committed) {
+                retained.push_back(entry);
+            }
+        }
+        if (retained.size() != chain.size()) {
+            chain.swap(retained);
+        }
+    }
 
     void register_active_write(int fd, txn_id_t txn_id) {
         std::lock_guard<std::mutex> lock(state_mutex_);
