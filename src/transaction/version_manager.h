@@ -13,6 +13,7 @@ See the Mulan PSL v2 for more details. */
 #include <algorithm>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <memory>
 #include "common/config.h"
@@ -104,6 +105,26 @@ public:
         return true;
     }
 
+    // A physical record is snapshot-safe only when this file has no active
+    // writer, no commit after the reader's snapshot, and no historical MVCC
+    // delete represented by a still-live heap slot.  The check is deliberately
+    // conservative; callers fall back to the version-chain path otherwise.
+    bool can_use_direct_read(int fd, Transaction* txn) {
+        if (txn == nullptr) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        auto active_it = active_writers_.find(fd);
+        if (active_it != active_writers_.end() && !active_it->second.empty()) {
+            return false;
+        }
+        auto commit_it = last_commit_ts_.find(fd);
+        if (commit_it != last_commit_ts_.end() && commit_it->second > txn->get_start_ts()) {
+            return false;
+        }
+        return committed_deletes_.count(fd) == 0;
+    }
+
     bool save_old_data_if_no_conflict(int fd, const Rid& rid, Transaction* txn,
                                        const RmRecord* old_data, bool was_deleted,
                                        bool new_deleted = false) {
@@ -120,6 +141,8 @@ public:
                 }
             }
         }
+
+        register_active_write(fd, txn->get_transaction_id());
 
         VersionEntry entry;
         entry.txn_id_ = txn->get_transaction_id();
@@ -150,6 +173,8 @@ public:
         VersionKey key{fd, rid.page_no, rid.slot_no};
         auto& shard = get_shard(key);
         std::lock_guard<std::mutex> lock(shard.mutex);
+
+        register_active_write(fd, txn->get_transaction_id());
 
         auto& chain = shard.version_chains[key];
 
@@ -186,6 +211,11 @@ public:
             txn_shard.versions.erase(txn_it);
         }
 
+        std::unordered_set<int> touched_fds;
+        for (const auto &key : keys) {
+            touched_fds.insert(key.fd);
+        }
+
         // 按分片分组处理
         std::vector<std::vector<VersionKey>> shard_keys(NUM_SHARDS);
         for (const auto& key : keys) {
@@ -204,9 +234,26 @@ public:
                 for (auto& entry : chain) {
                     if (entry.txn_id_ == txn_id && entry.commit_ts_ == 0) {
                         entry.commit_ts_ = commit_ts;
+                        if (entry.new_deleted_) {
+                            std::lock_guard<std::mutex> state_lock(state_mutex_);
+                            committed_deletes_.insert(key.fd);
+                        }
                     }
                 }
             }
+        }
+
+        std::lock_guard<std::mutex> state_lock(state_mutex_);
+        for (int fd : touched_fds) {
+            auto active_it = active_writers_.find(fd);
+            if (active_it != active_writers_.end()) {
+                active_it->second.erase(txn_id);
+                if (active_it->second.empty()) {
+                    active_writers_.erase(active_it);
+                }
+            }
+            auto &last_commit = last_commit_ts_[fd];
+            last_commit = std::max(last_commit, commit_ts);
         }
     }
 
@@ -225,6 +272,11 @@ public:
             }
             keys = std::move(txn_it->second);
             txn_shard.versions.erase(txn_it);
+        }
+
+        std::unordered_set<int> touched_fds;
+        for (const auto &key : keys) {
+            touched_fds.insert(key.fd);
         }
 
         std::vector<std::tuple<int, Rid, std::shared_ptr<RmRecord>, bool>> to_restore;
@@ -266,6 +318,17 @@ public:
 
                 if (chain.empty()) {
                     shards_[i].version_chains.erase(it);
+                }
+            }
+        }
+
+        std::lock_guard<std::mutex> state_lock(state_mutex_);
+        for (int fd : touched_fds) {
+            auto active_it = active_writers_.find(fd);
+            if (active_it != active_writers_.end()) {
+                active_it->second.erase(txn_id);
+                if (active_it->second.empty()) {
+                    active_writers_.erase(active_it);
                 }
             }
         }
@@ -445,6 +508,11 @@ public:
                 }
             }
         }
+
+        std::lock_guard<std::mutex> state_lock(state_mutex_);
+        active_writers_.erase(fd);
+        last_commit_ts_.erase(fd);
+        committed_deletes_.erase(fd);
     }
 
     void clear_all() {
@@ -456,10 +524,19 @@ public:
             std::lock_guard<std::mutex> txn_lock(txn_shards_[i].mutex);
             txn_shards_[i].versions.clear();
         }
+        std::lock_guard<std::mutex> state_lock(state_mutex_);
+        active_writers_.clear();
+        last_commit_ts_.clear();
+        committed_deletes_.clear();
     }
 
 private:
     VersionManager() = default;
+
+    void register_active_write(int fd, txn_id_t txn_id) {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        active_writers_[fd].insert(txn_id);
+    }
 
     // 分片锁配置
     static constexpr int NUM_SHARDS = 64;
@@ -502,6 +579,13 @@ private:
 
     // 分片数组
     Shard shards_[NUM_SHARDS];
+
+    // File-level state used only to decide whether a physical read is already
+    // snapshot-safe. The version chains remain the source of truth.
+    std::mutex state_mutex_;
+    std::unordered_map<int, std::unordered_set<txn_id_t>> active_writers_;
+    std::unordered_map<int, timestamp_t> last_commit_ts_;
+    std::unordered_set<int> committed_deletes_;
 
     // 每个 SI 写只登记到所属事务 ID 的分片，避免无关事务竞争同一把全局锁。
     TxnShard txn_shards_[NUM_TXN_SHARDS];

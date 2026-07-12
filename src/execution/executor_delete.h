@@ -25,19 +25,27 @@ class DeleteExecutor : public AbstractExecutor {
     std::vector<Condition> conds_;
     RmFileHandle *fh_;
     std::vector<Rid> rids_;
+    std::vector<std::unique_ptr<RmRecord>> records_;
     std::string tab_name_;
     SmManager *sm_manager_;
     size_t cur_idx_;
 
    public:
     DeleteExecutor(SmManager *sm_manager, const std::string &tab_name, std::vector<Condition> conds,
-                   std::vector<Rid> rids, Context *context) {
+                   std::vector<Rid> rids, Context *context)
+        : DeleteExecutor(sm_manager, tab_name, std::move(conds), std::move(rids),
+                          std::vector<std::unique_ptr<RmRecord>>(), context) {}
+
+    DeleteExecutor(SmManager *sm_manager, const std::string &tab_name, std::vector<Condition> conds,
+                   std::vector<Rid> rids, std::vector<std::unique_ptr<RmRecord>> records,
+                   Context *context) {
         sm_manager_ = sm_manager;
         tab_name_ = tab_name;
         tab_ = sm_manager_->db_.get_table(tab_name);
         fh_ = sm_manager_->fhs_.at(tab_name).get();
         conds_ = conds;
         rids_ = rids;
+        records_ = std::move(records);
         context_ = context;
         cur_idx_ = 0;
     }
@@ -58,7 +66,12 @@ class DeleteExecutor : public AbstractExecutor {
 
         while (cur_idx_ < rids_.size()) {
             // Get the record before deletion
-            auto record = fh_->get_record(rids_[cur_idx_], context_);
+            std::unique_ptr<RmRecord> record;
+            if (cur_idx_ < records_.size() && records_[cur_idx_] != nullptr) {
+                record = std::move(records_[cur_idx_]);
+            } else {
+                record = fh_->get_record(rids_[cur_idx_], context_);
+            }
             if (record == nullptr) {
                 if (index_maintenance::is_mvcc_txn(context_) && txn != nullptr) {
                     throw TransactionAbortException(txn->get_transaction_id(),

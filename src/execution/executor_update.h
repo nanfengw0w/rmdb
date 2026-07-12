@@ -28,6 +28,7 @@ class UpdateExecutor : public AbstractExecutor {
     std::vector<Condition> conds_;
     RmFileHandle *fh_;
     std::vector<Rid> rids_;
+    std::vector<std::unique_ptr<RmRecord>> records_;
     std::string tab_name_;
     std::vector<SetClause> set_clauses_;
     SmManager *sm_manager_;
@@ -87,7 +88,13 @@ class UpdateExecutor : public AbstractExecutor {
 
    public:
     UpdateExecutor(SmManager *sm_manager, const std::string &tab_name, std::vector<SetClause> set_clauses,
-                   std::vector<Condition> conds, std::vector<Rid> rids, Context *context) {
+                   std::vector<Condition> conds, std::vector<Rid> rids, Context *context)
+        : UpdateExecutor(sm_manager, tab_name, std::move(set_clauses), std::move(conds), std::move(rids),
+                          std::vector<std::unique_ptr<RmRecord>>(), context) {}
+
+    UpdateExecutor(SmManager *sm_manager, const std::string &tab_name, std::vector<SetClause> set_clauses,
+                   std::vector<Condition> conds, std::vector<Rid> rids,
+                   std::vector<std::unique_ptr<RmRecord>> records, Context *context) {
         sm_manager_ = sm_manager;
         tab_name_ = tab_name;
         set_clauses_ = set_clauses;
@@ -95,6 +102,7 @@ class UpdateExecutor : public AbstractExecutor {
         fh_ = sm_manager_->fhs_.at(tab_name).get();
         conds_ = conds;
         rids_ = rids;
+        records_ = std::move(records);
         context_ = context;
         cur_idx_ = 0;
     }
@@ -129,10 +137,15 @@ class UpdateExecutor : public AbstractExecutor {
         std::vector<PendingUpdate> pending_updates;
         pending_updates.reserve(rids_.size());
 
-        for (auto &rid : rids_) {
+        for (size_t rid_index = 0; rid_index < rids_.size(); ++rid_index) {
+            auto &rid = rids_[rid_index];
             PendingUpdate pending;
             pending.rid = rid;
-            pending.old_record = fh_->get_record(rid, context_);
+            if (rid_index < records_.size() && records_[rid_index] != nullptr) {
+                pending.old_record = std::move(records_[rid_index]);
+            } else {
+                pending.old_record = fh_->get_record(rid, context_);
+            }
             if (pending.old_record == nullptr) {
                 if (mvcc_txn && context_ != nullptr && context_->txn_ != nullptr) {
                     throw TransactionAbortException(context_->txn_->get_transaction_id(),

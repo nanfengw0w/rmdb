@@ -82,28 +82,34 @@ class Portal
                 case T_Update:
                 {
                     std::vector<Rid> rids;
+                    std::vector<std::unique_ptr<RmRecord>> records;
                     if (!write_index_probe::collect_exact_write_rids(sm_manager_, x, context, rids)) {
                         std::unique_ptr<AbstractExecutor> scan= convert_plan_executor(x->subplan_, context);
                         for (scan->beginTuple(); !scan->is_end(); scan->nextTuple()) {
                             rids.push_back(scan->rid());
+                            records.push_back(scan->Next());
                         }
                     }
                     std::unique_ptr<AbstractExecutor> root =std::make_unique<UpdateExecutor>(sm_manager_,
-                                                            x->tab_name_, x->set_clauses_, x->conds_, rids, context);
+                                                            x->tab_name_, x->set_clauses_, x->conds_, rids,
+                                                            std::move(records), context);
                     return std::make_shared<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<TabCol>(), std::move(root), plan);
                 }
                 case T_Delete:
                 {
                     std::vector<Rid> rids;
+                    std::vector<std::unique_ptr<RmRecord>> records;
                     if (!write_index_probe::collect_exact_write_rids(sm_manager_, x, context, rids)) {
                         std::unique_ptr<AbstractExecutor> scan= convert_plan_executor(x->subplan_, context);
                         for (scan->beginTuple(); !scan->is_end(); scan->nextTuple()) {
                             rids.push_back(scan->rid());
+                            records.push_back(scan->Next());
                         }
                     }
 
                     std::unique_ptr<AbstractExecutor> root =
-                            std::make_unique<DeleteExecutor>(sm_manager_, x->tab_name_, x->conds_, rids, context);
+                            std::make_unique<DeleteExecutor>(sm_manager_, x->tab_name_, x->conds_, rids,
+                                                             std::move(records), context);
 
                     return std::make_shared<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<TabCol>(), std::move(root), plan);
                 }

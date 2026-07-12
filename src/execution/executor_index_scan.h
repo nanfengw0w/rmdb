@@ -14,6 +14,7 @@ See the Mulan PSL v2 for more details. */
 #include <limits>
 #include <map>
 #include <optional>
+#include <set>
 
 #include "execution_defs.h"
 #include "execution_manager.h"
@@ -39,8 +40,9 @@ class IndexScanExecutor : public AbstractExecutor {
     IxIndexHandle *ih_;
 
     Rid rid_;
-    std::vector<Rid> matched_rids_;
-    size_t matched_pos_;
+    std::unique_ptr<IxScan> scan_;
+    std::unique_ptr<RmRecord> current_record_;
+    std::set<Rid> seen_rids_;
     bool is_end_;
     std::optional<std::vector<char>> runtime_first_col_value_;
 
@@ -80,7 +82,6 @@ class IndexScanExecutor : public AbstractExecutor {
         }
         fed_conds_ = conds_;
         is_end_ = true;
-        matched_pos_ = 0;
 
         // Get the index handle
         std::string ix_name = sm_manager_->get_ix_manager()->get_index_name(real_tab_name, index_col_names_);
@@ -92,8 +93,9 @@ class IndexScanExecutor : public AbstractExecutor {
     }
 
     void beginTuple() override {
-        matched_rids_.clear();
-        matched_pos_ = 0;
+        scan_.reset();
+        current_record_.reset();
+        seen_rids_.clear();
         is_end_ = true;
         track_predicate_read();
 
@@ -101,64 +103,68 @@ class IndexScanExecutor : public AbstractExecutor {
             return;
         }
 
-        bool perf_mode = context_ != nullptr && context_->txn_ != nullptr &&
-                         context_->txn_->get_perf_mode();
-        if (index_meta_.col_num > 1 && !perf_mode) {
-            materialize_index_scan(ih_->leaf_begin(), ih_->leaf_end());
-            finish_materialized_scan();
-            return;
-        }
-
+        Iid lower;
+        Iid upper;
         auto exact_key = build_exact_match_key();
         if (exact_key.has_value()) {
-            std::vector<Rid> result;
-            if (ih_->get_value(exact_key->data(), &result, nullptr)) {
-                for (auto &candidate_rid : result) {
-                    auto record = fh_->get_record(candidate_rid, context_);
-                    if (record != nullptr && eval_conds(record.get(), fed_conds_)) {
-                        track_record_read(candidate_rid);
-                        matched_rids_.push_back(candidate_rid);
-                    }
+            lower = ih_->lower_bound(exact_key->data());
+            upper = ih_->upper_bound(exact_key->data());
+        } else {
+            auto range = build_prefix_range_bounds();
+            if (!range.has_value()) {
+                lower = ih_->leaf_begin();
+                upper = ih_->leaf_end();
+            } else {
+                if (bounds_are_empty(range->first, range->second)) {
+                    return;
                 }
+                lower = range->first.inclusive ? ih_->lower_bound(range->first.key.data())
+                                               : ih_->upper_bound(range->first.key.data());
+                upper = range->second.inclusive ? ih_->upper_bound(range->second.key.data())
+                                                : ih_->lower_bound(range->second.key.data());
             }
-            finish_materialized_scan();
-            return;
         }
 
-        auto range = build_prefix_range_bounds();
-        if (!range.has_value()) {
-            materialize_index_scan(ih_->leaf_begin(), ih_->leaf_end());
-            finish_materialized_scan();
-            return;
-        }
-        if (bounds_are_empty(range->first, range->second)) {
-            finish_materialized_scan();
-            return;
-        }
-
-        Iid lower = range->first.inclusive ? ih_->lower_bound(range->first.key.data())
-                                           : ih_->upper_bound(range->first.key.data());
-        Iid upper = range->second.inclusive ? ih_->upper_bound(range->second.key.data())
-                                            : ih_->lower_bound(range->second.key.data());
-
-        materialize_index_scan(lower, upper);
-        finish_materialized_scan();
+        scan_ = std::make_unique<IxScan>(ih_, lower, upper, sm_manager_->get_bpm());
+        nextTuple();
     }
 
     void nextTuple() override {
-        if (is_end_) {
+        current_record_.reset();
+        is_end_ = true;
+        if (scan_ == nullptr) {
             return;
         }
-        matched_pos_++;
-        if (matched_pos_ >= matched_rids_.size()) {
-            is_end_ = true;
+
+        while (!scan_->is_end()) {
+            if (!eval_index_key(scan_->key())) {
+                scan_->next();
+                continue;
+            }
+            Rid candidate_rid = scan_->rid();
+            // Advance the index scan before touching the heap.  This keeps
+            // the leaf latch held for the shortest possible interval.
+            scan_->next();
+            auto record = fh_->get_record(candidate_rid, context_);
+            if (record == nullptr || !eval_conds(record.get(), fed_conds_)) {
+                continue;
+            }
+            if (!seen_rids_.insert(candidate_rid).second) {
+                continue;
+            }
+            track_record_read(candidate_rid);
+            rid_ = candidate_rid;
+            current_record_ = std::move(record);
+            is_end_ = false;
             return;
         }
-        rid_ = matched_rids_[matched_pos_];
     }
 
     std::unique_ptr<RmRecord> Next() override {
-        return fh_->get_record(rid_, context_);
+        if (is_end_ || current_record_ == nullptr) {
+            return nullptr;
+        }
+        return std::make_unique<RmRecord>(*current_record_);
     }
 
     Rid &rid() override { return rid_; }
@@ -191,23 +197,6 @@ class IndexScanExecutor : public AbstractExecutor {
     }
 
    private:
-    void materialize_index_scan(const Iid &lower, const Iid &upper) {
-        IxScan index_scan(ih_, lower, upper, sm_manager_->get_bpm());
-        while (!index_scan.is_end()) {
-            if (!eval_index_key(index_scan.key())) {
-                index_scan.next();
-                continue;
-            }
-            auto candidate_rid = index_scan.rid();
-            auto record = fh_->get_record(candidate_rid, context_);
-            if (record != nullptr && eval_conds(record.get(), fed_conds_)) {
-                track_record_read(candidate_rid);
-                matched_rids_.push_back(candidate_rid);
-            }
-            index_scan.next();
-        }
-    }
-
     void track_predicate_read() {
         if (context_ == nullptr || context_->txn_ == nullptr || g_txn_manager == nullptr ||
             context_->txn_->get_isolation_level() != IsolationLevel::SERIALIZABLE) {
@@ -491,20 +480,6 @@ class IndexScanExecutor : public AbstractExecutor {
         }
         int cmp = compare_full_key(lower->key, upper->key);
         return cmp > 0 || (cmp == 0 && (!lower->inclusive || !upper->inclusive));
-    }
-
-    void finish_materialized_scan() {
-        std::sort(matched_rids_.begin(), matched_rids_.end(), index_maintenance::rid_less);
-        matched_rids_.erase(std::unique(matched_rids_.begin(), matched_rids_.end(),
-                                        index_maintenance::same_rid),
-                            matched_rids_.end());
-        if (matched_rids_.empty()) {
-            is_end_ = true;
-            return;
-        }
-        matched_pos_ = 0;
-        rid_ = matched_rids_[matched_pos_];
-        is_end_ = false;
     }
 
     bool eval_conds(RmRecord *record, const std::vector<Condition> &conds) {

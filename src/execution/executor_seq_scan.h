@@ -30,6 +30,7 @@ class SeqScanExecutor : public AbstractExecutor {
 
     Rid rid_;
     std::unique_ptr<RecScan> scan_;
+    std::unique_ptr<RmRecord> current_record_;
     bool is_end_;
 
     SmManager *sm_manager_;
@@ -86,6 +87,7 @@ class SeqScanExecutor : public AbstractExecutor {
 
     void beginTuple() override {
         scan_ = std::make_unique<RmScan>(fh_);
+        current_record_.reset();
         is_end_ = false;
         track_predicate_read();
         // Skip to the first record that satisfies conditions
@@ -108,6 +110,7 @@ class SeqScanExecutor : public AbstractExecutor {
                         }
                     }
                 }
+                current_record_ = std::move(record);
                 return;
             }
             scan_->next();
@@ -116,6 +119,7 @@ class SeqScanExecutor : public AbstractExecutor {
     }
 
     void nextTuple() override {
+        current_record_.reset();
         scan_->next();
         while (!scan_->is_end()) {
             rid_ = scan_->rid();
@@ -136,6 +140,7 @@ class SeqScanExecutor : public AbstractExecutor {
                         }
                     }
                 }
+                current_record_ = std::move(record);
                 return;
             }
             scan_->next();
@@ -144,7 +149,10 @@ class SeqScanExecutor : public AbstractExecutor {
     }
 
     std::unique_ptr<RmRecord> Next() override {
-        return fh_->get_record(rid_, context_);
+        if (is_end_ || current_record_ == nullptr) {
+            return nullptr;
+        }
+        return std::make_unique<RmRecord>(*current_record_);
     }
 
     Rid &rid() override { return rid_; }

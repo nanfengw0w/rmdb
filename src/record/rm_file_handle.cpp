@@ -47,6 +47,9 @@ std::unique_ptr<RmRecord> RmFileHandle::get_record(const Rid& rid, Context* cont
         IsolationLevel level = context->txn_->get_isolation_level();
         if (level == IsolationLevel::SNAPSHOT_ISOLATION || level == IsolationLevel::SERIALIZABLE) {
             auto& vm = VersionManager::instance();
+            if (vm.can_use_direct_read(fd_, context->txn_)) {
+                return rec;
+            }
             bool is_deleted = false;
             std::unique_ptr<RmRecord> result;
             int vis = vm.get_visible_data(fd_, rid, context->txn_, result, is_deleted);
