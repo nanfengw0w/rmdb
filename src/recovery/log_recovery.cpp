@@ -480,10 +480,20 @@ void RecoveryManager::undo() {
         }
     }
 
-    // Flush all dirty pages to ensure recovered data is on disk
+    // Recovery mutates record bitmaps directly, so rebuild the derived free-page
+    // lists before accepting new inserts.
     for (auto& entry : sm_manager_->fhs_) {
-        int fd = entry.second->GetFd();
+        entry.second->rebuild_free_page_list();
+    }
+
+    // Flush all recovered page and file-header state to disk.
+    for (auto& entry : sm_manager_->fhs_) {
+        RmFileHandle* fh = entry.second.get();
+        int fd = fh->GetFd();
         buffer_pool_manager_->flush_all_pages(fd);
+        disk_manager_->write_page(fd, RM_FILE_HDR_PAGE,
+                                  reinterpret_cast<const char*>(&fh->get_file_hdr_ref()),
+                                  sizeof(RmFileHdr));
     }
 
     // Rebuild indexes to be consistent with recovered record data

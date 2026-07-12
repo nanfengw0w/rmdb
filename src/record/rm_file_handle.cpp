@@ -188,6 +188,25 @@ void RmFileHandle::update_record(const Rid& rid, char* buf, Context* context) {
     buffer_pool_manager_->unpin_page(PageId{fd_, rid.page_no}, true);
 }
 
+void RmFileHandle::rebuild_free_page_list() {
+    int first_free_page_no = RM_NO_PAGE;
+    for (int page_no = RM_FIRST_RECORD_PAGE; page_no < file_hdr_.num_pages; page_no++) {
+        RmPageHandle page_handle = fetch_page_handle(page_no);
+        int next_free_page_no = RM_NO_PAGE;
+        if (page_handle.page_hdr->num_records < file_hdr_.num_records_per_page) {
+            next_free_page_no = first_free_page_no;
+            first_free_page_no = page_no;
+        }
+
+        bool dirty = page_handle.page_hdr->next_free_page_no != next_free_page_no;
+        page_handle.page_hdr->next_free_page_no = next_free_page_no;
+        buffer_pool_manager_->unpin_page(PageId{fd_, page_no}, dirty);
+    }
+
+    file_hdr_.first_free_page_no = first_free_page_no;
+    disk_manager_->set_fd2pageno(fd_, file_hdr_.num_pages);
+}
+
 RmPageHandle RmFileHandle::fetch_page_handle(int page_no) const {
     if (page_no < 0 || page_no >= file_hdr_.num_pages) {
         throw PageNotExistError("table", page_no);
@@ -207,12 +226,13 @@ RmPageHandle RmFileHandle::create_new_page_handle() {
     }
 
     RmPageHdr* page_hdr = reinterpret_cast<RmPageHdr*>(page->get_data() + Page::OFFSET_PAGE_HDR);
-    page_hdr->next_free_page_no = RM_NO_PAGE;
+    page_hdr->next_free_page_no = file_hdr_.first_free_page_no;
     page_hdr->num_records = 0;
 
     char* bitmap = page->get_data() + sizeof(RmPageHdr) + Page::OFFSET_PAGE_HDR;
     Bitmap::init(bitmap, file_hdr_.bitmap_size);
 
+    file_hdr_.first_free_page_no = new_page_id.page_no;
     file_hdr_.num_pages++;
 
     BufferPoolManager::mark_dirty(page);
