@@ -42,7 +42,7 @@ TRANSACTION ISOLATION LEVEL SNAPSHOT SERIALIZABLE
 %type <sv_expr> expr
 %type <sv_val> value
 %type <sv_vals> valueList
-%type <sv_str> tbName colName
+%type <sv_str> tbName colName fileName
 %type <sv_strs> tableList colNameList
 %type <sv_col> col
 %type <sv_cols> colList selector
@@ -407,4 +407,9 @@ set_knob_type:
 tbName: IDENTIFIER;
 
 colName: IDENTIFIER;
+
+fileName:
+        VALUE_STRING
+    |   IDENTIFIER
+    ;
 %%
